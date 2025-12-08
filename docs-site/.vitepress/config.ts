@@ -8,11 +8,42 @@ export default withMermaid(
     
     head: [
       ['link', { rel: 'icon', href: '/favicon.ico' }],
+      ['link', { rel: 'apple-touch-icon', href: '/logo.png' }],
       ['meta', { name: 'theme-color', content: '#06b6d4' }],
       ['meta', { property: 'og:type', content: 'website' }],
       ['meta', { property: 'og:title', content: 'NeuroShard Documentation' }],
       ['meta', { property: 'og:description', content: 'Build the future of decentralized AI. Train models, earn NEURO, own collective intelligence.' }],
-      ['meta', { property: 'og:image', content: 'https://neuroshard.com/og-image.png' }],
+      ['meta', { property: 'og:image', content: 'https://neuroshard.com/logo.png' }],
+      ['meta', { property: 'og:url', content: 'https://neuroshard.com' }],
+      ['meta', { property: 'og:site_name', content: 'NeuroShard' }],
+      ['meta', { name: 'twitter:card', content: 'summary' }],
+      ['meta', { name: 'twitter:title', content: 'NeuroShard Documentation' }],
+      ['meta', { name: 'twitter:description', content: 'Build the future of decentralized AI. Train models, earn NEURO, own collective intelligence.' }],
+      ['meta', { name: 'twitter:image', content: 'https://neuroshard.com/logo.png' }],
+      ['script', { type: 'application/ld+json' }, JSON.stringify({
+        '@context': 'https://schema.org',
+        '@type': 'Organization',
+        'name': 'NeuroShard',
+        'url': 'https://neuroshard.com',
+        'logo': 'https://neuroshard.com/logo.png',
+        'description': 'Decentralized AI Training Network - Train models together. Earn NEURO. Own collective intelligence.',
+        'sameAs': [
+          'https://github.com/Nexaroa/neuroshard',
+          'https://x.com/shardneuro',
+          'https://discord.gg/4R49xpj7vn'
+        ]
+      })],
+      ['script', { type: 'application/ld+json' }, JSON.stringify({
+        '@context': 'https://schema.org',
+        '@type': 'WebSite',
+        'name': 'NeuroShard',
+        'url': 'https://neuroshard.com',
+        'potentialAction': {
+          '@type': 'SearchAction',
+          'target': 'https://neuroshard.com/search?q={search_term_string}',
+          'query-input': 'required name=search_term_string'
+        }
+      })]
     ],
 
 themeConfig: {
