@@ -1,88 +1,17 @@
-import { useState, useEffect } from 'react';
-import { Download, FileText, Lock, Shield, BookOpen, Loader2 } from 'lucide-react';
-import { useAuth } from '../contexts/AuthContext';
-const API_BASE = import.meta.env.VITE_API_URL || '';
+import { Download, FileText, BookOpen } from 'lucide-react';
 
 export const Whitepaper = () => {
-  const { user } = useAuth();
-  const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  // Public PDF URL - directly from GitHub
+  const pdfUrl = 'https://github.com/Nexaroa/neuroshard/raw/main/docs/whitepaper/neuroshard_whitepaper.pdf';
   
-  // Protected PDF URL - requires authentication
-  const pdfUrl = `${API_BASE}/api/whitepaper/pdf`;
-  
-  // Fetch PDF on mount with authentication
-  useEffect(() => {
-    const fetchPdf = async () => {
-      try {
-        setLoading(true);
-        setError(null);
-        const token = localStorage.getItem('token');
-        
-        if (!token) {
-          setError('Authentication required');
-          setLoading(false);
-          return;
-        }
-        
-        const response = await fetch(pdfUrl, {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        });
-        
-        if (!response.ok) {
-          throw new Error('Failed to load whitepaper');
-        }
-        
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        setPdfBlobUrl(url);
-      } catch (err) {
-        console.error('PDF fetch error:', err);
-        setError('Failed to load whitepaper. Please try again.');
-      } finally {
-        setLoading(false);
-      }
-    };
-    
-    fetchPdf();
-    
-    // Cleanup blob URL on unmount
-    return () => {
-      if (pdfBlobUrl) {
-        window.URL.revokeObjectURL(pdfBlobUrl);
-      }
-    };
-  }, [pdfUrl]);
-  
-  const handleDownload = async () => {
-    try {
-      const token = localStorage.getItem('token');
-      const response = await fetch(pdfUrl, {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to download whitepaper');
-      }
-      
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'NeuroShard_Whitepaper.pdf';
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
-    } catch (error) {
-      console.error('Download error:', error);
-      alert('Failed to download whitepaper. Please try again.');
-    }
+  const handleDownload = () => {
+    const a = document.createElement('a');
+    a.href = pdfUrl;
+    a.download = 'NeuroShard_Whitepaper.pdf';
+    a.target = '_blank';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   return (
@@ -111,14 +40,12 @@ export const Whitepaper = () => {
           </button>
         </div>
 
-        {/* Access Badge */}
+        {/* Public Access Badge */}
         <div className="mb-6 flex items-center gap-2 text-sm">
-          <div className="flex items-center gap-2 px-3 py-1.5 bg-green-500/10 border border-green-500/30 rounded-full">
-            <Shield className="w-4 h-4 text-green-400" />
-            <span className="text-green-400">Authenticated Access</span>
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-cyan-500/10 border border-cyan-500/30 rounded-full">
+            <FileText className="w-4 h-4 text-cyan-400" />
+            <span className="text-cyan-400">Public Document</span>
           </div>
-          <span className="text-slate-500">•</span>
-          <span className="text-slate-400">Logged in as {user?.email}</span>
         </div>
 
         {/* PDF Viewer */}
@@ -128,47 +55,30 @@ export const Whitepaper = () => {
               <FileText className="w-4 h-4 text-slate-400" />
               <span className="text-slate-300 text-sm font-medium">NeuroShard_Whitepaper.pdf</span>
             </div>
-            <span className="text-xs text-slate-500">Members Only</span>
+            <span className="text-xs text-slate-500">Open Source</span>
           </div>
           <div className="h-[75vh]">
-            {loading ? (
-              <div className="w-full h-full flex items-center justify-center bg-slate-950">
-                <div className="flex flex-col items-center gap-4">
-                  <Loader2 className="w-10 h-10 text-cyan-400 animate-spin" />
-                  <span className="text-slate-400">Loading whitepaper...</span>
-                </div>
-              </div>
-            ) : error ? (
-              <div className="w-full h-full flex items-center justify-center bg-slate-950">
-                <div className="flex flex-col items-center gap-4 text-center px-4">
-                  <div className="p-4 bg-red-500/10 rounded-full">
-                    <Lock className="w-10 h-10 text-red-400" />
-                  </div>
-                  <span className="text-red-400 font-medium">{error}</span>
-                  <button
-                    onClick={() => window.location.reload()}
-                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-sm transition-colors"
-                  >
-                    Try Again
-                  </button>
-                </div>
-              </div>
-            ) : pdfBlobUrl ? (
-              <iframe
-                src={`${pdfBlobUrl}#toolbar=1&navpanes=0`}
-                className="w-full h-full"
-                title="NeuroShard Whitepaper"
-              />
-            ) : null}
+            <iframe
+              src={`${pdfUrl}#toolbar=1&navpanes=0`}
+              className="w-full h-full"
+              title="NeuroShard Whitepaper"
+            />
           </div>
         </div>
 
         {/* Footer Note */}
         <div className="mt-6 text-center text-slate-500 text-sm">
           <p>
-            This document is confidential and intended for registered NeuroShard members only.
+            This whitepaper is open source and publicly available.
             <br />
-            Please do not share without permission.
+            <a 
+              href="https://github.com/Nexaroa/neuroshard" 
+              target="_blank" 
+              rel="noopener noreferrer"
+              className="text-cyan-400 hover:text-cyan-300 underline"
+            >
+              View source code on GitHub
+            </a>
           </p>
         </div>
       </div>

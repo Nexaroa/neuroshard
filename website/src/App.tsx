@@ -56,14 +56,7 @@ function App() {
         <Route path="/login" element={<Login />} />
         <Route path="/signup" element={<Signup />} />
         <Route path="/legal" element={<Legal />} />
-        <Route
-          path="/whitepaper"
-          element={
-            <ProtectedRoute>
-              <Whitepaper />
-            </ProtectedRoute>
-          }
-        />
+        <Route path="/whitepaper" element={<Whitepaper />} />
         <Route path="/ledger" element={<LedgerExplorer />} />
         <Route path="/training" element={<GlobalLLMStatus />} />
         <Route
