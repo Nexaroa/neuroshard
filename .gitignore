@@ -111,6 +111,30 @@ secrets/
 credentials/
 .pypirc
 
+# AWS credentials
+.aws/
+aws/credentials
+.aws/credentials
+.aws/config
+*.pem
+boto.cfg
+.boto
+
+# API keys and tokens
+*_key.txt
+*_secret.txt
+*_token.txt
+api_keys.txt
+secrets.txt
+
+# SSH keys
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+*.pub
+!*.example.pub
+
 # -------------------- Databases --------------------
 *.db
 *.sqlite
