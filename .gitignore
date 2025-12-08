@@ -15,19 +15,9 @@ Dockerfile*
 # Server configuration - kept private
 config/
 *.service
-scripts/backup_to_private.sh
-scripts/manage_tags.sh
-scripts/build_whitepaper.sh
-scripts/install.sh
-scripts/manage_tags.sh
-scripts/manage_tags.sh
 
-# Infrastructure scripts - kept private
-scripts/genesis_*.sh
-scripts/genesis_*.json
-scripts/*_s3.py
-scripts/setup_*.py
-scripts/release.sh
+# Scripts folder - kept private
+scripts/
 
 # -------------------- Python --------------------
 __pycache__/
