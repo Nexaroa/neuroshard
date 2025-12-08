@@ -321,8 +321,22 @@ class DynamicLayerPool:
                     self._assign_layer(last_layer, node_id, node_url, grpc_addr)
                     assigned_layers.append(last_layer)
 
-            # 4. If we have capacity left, we can potentially grow the model
+            # 4. Calculate remaining capacity
             remaining_capacity = max_layers_for_node - len(assigned_layers)
+            
+            # 5. DECENTRALIZED: Query DHT for existing layers before growing
+            # This prevents overlap when multiple nodes start simultaneously
+            if self.dht and remaining_capacity > 0:
+                dht_layers = self._discover_network_layers_from_dht()
+                if dht_layers:
+                    # Other nodes exist! Start from after the highest known layer
+                    highest_known = max(dht_layers)
+                    if highest_known >= self.current_num_layers:
+                        self.current_num_layers = highest_known + 1
+                        logger.info(f"DHT discovery: network has {highest_known + 1} layers, "
+                                   f"will grow from layer {self.current_num_layers}")
+            
+            # 6. If we still have capacity, grow the model
             if remaining_capacity > 0:
                 # Add new layers to grow the model
                 new_layers = self._grow_model(remaining_capacity, node_id, node_url, grpc_addr)
@@ -374,16 +388,50 @@ class DynamicLayerPool:
             except Exception as e:
                 logger.debug(f"DHT announce failed: {e}")
     
+    def _discover_network_layers_from_dht(self) -> Set[int]:
+        """
+        Query DHT to discover which layers exist in the network.
+        
+        DECENTRALIZED COORDINATION:
+        - Each node announces "layer_X" to DHT when it holds layer X
+        - New nodes query DHT to see what layers already exist
+        - This prevents layer overlap without centralized coordination
+        """
+        discovered_layers = set()
+        
+        if not self.dht:
+            return discovered_layers
+        
+        try:
+            # Query for layers 0-1000 (reasonable max)
+            # DHT lookup is fast - O(log N) hops
+            for layer_id in range(min(1000, self.current_num_layers + 100)):
+                key = f"layer_{layer_id}"
+                try:
+                    value = self.dht.lookup_value(key)
+                    if value:
+                        discovered_layers.add(layer_id)
+                except Exception:
+                    continue
+            
+            if discovered_layers:
+                logger.info(f"DHT layer discovery: found {len(discovered_layers)} layers "
+                           f"(range: {min(discovered_layers)}-{max(discovered_layers)})")
+        except Exception as e:
+            logger.debug(f"DHT layer discovery failed: {e}")
+        
+        return discovered_layers
+    
     def _grow_model(
-        self, 
-        num_new_layers: int, 
-        node_id: str, 
+        self,
+        num_new_layers: int,
+        node_id: str,
         node_url: str,
         grpc_addr: str
     ) -> List[int]:
         """
         Grow the model by adding new layers.
-        
+
         This is how the model organically grows with the network!
         """
         new_layers = []
