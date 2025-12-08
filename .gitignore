@@ -1,0 +1,184 @@
+# ============================================
+# NeuroShard .gitignore
+# ============================================
+
+# -------------------- Python --------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+venv_build/
+ENV/
+env.bak/
+venv.bak/
+
+# PyInstaller
+*.manifest
+
+# Testing & Coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# -------------------- Node.js --------------------
+node_modules/
+*/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn
+
+# -------------------- Secrets & Credentials --------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials/
+.pypirc
+
+# -------------------- Databases --------------------
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+users.db
+node_ledger.db
+ledger.db
+website/api/users.db
+
+# -------------------- Model Files & Checkpoints --------------------
+*.ckpt
+*.pth
+*.pt
+*.h5
+*.safetensors
+*.bin
+checkpoints/
+models/
+*.onnx
+
+# -------------------- Logs --------------------
+*.log
+logs/
+*.log.*
+
+# -------------------- Temporary Files --------------------
+*.tmp
+*.temp
+*.bak
+*.backup
+*.swp
+*.swo
+*~
+
+# -------------------- IDE & Editors --------------------
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+.settings/
+*.code-workspace
+
+# -------------------- OS Files --------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# -------------------- Docker --------------------
+docker-compose.override.yml
+.docker/
+
+# -------------------- NeuroShard Specific --------------------
+# Local node data
+neuroshard_data/
+.neuroshard/
+node_state/
+
+# Genesis cache
+genesis_cache/
+.genesis/
+
+# Training artifacts
+training_runs/
+tensorboard_logs/
+
+# Local config overrides
+config.local.*
+settings.local.*
+*.local.yaml
+*.local.json
+
+# Whitepaper build artifacts
+docs/whitepaper/*.aux
+docs/whitepaper/*.log
+docs/whitepaper/*.out
+docs/whitepaper/*.toc
+docs/whitepaper/*.synctex.gz
+
+# Website build artifacts (keep source)
+website/dist/
+docs-site/.vitepress/cache/
+docs-site/.vitepress/dist/
+
+# -------------------- Misc --------------------
+.ipynb_checkpoints
+*.sage.py
+celerybeat-schedule
+celerybeat.pid
+/site
+Pipfile.lock

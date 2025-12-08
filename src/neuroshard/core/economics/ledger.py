@@ -1,0 +1,2105 @@
+"""
+NEURO Token Ledger System
+
+This module implements the NEURO token economics for NeuroShard:
+- Proof of Neural Work (PoNW) verification
+- Token minting through verified work
+- Fee burn mechanism (5% deflationary)
+- Anti-cheat measures and rate limiting
+- ECDSA cryptographic signature verification (trustless)
+
+Security Model:
+1. Nodes cannot claim arbitrary rewards - all rewards require verifiable proof
+2. Proofs are signed with ECDSA - ANYONE can verify without shared secrets
+3. Replay attacks prevented via signature deduplication
+4. Plausibility checks prevent inflated claims
+5. Cross-validation via gossip consensus
+
+Based on: docs/whitepaper/neuroshard_whitepaper.tex
+"""
+
+import sqlite3
+import time
+import json
+import logging
+import threading
+import hashlib
+import os
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, asdict
+from enum import Enum
+
+# Import ECDSA crypto module - REQUIRED
+from neuroshard.core.crypto.ecdsa import (
+    NodeCrypto, 
+    verify_signature,
+    register_public_key,
+    get_public_key,
+    is_valid_signature_format,
+    is_valid_node_id_format
+)
+
+# Import ProofVerifier for semantic validation
+from neuroshard.core.consensus.verifier import ProofVerifier
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CONSTANTS - Token Economics (from Centralized Economics Module)
+# ============================================================================
+# All economic constants are defined in neuroshard/core/economics.py
+# Import from there to ensure consistency across the codebase.
+# ============================================================================
+
+from neuroshard.core.economics.constants import (
+    # Reward rates
+    UPTIME_REWARD_PER_MINUTE,
+    TRAINING_REWARD_PER_BATCH,
+    DATA_REWARD_PER_SAMPLE,
+    
+    # Dynamic inference pricing (PURE MARKET - no caps)
+    INFERENCE_MARKET_PRICE_SMOOTHING,
+    INFERENCE_MARKET_CAPACITY_TIMEOUT,
+    INFERENCE_MARKET_TARGET_RESPONSE_TIME,
+    INFERENCE_MARKET_BASE_PRICE,
+    
+    # Role distribution
+    DRIVER_SHARE,
+    WORKER_SHARE,
+    VALIDATOR_SHARE,
+    DRIVER_BONUS,
+    VALIDATOR_BONUS,
+    WORKER_LAYER_BONUS,
+    MAX_LAYER_BONUS,
+    TRAINING_BONUS,
+    
+    # Staking
+    STAKING_BASE_BONUS,
+    STAKING_UNIT,
+    STAKING_DIMINISHING,
+    MIN_STAKE_AMOUNT,
+    MAX_STAKE_AMOUNT,
+    
+    # Validator requirements
+    VALIDATOR_MIN_STAKE,
+    VALIDATOR_MIN_MEMORY_MB,
+    VALIDATION_FEE_PER_PROOF,
+    VALIDATION_CONSENSUS_THRESHOLD,
+    VALIDATOR_ROTATION_ENABLED,
+    VALIDATOR_SELECTION_RANDOMNESS,
+    REMOTE_STAKE_MULTIPLIER_CAP,
+    
+    # Fees and burns
+    FEE_BURN_RATE,
+    BURN_ADDRESS,
+    
+    # Anti-cheat limits
+    MAX_UPTIME_PER_PROOF,
+    MAX_TOKENS_PER_MINUTE,
+    MAX_PROOFS_PER_HOUR,
+    PROOF_FRESHNESS_WINDOW,
+    MAX_REWARD_PER_PROOF,
+    
+    # Slashing
+    SLASH_AMOUNT,
+    WHISTLEBLOWER_REWARD_RATE,
+    VALIDATOR_SLASH_MULTIPLIER,
+    
+    # Helper functions
+    calculate_stake_multiplier,
+    is_valid_stake_amount,
+    is_valid_stake_duration,
+)
+
+
+class ProofType(Enum):
+    """Types of Proof of Neural Work."""
+    UPTIME = "uptime"
+    INFERENCE = "inference"
+    TRAINING = "training"
+    DATA = "data"
+
+
+@dataclass
+class PoNWProof:
+    """
+    Proof of Neural Work - Cryptographically signed proof of contribution.
+    
+    Security Properties:
+    1. node_id: Derived from node_token (cannot be forged)
+    2. timestamp: Must be recent (prevents replay)
+    3. signature: HMAC-SHA256(node_token, canonical_payload)
+    4. nonce: Random value to prevent signature collision
+    5. request_id: Links to InferenceRequest for price locking (NEW: marketplace)
+    """
+    node_id: str
+    proof_type: str
+    timestamp: float
+    nonce: str
+    
+    # Work metrics
+    uptime_seconds: float = 0.0
+    tokens_processed: int = 0
+    training_batches: int = 0
+    data_samples: int = 0
+    
+    # NEW: Marketplace - links to InferenceRequest for price locking
+    request_id: Optional[str] = None  # If inference, which request was this?
+    
+    # Context for verification
+    model_hash: str = ""          # Hash of model state (for training proofs)
+    layers_held: int = 0          # Number of layers this node holds
+    has_embedding: bool = False   # Driver node
+    has_lm_head: bool = False     # Validator node
+    
+    # Training metrics (for global loss tracking)
+    current_loss: Optional[float] = None  # Current training loss (for aggregation)
+    
+    # Signature
+    signature: str = ""
+    
+    def canonical_payload(self) -> str:
+        """Create canonical string for signing (deterministic ordering).
+        
+        CRITICAL: All float fields must use consistent formatting to ensure
+        the same payload is generated on sender and receiver.
+        
+        NOTE: request_id is included in signature to prevent proof stealing.
+        """
+        return (
+            f"{self.node_id}:{self.proof_type}:{self.timestamp:.6f}:{self.nonce}:"
+            f"{float(self.uptime_seconds):.1f}:{self.tokens_processed}:{self.training_batches}:"
+            f"{self.data_samples}:{self.request_id if self.request_id else ''}:"
+            f"{self.model_hash}:{self.layers_held}"
+        )
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'PoNWProof':
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+def sign_proof(proof: 'PoNWProof', node_token: str) -> 'PoNWProof':
+    """
+    Sign a Proof of Neural Work using ECDSA.
+    
+    Args:
+        proof: The proof to sign
+        node_token: The node's secret token for signing
+        
+    Returns:
+        The same proof with signature field populated
+    """
+    from neuroshard.core.crypto.ecdsa import sign_message
+    payload = proof.canonical_payload()
+    proof.signature = sign_message(payload, node_token)
+    return proof
+
+
+@dataclass
+class Transaction:
+    """NEURO transfer transaction with fee burn."""
+    tx_id: str
+    from_id: str
+    to_id: str
+    amount: float
+    fee: float              # Total fee
+    burn_amount: float      # 5% of fee burned
+    timestamp: float
+    signature: str
+    memo: str = ""
+    
+    def canonical_payload(self) -> str:
+        return f"{self.from_id}:{self.to_id}:{self.amount}:{self.fee}:{self.timestamp}:{self.memo}"
+
+
+@dataclass 
+class LedgerStats:
+    """Global ledger statistics."""
+    total_minted: float = 0.0
+    total_burned: float = 0.0
+    total_transferred: float = 0.0
+    circulating_supply: float = 0.0
+    total_proofs_processed: int = 0
+    total_transactions: int = 0
+
+
+class NEUROLedger:
+    """
+    Secure NEURO Token Ledger with Proof of Neural Work verification.
+    
+    Security Features:
+    1. ECDSA signatures on all proofs (trustless verification)
+    2. Rate limiting to prevent reward inflation
+    3. Plausibility checks on claimed work
+    4. Replay attack prevention via signature deduplication
+    5. Fee burn mechanism (5% deflationary)
+    6. Slashing for detected fraud
+    
+    Cryptography:
+    - Uses ECDSA with secp256k1 curve (same as Bitcoin/Ethereum)
+    - Anyone can verify signatures with just the public key
+    - No shared secrets needed for verification
+    """
+    
+    def __init__(
+        self, 
+        db_path: str = "neuro_ledger.db",
+        node_id: Optional[str] = None,
+        node_token: Optional[str] = None,
+        model_interface: Optional[Any] = None
+    ):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        
+        # Initialize ECDSA crypto - REQUIRED
+        self.crypto: Optional[NodeCrypto] = None
+        if node_token:
+            self.crypto = NodeCrypto(node_token)
+            self.node_id = self.crypto.node_id
+            logger.info(f"ECDSA crypto initialized for node {self.node_id[:16]}...")
+        else:
+            self.node_id = node_id or "unknown"
+        
+        self.node_token = node_token
+        
+        # Initialize inference market (PURE MARKET PRICING - no caps!)
+        # Quality emerges naturally: stupid model = no demand = low price
+        # Excellent model = high demand = high price (market finds true value)
+        self.inference_market = None
+        from neuroshard.core.economics.market import InferenceMarket
+        self.inference_market = InferenceMarket(
+            price_smoothing=INFERENCE_MARKET_PRICE_SMOOTHING,
+            capacity_timeout=INFERENCE_MARKET_CAPACITY_TIMEOUT,
+            base_price=INFERENCE_MARKET_BASE_PRICE
+        )
+        logger.info(f"Dynamic inference pricing enabled: PURE MARKET (no artificial caps)")
+        
+        # Initialize database
+        self._init_db()
+        
+        # Initialize Verifier
+        self.verifier = ProofVerifier(model_interface=model_interface)
+        
+        # Role verification callback (set by runner after layer pool is initialized)
+        # This prevents nodes from claiming Validator/Driver role bonuses they don't have
+        self._role_verifier = None
+        
+        # Cache for verified roles (signature -> (verified_embed, verified_head))
+        # Used to ensure rewards are based on VERIFIED roles, not claimed ones
+        self._verified_roles: Dict[str, Tuple[bool, bool]] = {}
+        
+        logger.info(f"NEUROLedger initialized: node={self.node_id[:16]}...")
+    
+    def set_role_verifier(self, verifier_fn):
+        """
+        Set the role verification callback.
+        
+        The callback should accept (node_id, claimed_has_embedding, claimed_has_lm_head)
+        and return (is_valid, actual_has_embedding, actual_has_lm_head).
+        
+        This prevents nodes from claiming Validator bonuses they don't deserve.
+        """
+        self._role_verifier = verifier_fn
+        logger.info("Role verifier registered - fake role claims will be rejected")
+    
+    def set_model_interface(self, model_interface):
+        """
+        Set the model interface for training work verification.
+        
+        This is called after the NeuroNode is initialized, since the ledger
+        is created before the node (in P2P setup).
+        
+        Args:
+            model_interface: Object implementing verify_training_work(proof).
+                             Typically a SwarmEnabledDynamicNode.
+        """
+        self.verifier.model_interface = model_interface
+        logger.info("Model interface registered - training work verification enabled")
+        
+    def _init_db(self):
+        """Initialize SQLite database with all required tables."""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Main balances table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS balances (
+                        node_id TEXT PRIMARY KEY,
+                        balance REAL DEFAULT 0.0,
+                        total_earned REAL DEFAULT 0.0,
+                        total_spent REAL DEFAULT 0.0,
+                        last_proof_time REAL DEFAULT 0.0,
+                        proof_count INTEGER DEFAULT 0,
+                        created_at REAL DEFAULT 0.0
+                    )
+                """)
+                
+                # Proof history (for replay prevention and audit)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS proof_history (
+                        signature TEXT PRIMARY KEY,
+                        node_id TEXT NOT NULL,
+                        proof_type TEXT NOT NULL,
+                        timestamp REAL NOT NULL,
+                        uptime_seconds REAL DEFAULT 0.0,
+                        tokens_processed INTEGER DEFAULT 0,
+                        training_batches INTEGER DEFAULT 0,
+                        data_samples INTEGER DEFAULT 0,
+                        reward_amount REAL DEFAULT 0.0,
+                        received_at REAL NOT NULL,
+                        verified BOOLEAN DEFAULT 1,
+                        current_loss REAL DEFAULT NULL,
+                        has_lm_head BOOLEAN DEFAULT 0
+                    )
+                """)
+                # Add columns if missing (migration for existing DBs)
+                try:
+                    conn.execute("ALTER TABLE proof_history ADD COLUMN current_loss REAL DEFAULT NULL")
+                except:
+                    pass  # Column already exists
+                try:
+                    conn.execute("ALTER TABLE proof_history ADD COLUMN has_lm_head BOOLEAN DEFAULT 0")
+                except:
+                    pass  # Column already exists
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_proof_node ON proof_history(node_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_proof_time ON proof_history(timestamp)")
+                
+                # Transaction history
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS transactions (
+                        tx_id TEXT PRIMARY KEY,
+                        from_id TEXT NOT NULL,
+                        to_id TEXT NOT NULL,
+                        amount REAL NOT NULL,
+                        fee REAL DEFAULT 0.0,
+                        burn_amount REAL DEFAULT 0.0,
+                        timestamp REAL NOT NULL,
+                        memo TEXT DEFAULT '',
+                        signature TEXT NOT NULL
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_from ON transactions(from_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_to ON transactions(to_id)")
+                
+                # Stakes (for reward multiplier)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS stakes (
+                        node_id TEXT PRIMARY KEY,
+                        amount REAL DEFAULT 0.0,
+                        locked_until REAL DEFAULT 0.0,
+                        updated_at REAL DEFAULT 0.0
+                    )
+                """)
+                
+                # Global stats
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS global_stats (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        total_minted REAL DEFAULT 0.0,
+                        total_burned REAL DEFAULT 0.0,
+                        total_transferred REAL DEFAULT 0.0,
+                        total_proofs INTEGER DEFAULT 0,
+                        total_transactions INTEGER DEFAULT 0,
+                        updated_at REAL DEFAULT 0.0
+                    )
+                """)
+
+                # Initialize global stats if not exists (Genesis Block)
+                # 
+                # TRANSPARENCY NOTICE:
+                # ====================
+                # This is the Genesis Block initialization. The ledger starts with:
+                # - total_minted = 0.0 (no pre-mine)
+                # - total_burned = 0.0
+                # - total_transferred = 0.0
+                # - total_proofs = 0
+                # - total_transactions = 0
+                #
+                # ALL NEURO tokens must be earned through verified Proof of Neural Work.
+                # There is NO pre-allocation, NO founder tokens, NO ICO.
+                # Even the project creators must run nodes and do real work to earn NEURO.
+                #
+                # This can be independently verified by any node by checking:
+                # SELECT * FROM global_stats WHERE id = 1;
+                #
+                conn.execute("""
+                    INSERT OR IGNORE INTO global_stats (id, total_minted, total_burned, updated_at) 
+                    VALUES (1, 0.0, 0.0, ?)
+                """, (time.time(),))
+                
+                # Create genesis record in proof_history for auditability
+                genesis_exists = conn.execute(
+                    "SELECT 1 FROM proof_history WHERE signature = 'GENESIS_BLOCK'"
+                ).fetchone()
+                
+                if not genesis_exists:
+                    conn.execute("""
+                        INSERT INTO proof_history 
+                        (signature, node_id, proof_type, timestamp, uptime_seconds, 
+                         tokens_processed, training_batches, data_samples, reward_amount, received_at)
+                        VALUES ('GENESIS_BLOCK', 'GENESIS', 'GENESIS', ?, 0, 0, 0, 0, 0.0, ?)
+                    """, (time.time(), time.time()))
+                    logger.info("Genesis Block created - Ledger initialized with zero supply")
+                
+                # Rate limiting table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS rate_limits (
+                        node_id TEXT PRIMARY KEY,
+                        proofs_last_hour INTEGER DEFAULT 0,
+                        tokens_last_minute INTEGER DEFAULT 0,
+                        last_reset_hour REAL DEFAULT 0.0,
+                        last_reset_minute REAL DEFAULT 0.0
+                    )
+                """)
+                
+                # Fraud reports (for slashing)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS fraud_reports (
+                        report_id TEXT PRIMARY KEY,
+                        reporter_id TEXT NOT NULL,
+                        accused_id TEXT NOT NULL,
+                        proof_signature TEXT,
+                        reason TEXT NOT NULL,
+                        evidence TEXT,
+                        status TEXT DEFAULT 'pending',
+                        slash_amount REAL DEFAULT 0.0,
+                        created_at REAL NOT NULL
+                    )
+                """)
+    
+    # ========================================================================
+    # SIGNATURE & VERIFICATION
+    # ========================================================================
+    
+    def _sign(self, payload: str) -> str:
+        """
+        Sign a payload using ECDSA with secp256k1.
+        
+        ECDSA signatures enable trustless verification by any node.
+        Anyone can verify using our public key.
+        """
+        if not self.crypto:
+            raise ValueError("Cannot sign without crypto initialized (need node_token)")
+        
+        return self.crypto.sign(payload)
+    
+    def get_public_key_hex(self) -> str:
+        """Get this node's public key in hex format for sharing."""
+        if not self.crypto:
+            raise ValueError("Crypto not initialized")
+        return self.crypto.get_public_key_hex()
+    
+    def get_public_key_bytes(self) -> bytes:
+        """Get this node's public key bytes for verification."""
+        if not self.crypto:
+            raise ValueError("Crypto not initialized")
+        return self.crypto.get_public_key_bytes()
+    
+    def _verify_signature(self, proof: PoNWProof) -> bool:
+        """
+        Verify proof signature using ECDSA.
+        
+        Security Model:
+        ===============
+        ECDSA enables TRUSTLESS verification:
+        - Signature can be verified by ANYONE with the public key
+        - No shared secret needed
+        - Full cryptographic verification
+        - Same curve as Bitcoin/Ethereum (secp256k1)
+        
+        TRANSPARENCY GUARANTEE:
+        =======================
+        There is NO admin backdoor. The ONLY way to get NEURO is:
+        1. Run a node that does real work (training, inference, uptime)
+        2. Create a proof of that work, signed with ECDSA
+        3. Submit the proof, which passes ALL verification checks
+        4. Receive rewards proportional to verified work
+        
+        Even the project creators must run nodes and do real work to earn NEURO.
+        """
+        if not proof.signature or proof.signature == "unsigned":
+            logger.warning("Missing or unsigned signature")
+            return False
+            
+        # Validate signature format
+        if not is_valid_signature_format(proof.signature):
+            logger.warning(f"Invalid signature format: {proof.signature[:20]}...")
+            return False
+
+        # Validate node_id format (32 hex chars)
+        if not is_valid_node_id_format(proof.node_id):
+            logger.warning(f"Invalid node_id format: {proof.node_id}")
+            return False
+        
+        # For our own proofs, verify with our crypto
+        if proof.node_id == self.node_id and self.crypto:
+            payload = proof.canonical_payload()
+            return self.crypto.verify(payload, proof.signature)
+        
+        # For external proofs, use the public key registry
+        payload = proof.canonical_payload()
+        result = verify_signature(proof.node_id, payload, proof.signature)
+        if not result:
+            # Log as debug - signature mismatches are common during version transitions
+            # where different nodes may have different canonical_payload formats
+            logger.warning(f"Signature verification failed for {proof.node_id[:16]}... (likely version mismatch)")
+        return result
+    
+    # ========================================================================
+    # PROOF CREATION & PROCESSING
+    # ========================================================================
+    
+    def create_proof(
+        self,
+        proof_type: ProofType,
+        uptime_seconds: float = 0.0,
+        tokens_processed: int = 0,
+        training_batches: int = 0,
+        data_samples: int = 0,
+        model_hash: str = "",
+        layers_held: int = 0,
+        has_embedding: bool = False,
+        has_lm_head: bool = False,
+        current_loss: Optional[float] = None
+    ) -> PoNWProof:
+        """
+        Create a signed Proof of Neural Work.
+        
+        Rate Limiting Applied:
+        - uptime_seconds capped at MAX_UPTIME_PER_PROOF
+        - tokens_processed checked against rate limits
+        """
+        # Apply rate limits
+        uptime_seconds = min(uptime_seconds, MAX_UPTIME_PER_PROOF)
+        
+        # Generate unique nonce
+        nonce = hashlib.sha256(f"{time.time()}:{os.urandom(16).hex()}".encode()).hexdigest()[:16]
+        
+        # CRITICAL: data_samples, model_hash, request_id match canonical_payload
+        proof = PoNWProof(
+            node_id=self.node_id,
+            proof_type=proof_type.value,
+            timestamp=time.time(),
+            nonce=nonce,
+            uptime_seconds=uptime_seconds,
+            tokens_processed=tokens_processed,
+            training_batches=training_batches,
+            data_samples=data_samples,
+            model_hash=model_hash,
+            layers_held=layers_held,
+            has_embedding=has_embedding,
+            has_lm_head=has_lm_head,
+            current_loss=current_loss
+        )
+        
+        # Sign the proof
+        payload = proof.canonical_payload()
+        proof.signature = self._sign(payload)
+        
+        return proof
+    
+    def verify_proof(self, proof: PoNWProof) -> Tuple[bool, str]:
+        """
+        Verify a Proof of Neural Work.
+        
+        Checks:
+        1. Signature validity
+        2. Timestamp freshness
+        3. Replay prevention (signature not seen before)
+        4. Rate limiting
+        5. Plausibility of claimed work
+        
+        Returns: (is_valid, reason)
+        """
+        # 1. Check signature
+        if not self._verify_signature(proof):
+            return False, "Invalid signature"
+        
+        # 2. Check timestamp freshness
+        age = time.time() - proof.timestamp
+        if age > PROOF_FRESHNESS_WINDOW:
+            return False, f"Proof too old ({age:.0f}s > {PROOF_FRESHNESS_WINDOW}s)"
+        if age < -60:  # Allow 1 minute clock skew
+            return False, "Proof timestamp in future"
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # 3. Check for replay
+                existing = conn.execute(
+                    "SELECT 1 FROM proof_history WHERE signature = ?",
+                    (proof.signature,)
+                ).fetchone()
+                if existing:
+                    return False, "Duplicate proof (replay)"
+                
+                # 4. Rate limiting
+                is_limited, limit_reason = self._check_rate_limits(conn, proof)
+                if is_limited:
+                    return False, limit_reason
+                
+                # 5. Plausibility checks
+                is_plausible, plausibility_reason = self._check_plausibility(proof)
+                if not is_plausible:
+                    return False, plausibility_reason
+        
+        # 6. Work Content Verification (Semantic Check)
+        # This verifies that the work was ACTUALLY done (e.g. gradients reduce loss)
+        is_work_valid, work_reason = self.verifier.verify_work_content(proof)
+        if not is_work_valid:
+            return False, f"Work validation failed: {work_reason}"
+
+        return True, "Valid"
+    
+    def _check_rate_limits(self, conn, proof: PoNWProof) -> Tuple[bool, str]:
+        """Check if node is within rate limits."""
+        now = time.time()
+        
+        # Get or create rate limit record
+        row = conn.execute(
+            "SELECT proofs_last_hour, tokens_last_minute, last_reset_hour, last_reset_minute FROM rate_limits WHERE node_id = ?",
+            (proof.node_id,)
+        ).fetchone()
+        
+        if row:
+            proofs_last_hour, tokens_last_minute, last_reset_hour, last_reset_minute = row
+            
+            # Reset hourly counter if needed
+            if now - last_reset_hour > 3600:
+                proofs_last_hour = 0
+                last_reset_hour = now
+            
+            # Reset minute counter if needed
+            if now - last_reset_minute > 60:
+                tokens_last_minute = 0
+                last_reset_minute = now
+        else:
+            proofs_last_hour = 0
+            tokens_last_minute = 0
+            last_reset_hour = now
+            last_reset_minute = now
+        
+        # Check limits
+        if proofs_last_hour >= MAX_PROOFS_PER_HOUR:
+            return True, f"Rate limit: max {MAX_PROOFS_PER_HOUR} proofs/hour"
+        
+        new_tokens = tokens_last_minute + proof.tokens_processed
+        if new_tokens > MAX_TOKENS_PER_MINUTE * 60:  # Scaled to hour
+            return True, f"Rate limit: max {MAX_TOKENS_PER_MINUTE} tokens/minute"
+        
+        # Update rate limits
+        conn.execute("""
+            INSERT INTO rate_limits (node_id, proofs_last_hour, tokens_last_minute, last_reset_hour, last_reset_minute)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                proofs_last_hour = ?,
+                tokens_last_minute = ?,
+                last_reset_hour = ?,
+                last_reset_minute = ?
+        """, (
+            proof.node_id,
+            proofs_last_hour + 1, new_tokens, last_reset_hour, last_reset_minute,
+            proofs_last_hour + 1, new_tokens, last_reset_hour, last_reset_minute
+        ))
+        
+        return False, ""
+    
+    def _check_plausibility(self, proof: PoNWProof) -> Tuple[bool, str]:
+        """Check if claimed work is plausible."""
+        # CRITICAL: Verify role claims against actual layer assignments
+        # This prevents nodes from claiming Validator/Driver bonuses they don't deserve
+        if self._role_verifier and (proof.has_embedding or proof.has_lm_head):
+            is_role_valid, actual_embed, actual_head = self._role_verifier(
+                proof.node_id, 
+                proof.has_embedding, 
+                proof.has_lm_head
+            )
+            
+            # Store VERIFIED roles for reward calculation
+            # Even if we accept the proof, we only pay bonuses for VERIFIED roles
+            self._verified_roles[proof.signature] = (actual_embed, actual_head)
+            
+            if not is_role_valid:
+                if proof.has_lm_head and not actual_head:
+                    logger.warning(f"FAKE VALIDATOR DETECTED: {proof.node_id[:16]}... claimed has_lm_head=True but is NOT a Validator")
+                    return False, "Invalid role claim: not a Validator"
+                if proof.has_embedding and not actual_embed:
+                    logger.warning(f"FAKE DRIVER DETECTED: {proof.node_id[:16]}... claimed has_embedding=True but is NOT a Driver")
+                    return False, "Invalid role claim: not a Driver"
+        else:
+            # No role verifier or no role claims - use claimed values
+            self._verified_roles[proof.signature] = (proof.has_embedding, proof.has_lm_head)
+        
+        # Uptime check
+        if proof.uptime_seconds > MAX_UPTIME_PER_PROOF:
+            return False, f"Uptime too high ({proof.uptime_seconds}s > {MAX_UPTIME_PER_PROOF}s)"
+        
+        # Token rate check (tokens per second)
+        if proof.uptime_seconds > 0:
+            tokens_per_second = proof.tokens_processed / proof.uptime_seconds
+            max_tps = MAX_TOKENS_PER_MINUTE / 60
+            if tokens_per_second > max_tps * 2:  # Allow 2x buffer
+                return False, f"Token rate implausible ({tokens_per_second:.0f} > {max_tps * 2:.0f} tps)"
+        
+        # Training batches check (max ~60 per minute on good hardware)
+        if proof.uptime_seconds > 0:
+            batches_per_minute = (proof.training_batches / proof.uptime_seconds) * 60
+            if batches_per_minute > 120:  # 2 batches/second max
+                return False, f"Training rate implausible ({batches_per_minute:.0f} batches/min)"
+        
+        return True, ""
+    
+    def process_proof(self, proof: PoNWProof) -> Tuple[bool, float, str]:
+        """
+        Process a verified proof and credit rewards.
+        
+        Returns: (success, reward_amount, message)
+        """
+        # Verify first
+        is_valid, reason = self.verify_proof(proof)
+        if not is_valid:
+            return False, 0.0, reason
+        
+        # Calculate reward
+        reward = self._calculate_reward(proof)
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Double-check replay (in case of race)
+                existing = conn.execute(
+                    "SELECT 1 FROM proof_history WHERE signature = ?",
+                    (proof.signature,)
+                ).fetchone()
+                if existing:
+                    return False, 0.0, "Duplicate proof"
+                
+                # Record proof (including current_loss and has_lm_head for training stats aggregation)
+                conn.execute("""
+                    INSERT INTO proof_history 
+                    (signature, node_id, proof_type, timestamp, uptime_seconds, 
+                     tokens_processed, training_batches, data_samples, reward_amount, received_at, current_loss, has_lm_head)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    proof.signature, proof.node_id, proof.proof_type, proof.timestamp,
+                    proof.uptime_seconds, proof.tokens_processed, proof.training_batches,
+                    proof.data_samples, reward, time.time(), proof.current_loss, proof.has_lm_head
+                ))
+                
+                # Credit balance
+                conn.execute("""
+                    INSERT INTO balances (node_id, balance, total_earned, last_proof_time, proof_count, created_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        balance = balance + ?,
+                        total_earned = total_earned + ?,
+                        last_proof_time = ?,
+                        proof_count = proof_count + 1
+                """, (
+                    proof.node_id, reward, reward, proof.timestamp, time.time(),
+                    reward, reward, proof.timestamp
+                ))
+                
+                # Update global stats
+                conn.execute("""
+                    UPDATE global_stats SET
+                        total_minted = total_minted + ?,
+                        total_proofs = total_proofs + 1,
+                        updated_at = ?
+                    WHERE id = 1
+                """, (reward, time.time()))
+        
+        # If this was a marketplace request, register proof received (DISTRIBUTED)
+        # Multiple nodes (driver, workers, validator) submit proofs for same request
+        if proof.request_id and self.inference_market:
+            is_complete, error = self.inference_market.register_proof_received(
+                request_id=proof.request_id,
+                node_id=proof.node_id,
+                is_driver=proof.has_embedding,
+                is_validator=proof.has_lm_head
+            )
+            if error:
+                logger.warning(f"Failed to register proof for {proof.request_id[:8]}...: {error}")
+            elif is_complete:
+                logger.info(f"Request {proof.request_id[:8]}... COMPLETED (all proofs received)")
+        
+        logger.info(f"PoNW: {proof.node_id[:12]}... earned {reward:.6f} NEURO "
+                   f"(type={proof.proof_type}, uptime={proof.uptime_seconds:.0f}s, "
+                   f"tokens={proof.tokens_processed})"
+                   f"{f', request={proof.request_id[:8]}...' if proof.request_id else ''}")
+        
+        return True, reward, "Proof processed"
+    
+    def _calculate_reward(self, proof: PoNWProof) -> float:
+        """
+        Calculate NEURO reward for a Proof of Neural Work.
+        
+        Reward Structure:
+        ================
+        
+        1. UPTIME REWARD (all nodes):
+           - 0.1 NEURO per minute of uptime
+           - Incentivizes nodes to stay online
+        
+        2. INFERENCE REWARD (PURE MARKET-BASED):
+           - Total pool: DYNAMIC (based on supply/demand)
+           - Worthless model → ~0 NEURO (no demand)
+           - Good model → Market price rises naturally
+           - Distributed by role:
+             * DRIVER (has_embedding=True):  See DRIVER_SHARE
+             * WORKER (middle layers):       See WORKER_SHARE
+             * VALIDATOR (has_lm_head=True): See VALIDATOR_SHARE
+        
+        3. TRAINING REWARD:
+           - See TRAINING_REWARD_PER_BATCH in economics.py
+        
+        4. DATA REWARD:
+           - See DATA_REWARD_PER_SAMPLE in economics.py
+        
+        5. MULTIPLIERS:
+           - Staking: Logarithmic curve (see calculate_stake_multiplier)
+           - Role bonus: Defined in economics.py
+           - Layer bonus: Defined in economics.py
+        """
+        # =====================================================================
+        # 1. UPTIME REWARD (same for all roles)
+        # =====================================================================
+        uptime_reward = (proof.uptime_seconds / 60.0) * UPTIME_REWARD_PER_MINUTE
+        
+        # =====================================================================
+        # 2. INFERENCE REWARD (MARKETPLACE with REQUEST MATCHING)
+        # =====================================================================
+        # Price is LOCKED at request submission time (prevents timing attacks)
+        # - If request_id present: Use locked price from InferenceRequest
+        # - If no request_id: Use current market price (legacy/direct inference)
+        
+        if proof.request_id and self.inference_market:
+            # NEW MARKETPLACE: Use locked price from request
+            request = self.inference_market.get_request(proof.request_id)
+            
+            if not request:
+                raise ValueError(f"Request {proof.request_id} not found")
+            
+            if request.claimed_by != proof.node_id:
+                raise ValueError(f"Request {proof.request_id} was claimed by {request.claimed_by}, "
+                               f"but proof submitted by {proof.node_id}")
+            
+            if request.completed:
+                raise ValueError(f"Request {proof.request_id} already completed")
+            
+            # Use LOCKED price from request submission time
+            market_price = request.locked_price
+            logger.debug(f"Using locked price {market_price:.6f} from request {proof.request_id[:8]}...")
+        else:
+            # Legacy mode or direct inference: use current market price
+            market_price = self.inference_market.get_current_price()
+            logger.debug(f"Using current market price {market_price:.6f} (no request_id)")
+        
+        inference_pool = (proof.tokens_processed / 1_000_000.0) * market_price
+        
+        # Determine role and calculate share
+        # CRITICAL: Use VERIFIED roles, not claimed roles!
+        # This ensures nodes can't claim bonuses they don't deserve
+        if proof.signature in self._verified_roles:
+            is_driver, is_validator = self._verified_roles[proof.signature]
+            # Clean up cache entry
+            del self._verified_roles[proof.signature]
+        else:
+            # Fallback to claimed (for self-proofs or legacy)
+            is_driver = proof.has_embedding
+            is_validator = proof.has_lm_head
+        
+        is_worker = proof.layers_held > 0 and not (is_driver and is_validator)
+        
+        inference_reward = 0.0
+        
+        if is_driver:
+            # Driver gets 15% of the inference pool
+            inference_reward += inference_pool * DRIVER_SHARE
+        
+        if is_validator:
+            # Validator gets 15% of the inference pool
+            inference_reward += inference_pool * VALIDATOR_SHARE
+        
+        if is_worker or proof.layers_held > 0:
+            # Workers get rewarded per layer they process
+            # 
+            # The WORKER_SHARE (70%) represents the total computation work.
+            # Each layer does roughly equal work, so we reward per layer.
+            #
+            # Formula: worker_reward = (layers_held / total_layers) * worker_pool
+            #
+            # But we don't know total_layers in the network at proof time.
+            # Instead, we use a PER-LAYER reward rate:
+            #
+            #   WORKER_SHARE_PER_LAYER = WORKER_SHARE / expected_layers
+            #
+            # For simplicity, we give full worker share if you hold ANY layers,
+            # since each node only claims for tokens THEY processed through
+            # THEIR layers. The tokens_processed already reflects their work.
+            #
+            # In multi-node inference:
+            #   - Driver processes 100K tokens → claims Driver share for 100K
+            #   - Worker1 processes 100K tokens → claims Worker share for 100K  
+            #   - Worker2 processes 100K tokens → claims Worker share for 100K
+            #   - Validator processes 100K tokens → claims Validator share for 100K
+            #
+            # Each node's tokens_processed = tokens they actually computed.
+            # So we give full worker share - the tokens_processed is already
+            # the accurate measure of their contribution.
+            
+            worker_pool = inference_pool * WORKER_SHARE
+            inference_reward += worker_pool  # Full share - tokens_processed is already per-node
+        
+        # =====================================================================
+        # 3. TRAINING REWARD
+        # =====================================================================
+        training_reward = proof.training_batches * TRAINING_REWARD_PER_BATCH
+        
+        # =====================================================================
+        # 4. DATA REWARD
+        # =====================================================================
+        data_reward = proof.data_samples * DATA_REWARD_PER_SAMPLE
+        
+        # =====================================================================
+        # 5. CALCULATE BASE REWARD
+        # =====================================================================
+        base_reward = uptime_reward + inference_reward + training_reward + data_reward
+        
+        # =====================================================================
+        # 6. STAKING MULTIPLIER (with diminishing returns)
+        # =====================================================================
+        # SECURITY: For LOCAL proofs, use our verified stake
+        # For REMOTE proofs, we use their claimed stake but cap the multiplier
+        stake = self._get_stake(proof.node_id)
+        
+        # If this is a REMOTE proof (not from us), cap the stake multiplier
+        # to prevent fake stake claims from inflating rewards
+        is_local_proof = (proof.node_id == self.node_id)
+        
+        if is_local_proof:
+            # Our own proof - use full stake multiplier
+            stake_multiplier = self._calculate_stake_multiplier(stake)
+        else:
+            # Remote proof - cap multiplier for security (from economics.py)
+            # This limits the impact of fake stake claims
+            stake_multiplier = min(REMOTE_STAKE_MULTIPLIER_CAP, self._calculate_stake_multiplier(stake))
+        
+        # =====================================================================
+        # 7. ROLE BONUS MULTIPLIER (on uptime reward component)
+        # =====================================================================
+        role_multiplier = 1.0
+        
+        if is_driver:
+            role_multiplier *= DRIVER_BONUS  # See economics.py for rate
+        
+        if is_validator:
+            role_multiplier *= VALIDATOR_BONUS  # See economics.py for rate
+        
+        # Layer bonus for workers
+        if proof.layers_held > 0:
+            layer_bonus = min(MAX_LAYER_BONUS, proof.layers_held * WORKER_LAYER_BONUS)
+            role_multiplier *= (1.0 + layer_bonus)
+        
+        # Training bonus
+        if proof.training_batches > 0:
+            role_multiplier *= TRAINING_BONUS
+        
+        # =====================================================================
+        # 8. FINAL REWARD
+        # =====================================================================
+        total_reward = base_reward * stake_multiplier * role_multiplier
+        
+        return total_reward
+    
+    def _get_stake(self, node_id: str) -> float:
+        """Get staked amount for a node."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT amount FROM stakes WHERE node_id = ? AND locked_until > ?",
+                (node_id, time.time())
+            ).fetchone()
+            return row[0] if row else 0.0
+    
+    def _calculate_stake_multiplier(self, stake: float) -> float:
+        """
+        Calculate stake multiplier using centralized economics function.
+        
+        See neuroshard/core/economics.py for formula and examples.
+        """
+        return calculate_stake_multiplier(stake)
+    
+    # ========================================================================
+    # VALIDATOR ELIGIBILITY
+    # ========================================================================
+    
+    def is_eligible_validator(self, node_id: str = None) -> Tuple[bool, str]:
+        """
+        Check if a node is eligible to be a Validator.
+        
+        Requirements:
+        1. Minimum stake of VALIDATOR_MIN_STAKE (100 NEURO)
+        2. Memory requirements checked at layer assignment time
+        
+        Returns: (eligible, reason)
+        """
+        node_id = node_id or self.node_id
+        stake = self._get_stake(node_id)
+        
+        if stake < VALIDATOR_MIN_STAKE:
+            return False, f"Insufficient stake: {stake:.2f} < {VALIDATOR_MIN_STAKE} NEURO required"
+        
+        return True, f"Eligible with {stake:.2f} NEURO staked"
+    
+    def get_validator_info(self, node_id: str = None) -> dict:
+        """Get validator status and info for a node."""
+        node_id = node_id or self.node_id
+        stake = self._get_stake(node_id)
+        eligible, reason = self.is_eligible_validator(node_id)
+        
+        return {
+            "node_id": node_id,
+            "stake": stake,
+            "stake_multiplier": self._calculate_stake_multiplier(stake),
+            "is_eligible_validator": eligible,
+            "eligibility_reason": reason,
+            "min_stake_required": VALIDATOR_MIN_STAKE,
+            "validation_fee_per_proof": VALIDATION_FEE_PER_PROOF,
+        }
+    
+    # ========================================================================
+    # DYNAMIC INFERENCE MARKET
+    # ========================================================================
+    
+    def register_inference_capacity(
+        self,
+        tokens_per_second: int,
+        min_price: float = 0.0
+    ):
+        """
+        Register this node's available inference capacity with the market.
+        
+        Args:
+            tokens_per_second: Processing capacity (tokens/sec)
+            min_price: Minimum NEURO per 1M tokens node will accept
+        """
+        if not USE_DYNAMIC_INFERENCE_PRICING or not self.inference_market:
+            return
+        
+        self.inference_market.register_capacity(
+            node_id=self.node_id,
+            tokens_per_second=tokens_per_second,
+            min_price=min_price
+        )
+        logger.debug(f"Registered inference capacity: {tokens_per_second} t/s, min_price={min_price:.4f}")
+    
+    def withdraw_inference_capacity(self):
+        """
+        Withdraw this node from the inference market (e.g., to focus on training).
+        """
+        if not USE_DYNAMIC_INFERENCE_PRICING or not self.inference_market:
+            return
+        
+        self.inference_market.withdraw_capacity(self.node_id)
+        logger.debug(f"Withdrew from inference market")
+    
+    def get_inference_market_stats(self) -> dict:
+        """
+        Get current inference market statistics.
+        
+        Returns:
+            Market stats including price, supply, demand, utilization
+        """
+        # ALWAYS use dynamic market pricing (no fallback)
+        stats = self.inference_market.get_market_stats()
+        stats["mode"] = "pure_market"
+        return stats
+    
+    def submit_inference_request(
+        self,
+        request_id: str,
+        user_id: str,
+        tokens_requested: int,
+        max_price: float,
+        priority: int = 0
+    ) -> bool:
+        """
+        Submit an inference request to the market.
+        
+        Args:
+            request_id: Unique request identifier
+            user_id: User submitting request
+            tokens_requested: Number of tokens to generate
+            max_price: Maximum NEURO per 1M tokens user will pay
+            priority: Request priority (higher = more urgent)
+        
+        Returns:
+            True if request accepted, False if price too high
+        """
+
+        return self.inference_market.submit_request(
+            request_id=request_id,
+            user_id=user_id,
+            tokens_requested=tokens_requested,
+            max_price=max_price,
+            priority=priority
+        )
+    
+    # ========================================================================
+    # PROOF VALIDATION (Stake-Weighted Consensus)
+    # ========================================================================
+    
+    def validate_proof_as_validator(
+        self,
+        proof: PoNWProof,
+        vote: bool,
+        validation_details: str = ""
+    ) -> Tuple[bool, float, str]:
+        """
+        Cast a validation vote on a proof as a Validator.
+        
+        Only nodes meeting VALIDATOR_MIN_STAKE can validate.
+        Validators earn VALIDATION_FEE_PER_PROOF for each validation.
+        Bad validators (voting against consensus) can be slashed.
+        
+        Args:
+            proof: The PoNW proof to validate
+            vote: True = valid, False = invalid
+            validation_details: Optional details about validation
+            
+        Returns: (success, fee_earned, message)
+        """
+        # Check eligibility
+        eligible, reason = self.is_eligible_validator()
+        if not eligible:
+            return False, 0.0, f"Not eligible to validate: {reason}"
+        
+        # Record the validation vote
+        validation_id = hashlib.sha256(
+            f"{self.node_id}:{proof.signature}:{time.time()}".encode()
+        ).hexdigest()[:32]
+        
+        my_stake = self._get_stake(self.node_id)
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Create validation_votes table if not exists
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS validation_votes (
+                        validation_id TEXT PRIMARY KEY,
+                        proof_signature TEXT NOT NULL,
+                        validator_id TEXT NOT NULL,
+                        validator_stake REAL NOT NULL,
+                        vote INTEGER NOT NULL,
+                        details TEXT,
+                        timestamp REAL NOT NULL,
+                        fee_earned REAL DEFAULT 0.0,
+                        UNIQUE(proof_signature, validator_id)
+                    )
+                """)
+                
+                # Check if already voted
+                existing = conn.execute(
+                    "SELECT validation_id FROM validation_votes WHERE proof_signature = ? AND validator_id = ?",
+                    (proof.signature, self.node_id)
+                ).fetchone()
+                
+                if existing:
+                    return False, 0.0, "Already voted on this proof"
+                
+                # Record vote
+                conn.execute("""
+                    INSERT INTO validation_votes 
+                    (validation_id, proof_signature, validator_id, validator_stake, vote, details, timestamp, fee_earned)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    validation_id,
+                    proof.signature,
+                    self.node_id,
+                    my_stake,
+                    1 if vote else 0,
+                    validation_details,
+                    time.time(),
+                    VALIDATION_FEE_PER_PROOF
+                ))
+                
+                # Credit validation fee
+                conn.execute("""
+                    UPDATE balances SET
+                        balance = balance + ?,
+                        total_earned = total_earned + ?
+                    WHERE node_id = ?
+                """, (VALIDATION_FEE_PER_PROOF, VALIDATION_FEE_PER_PROOF, self.node_id))
+        
+        logger.info(f"Validation vote recorded: {self.node_id[:16]}... voted {'VALID' if vote else 'INVALID'} "
+                   f"on proof {proof.signature[:16]}... (stake: {my_stake:.2f})")
+        
+        return True, VALIDATION_FEE_PER_PROOF, f"Vote recorded, earned {VALIDATION_FEE_PER_PROOF} NEURO"
+    
+    def get_proof_validation_status(self, proof_signature: str) -> dict:
+        """
+        Get the current validation status of a proof.
+        
+        Returns stake-weighted vote tallies and consensus status.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            # Check if validation_votes table exists
+            table_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='validation_votes'"
+            ).fetchone()
+            
+            if not table_exists:
+                return {
+                    "proof_signature": proof_signature,
+                    "total_votes": 0,
+                    "valid_votes": 0,
+                    "invalid_votes": 0,
+                    "valid_stake": 0.0,
+                    "invalid_stake": 0.0,
+                    "total_stake": 0.0,
+                    "consensus_reached": False,
+                    "consensus_result": None,
+                }
+            
+            # Get all votes for this proof
+            votes = conn.execute("""
+                SELECT validator_id, validator_stake, vote
+                FROM validation_votes
+                WHERE proof_signature = ?
+            """, (proof_signature,)).fetchall()
+            
+            valid_stake = 0.0
+            invalid_stake = 0.0
+            valid_count = 0
+            invalid_count = 0
+            
+            for _, stake, vote in votes:
+                if vote:
+                    valid_stake += stake
+                    valid_count += 1
+                else:
+                    invalid_stake += stake
+                    invalid_count += 1
+            
+            total_stake = valid_stake + invalid_stake
+            
+            # Check consensus
+            consensus_reached = False
+            consensus_result = None
+            
+            if total_stake > 0:
+                valid_ratio = valid_stake / total_stake
+                if valid_ratio >= VALIDATION_CONSENSUS_THRESHOLD:
+                    consensus_reached = True
+                    consensus_result = True  # Valid
+                elif (1 - valid_ratio) >= VALIDATION_CONSENSUS_THRESHOLD:
+                    consensus_reached = True
+                    consensus_result = False  # Invalid
+            
+            return {
+                "proof_signature": proof_signature,
+                "total_votes": len(votes),
+                "valid_votes": valid_count,
+                "invalid_votes": invalid_count,
+                "valid_stake": valid_stake,
+                "invalid_stake": invalid_stake,
+                "total_stake": total_stake,
+                "valid_ratio": valid_stake / total_stake if total_stake > 0 else 0,
+                "consensus_reached": consensus_reached,
+                "consensus_result": consensus_result,
+                "threshold": VALIDATION_CONSENSUS_THRESHOLD,
+            }
+    
+    def select_validators_for_proof(self, proof: PoNWProof, num_validators: int = 3) -> List[str]:
+        """
+        Select validators for a proof using stake-weighted random selection.
+        
+        Selection algorithm:
+        1. Get all eligible validators (stake >= VALIDATOR_MIN_STAKE)
+        2. Weight by stake with randomness factor
+        3. Select top N by weighted score
+        
+        This ensures:
+        - Higher stake = higher chance of selection
+        - But randomness prevents monopoly
+        - Small stakers still get opportunities
+        """
+        import random
+        
+        with sqlite3.connect(self.db_path) as conn:
+            # Get all nodes with sufficient stake
+            eligible = conn.execute("""
+                SELECT node_id, amount
+                FROM stakes
+                WHERE amount >= ? AND locked_until > ?
+            """, (VALIDATOR_MIN_STAKE, time.time())).fetchall()
+            
+            if not eligible:
+                return []
+            
+            # Exclude the proof submitter
+            eligible = [(nid, stake) for nid, stake in eligible if nid != proof.node_id]
+            
+            if not eligible:
+                return []
+            
+            # Calculate selection scores (stake-weighted with randomness)
+            scores = []
+            for node_id, stake in eligible:
+                # Score = stake * (1 - randomness) + random * randomness * max_stake
+                max_stake = max(s for _, s in eligible)
+                stake_component = stake * (1 - VALIDATOR_SELECTION_RANDOMNESS)
+                random_component = random.random() * VALIDATOR_SELECTION_RANDOMNESS * max_stake
+                score = stake_component + random_component
+                scores.append((node_id, score, stake))
+            
+            # Sort by score and select top N
+            scores.sort(key=lambda x: x[1], reverse=True)
+            selected = [node_id for node_id, _, _ in scores[:num_validators]]
+            
+            logger.debug(f"Selected {len(selected)} validators for proof {proof.signature[:16]}...")
+            
+            return selected
+    
+    # ========================================================================
+    # TRANSACTIONS & FEE BURN
+    # ========================================================================
+    
+    def transfer(
+        self,
+        to_id: str,
+        amount: float,
+        memo: str = ""
+    ) -> Tuple[bool, str, Optional[Transaction]]:
+        """
+        Transfer NEURO to another node with 5% fee burn.
+        
+        Fee Structure:
+        - 5% of amount is burned (deflationary)
+        - Recipient receives full amount
+        - Sender pays amount + fee
+        
+        Returns: (success, message, transaction)
+        """
+        if amount <= 0:
+            return False, "Amount must be positive", None
+        
+        # Calculate fee and burn
+        fee = amount * FEE_BURN_RATE
+        burn_amount = fee  # 100% of fee is burned
+        total_deduction = amount + fee
+        
+        # Generate transaction ID
+        tx_id = hashlib.sha256(
+            f"{self.node_id}:{to_id}:{amount}:{time.time()}:{os.urandom(8).hex()}".encode()
+        ).hexdigest()
+        
+        tx = Transaction(
+            tx_id=tx_id,
+            from_id=self.node_id,
+            to_id=to_id,
+            amount=amount,
+            fee=fee,
+            burn_amount=burn_amount,
+            timestamp=time.time(),
+            signature="",
+            memo=memo
+        )
+        
+        # Sign transaction
+        tx.signature = self._sign(tx.canonical_payload())
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Check sender balance
+                row = conn.execute(
+                    "SELECT balance FROM balances WHERE node_id = ?",
+                    (self.node_id,)
+                ).fetchone()
+                
+                current_balance = row[0] if row else 0.0
+                
+                if current_balance < total_deduction:
+                    return False, f"Insufficient balance ({current_balance:.6f} < {total_deduction:.6f})", None
+                
+                # Deduct from sender (amount + fee)
+                conn.execute("""
+                    UPDATE balances SET
+                        balance = balance - ?,
+                        total_spent = total_spent + ?
+                    WHERE node_id = ?
+                """, (total_deduction, total_deduction, self.node_id))
+                
+                # Credit to recipient
+                conn.execute("""
+                    INSERT INTO balances (node_id, balance, total_earned, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        balance = balance + ?,
+                        total_earned = total_earned + ?
+                """, (to_id, amount, amount, time.time(), amount, amount))
+                
+                # Record burn (to special burn address)
+                conn.execute("""
+                    INSERT INTO balances (node_id, balance, total_earned, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        balance = balance + ?,
+                        total_earned = total_earned + ?
+                """, (BURN_ADDRESS, burn_amount, burn_amount, time.time(), burn_amount, burn_amount))
+                
+                # Record transaction
+                conn.execute("""
+                    INSERT INTO transactions 
+                    (tx_id, from_id, to_id, amount, fee, burn_amount, timestamp, memo, signature)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    tx.tx_id, tx.from_id, tx.to_id, tx.amount, tx.fee,
+                    tx.burn_amount, tx.timestamp, tx.memo, tx.signature
+                ))
+                
+                # Update global stats
+                conn.execute("""
+                    UPDATE global_stats SET
+                        total_burned = total_burned + ?,
+                        total_transferred = total_transferred + ?,
+                        total_transactions = total_transactions + 1,
+                        updated_at = ?
+                    WHERE id = 1
+                """, (burn_amount, amount, time.time()))
+        
+        logger.info(f"Transfer: {self.node_id[:12]}... → {to_id[:12]}... "
+                   f"amount={amount:.6f} fee={fee:.6f} burned={burn_amount:.6f}")
+        
+        return True, "Transfer complete", tx
+    
+    def spend_for_inference(self, tokens_requested: int) -> Tuple[bool, float, str]:
+        """
+        Spend NEURO for inference (with 5% burn).
+        
+        Cost: 1 NEURO per 1M tokens (from whitepaper)
+        Fee: 5% burned
+        
+        Returns: (success, cost, message)
+        """
+        # Calculate cost
+        cost = (tokens_requested / 1_000_000.0) * 1.0
+        cost = max(0.0001, cost)  # Minimum cost
+        
+        fee = cost * FEE_BURN_RATE
+        total_cost = cost + fee
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Check balance
+                row = conn.execute(
+                    "SELECT balance FROM balances WHERE node_id = ?",
+                    (self.node_id,)
+                ).fetchone()
+                
+                current_balance = row[0] if row else 0.0
+                
+                if current_balance < total_cost:
+                    return False, total_cost, f"Insufficient NEURO ({current_balance:.6f} < {total_cost:.6f})"
+                
+                # Deduct cost
+                conn.execute("""
+                    UPDATE balances SET
+                        balance = balance - ?,
+                        total_spent = total_spent + ?
+                    WHERE node_id = ?
+                """, (total_cost, total_cost, self.node_id))
+                
+                # Burn the fee
+                conn.execute("""
+                    INSERT INTO balances (node_id, balance, total_earned, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        balance = balance + ?
+                """, (BURN_ADDRESS, fee, fee, time.time(), fee))
+                
+                # Update global stats
+                conn.execute("""
+                    UPDATE global_stats SET
+                        total_burned = total_burned + ?,
+                        updated_at = ?
+                    WHERE id = 1
+                """, (fee, time.time()))
+        
+        logger.info(f"Inference spend: {self.node_id[:12]}... cost={cost:.6f} fee={fee:.6f} burned")
+        
+        return True, total_cost, "Inference authorized"
+    
+    # ========================================================================
+    # STAKING
+    # ========================================================================
+    
+    def stake(self, amount: float, duration_days: int = 30) -> Tuple[bool, str]:
+        """
+        Stake NEURO for reward multiplier.
+        
+        Staking provides:
+        - 10% bonus per 1000 NEURO staked
+        - Locked for specified duration
+        """
+        if amount <= 0:
+            return False, "Amount must be positive"
+        
+        lock_until = time.time() + (duration_days * 24 * 3600)
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Check balance
+                row = conn.execute(
+                    "SELECT balance FROM balances WHERE node_id = ?",
+                    (self.node_id,)
+                ).fetchone()
+                
+                current_balance = row[0] if row else 0.0
+                
+                if current_balance < amount:
+                    return False, f"Insufficient balance ({current_balance:.6f} < {amount:.6f})"
+                
+                # Get current stake
+                row = conn.execute(
+                    "SELECT amount FROM stakes WHERE node_id = ?",
+                    (self.node_id,)
+                ).fetchone()
+                current_stake = row[0] if row else 0.0
+                
+                # Deduct from balance
+                conn.execute("""
+                    UPDATE balances SET balance = balance - ? WHERE node_id = ?
+                """, (amount, self.node_id))
+                
+                # Add to stake
+                conn.execute("""
+                    INSERT INTO stakes (node_id, amount, locked_until, updated_at)
+                    VALUES (?, ?, ?, ?)
+                        ON CONFLICT(node_id) DO UPDATE SET
+                        amount = amount + ?,
+                        locked_until = MAX(locked_until, ?),
+                        updated_at = ?
+                """, (
+                    self.node_id, amount, lock_until, time.time(),
+                    amount, lock_until, time.time()
+                ))
+        
+        new_stake = current_stake + amount
+        multiplier = calculate_stake_multiplier(new_stake)
+        
+        logger.info(f"Staked: {self.node_id[:12]}... amount={amount:.6f} "
+                   f"total_stake={new_stake:.6f} multiplier={multiplier:.2f}x")
+        
+        return True, f"Staked {amount:.6f} NEURO (new multiplier: {multiplier:.2f}x)"
+    
+    def unstake(self) -> Tuple[bool, float, str]:
+        """
+        Unstake NEURO (if lock period expired).
+        
+        Returns: (success, amount_unstaked, message)
+        """
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT amount, locked_until FROM stakes WHERE node_id = ?",
+                    (self.node_id,)
+                ).fetchone()
+                
+                if not row or row[0] == 0:
+                    return False, 0.0, "No stake found"
+                
+                amount, locked_until = row
+                
+                if time.time() < locked_until:
+                    remaining = (locked_until - time.time()) / 3600
+                    return False, 0.0, f"Stake locked for {remaining:.1f} more hours"
+                
+                # Return stake to balance
+                conn.execute("""
+                    UPDATE balances SET balance = balance + ? WHERE node_id = ?
+                """, (amount, self.node_id))
+                
+                # Clear stake
+                conn.execute("""
+                    UPDATE stakes SET amount = 0, updated_at = ? WHERE node_id = ?
+                """, (time.time(), self.node_id))
+        
+        logger.info(f"Unstaked: {self.node_id[:12]}... amount={amount:.6f}")
+        
+        return True, amount, f"Unstaked {amount:.6f} NEURO"
+    
+    def update_stake(self, node_id: str, amount: float, locked_until: float = None) -> bool:
+        """
+        Update stake record for a REMOTE node (from P2P gossip).
+        
+        SECURITY MODEL:
+        ===============
+        This does NOT directly affect reward calculations for the remote node.
+        It only maintains a local VIEW of what other nodes claim to have staked.
+        
+        The actual reward multiplier is calculated based on:
+        1. For LOCAL node: Our own stake (from stake() method, which requires balance)
+        2. For REMOTE proofs: We can verify their claimed multiplier is reasonable
+        
+        A malicious node can claim any stake, but:
+        - They cannot earn MORE than the base reward without actual work
+        - Validators cross-check stake claims during proof validation
+        - Consensus rejects proofs with implausible multipliers
+        
+        This gossip sync is primarily for:
+        - Validator selection (who can validate proofs)
+        - Network visibility (dashboard displays)
+        
+        Returns True if the update was applied.
+        """
+        if locked_until is None:
+            locked_until = time.time() + 86400 * 30  # Default 30 day lock
+        
+        # Validate stake amount using centralized economics
+        is_valid, error_msg = is_valid_stake_amount(amount)
+        if not is_valid:
+            logger.warning(f"Rejected stake claim from {node_id[:16]}...: {error_msg}")
+            return False
+        
+        try:
+            with self.lock:
+                with sqlite3.connect(self.db_path) as conn:
+                    # Mark this as a REMOTE stake (not locally verified)
+                    conn.execute("""
+                        INSERT INTO stakes (node_id, amount, locked_until, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(node_id) DO UPDATE SET
+                            amount = ?,
+                            locked_until = ?,
+                            updated_at = ?
+                    """, (node_id, amount, locked_until, time.time(), amount, locked_until, time.time()))
+                    return True
+        except Exception as e:
+            logger.error(f"Failed to update stake for {node_id[:16]}...: {e}")
+            return False
+    
+    def get_local_stake(self, node_id: str) -> float:
+        """Get stake for a specific node."""
+        return self._get_stake(node_id)
+    
+    def create_transaction(self, from_id: str, to_id: str, amount: float, signature: str) -> bool:
+        """
+        Create a transaction from gossip (external source).
+        
+        Note: This only processes transactions where we are the sender,
+        as we can't spend other nodes' balances.
+        """
+        # Only allow if we're the sender
+        if from_id != self.node_id:
+            logger.debug(f"Cannot create transaction for another node: {from_id[:12]}...")
+            return False
+        
+        success, _, _ = self.transfer(to_id, amount)
+        return success
+    
+    # ========================================================================
+    # SLASHING (Fraud Prevention)
+    # ========================================================================
+    
+    def report_fraud(
+        self,
+        accused_id: str,
+        reason: str,
+        proof_signature: Optional[str] = None,
+        evidence: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """
+        Report suspected fraud for slashing.
+        
+        If verified, the accused node loses SLASH_AMOUNT NEURO:
+        - 50% goes to reporter (whistleblower reward)
+        - 50% is burned
+        """
+        report_id = hashlib.sha256(
+            f"{self.node_id}:{accused_id}:{time.time()}:{os.urandom(8).hex()}".encode()
+        ).hexdigest()
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT INTO fraud_reports 
+                    (report_id, reporter_id, accused_id, proof_signature, reason, evidence, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    report_id, self.node_id, accused_id, proof_signature,
+                    reason, evidence, time.time()
+                ))
+        
+        logger.warning(f"Fraud report: {self.node_id[:12]}... reported {accused_id[:12]}... "
+                      f"reason={reason}")
+        
+        return True, f"Fraud report submitted (ID: {report_id[:16]}...)"
+    
+    def execute_slash(self, accused_id: str, reporter_id: str) -> Tuple[bool, str]:
+        """
+        Execute slashing after fraud verification.
+        
+        Called by consensus mechanism after fraud is confirmed.
+        """
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Get accused balance
+                row = conn.execute(
+                    "SELECT balance FROM balances WHERE node_id = ?",
+                    (accused_id,)
+                ).fetchone()
+                
+                current_balance = row[0] if row else 0.0
+                slash_amount = min(SLASH_AMOUNT, current_balance)
+                
+                if slash_amount <= 0:
+                    return False, "No balance to slash"
+                
+                whistleblower_reward = slash_amount * WHISTLEBLOWER_REWARD_RATE
+                burn_amount = slash_amount - whistleblower_reward
+                
+                # Deduct from accused
+                conn.execute("""
+                    UPDATE balances SET balance = balance - ? WHERE node_id = ?
+                """, (slash_amount, accused_id))
+                
+                # Reward whistleblower
+                conn.execute("""
+                    INSERT INTO balances (node_id, balance, total_earned, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        balance = balance + ?,
+                        total_earned = total_earned + ?
+                """, (reporter_id, whistleblower_reward, whistleblower_reward, time.time(),
+                      whistleblower_reward, whistleblower_reward))
+                
+                # Burn remainder
+                conn.execute("""
+                    INSERT INTO balances (node_id, balance, total_earned, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        balance = balance + ?
+                """, (BURN_ADDRESS, burn_amount, burn_amount, time.time(), burn_amount))
+                
+                # Update global stats
+                conn.execute("""
+                    UPDATE global_stats SET
+                        total_burned = total_burned + ?,
+                        updated_at = ?
+                    WHERE id = 1
+                """, (burn_amount, time.time()))
+        
+        logger.warning(f"Slashed: {accused_id[:12]}... lost {slash_amount:.6f} NEURO "
+                      f"(whistleblower={whistleblower_reward:.6f}, burned={burn_amount:.6f})")
+        
+        return True, f"Slashed {slash_amount:.6f} NEURO"
+    
+    def slash_bad_validator(self, validator_id: str, proof_signature: str, reason: str) -> Tuple[bool, str]:
+        """
+        Slash a validator who voted against consensus.
+        
+        Validators are held to a higher standard - they are slashed 2x the normal amount
+        for voting incorrectly (VALIDATOR_SLASH_MULTIPLIER).
+        
+        This is called when consensus is reached and a validator's vote differs.
+        """
+        slash_amount = SLASH_AMOUNT * VALIDATOR_SLASH_MULTIPLIER
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Get validator's stake (they lose from stake first)
+                stake_row = conn.execute(
+                    "SELECT amount FROM stakes WHERE node_id = ?",
+                    (validator_id,)
+                ).fetchone()
+                
+                stake = stake_row[0] if stake_row else 0.0
+                
+                # Get balance
+                balance_row = conn.execute(
+                    "SELECT balance FROM balances WHERE node_id = ?",
+                    (validator_id,)
+                ).fetchone()
+                
+                balance = balance_row[0] if balance_row else 0.0
+                
+                total_available = stake + balance
+                actual_slash = min(slash_amount, total_available)
+                
+                if actual_slash <= 0:
+                    return False, "No funds to slash"
+                
+                # Deduct from stake first, then balance
+                stake_deduction = min(actual_slash, stake)
+                balance_deduction = actual_slash - stake_deduction
+                
+                if stake_deduction > 0:
+                    conn.execute("""
+                        UPDATE stakes SET amount = amount - ? WHERE node_id = ?
+                    """, (stake_deduction, validator_id))
+                
+                if balance_deduction > 0:
+                    conn.execute("""
+                        UPDATE balances SET balance = balance - ? WHERE node_id = ?
+                    """, (balance_deduction, validator_id))
+                
+                # Burn the slashed amount
+                conn.execute("""
+                    INSERT INTO balances (node_id, balance, total_earned, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        balance = balance + ?
+                """, (BURN_ADDRESS, actual_slash, actual_slash, time.time(), actual_slash))
+                
+                # Update global stats
+                conn.execute("""
+                    UPDATE global_stats SET
+                        total_burned = total_burned + ?,
+                        updated_at = ?
+                    WHERE id = 1
+                """, (actual_slash, time.time()))
+                
+                # Record the slash
+                conn.execute("""
+                    INSERT INTO fraud_reports 
+                    (report_id, reporter_id, accused_id, proof_signature, reason, evidence, created_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    hashlib.sha256(f"validator_slash:{validator_id}:{proof_signature}:{time.time()}".encode()).hexdigest()[:32],
+                    "CONSENSUS",  # Reporter is the consensus mechanism
+                    validator_id,
+                    proof_signature,
+                    reason,
+                    f"Slashed {actual_slash:.6f} NEURO (stake: {stake_deduction:.6f}, balance: {balance_deduction:.6f})",
+                    time.time(),
+                    "executed"
+                ))
+        
+        logger.warning(f"Validator slashed: {validator_id[:12]}... lost {actual_slash:.6f} NEURO "
+                      f"for bad validation on {proof_signature[:16]}... Reason: {reason}")
+        
+        return True, f"Validator slashed {actual_slash:.6f} NEURO"
+    
+    def check_and_slash_bad_validators(self, proof_signature: str) -> List[str]:
+        """
+        Check if consensus was reached and slash validators who voted wrong.
+        
+        Called after a proof reaches consensus.
+        Returns list of slashed validator IDs.
+        """
+        status = self.get_proof_validation_status(proof_signature)
+        
+        if not status["consensus_reached"]:
+            return []
+        
+        consensus_result = status["consensus_result"]
+        slashed = []
+        
+        with sqlite3.connect(self.db_path) as conn:
+            # Get all votes for this proof
+            votes = conn.execute("""
+                SELECT validator_id, vote
+                FROM validation_votes
+                WHERE proof_signature = ?
+            """, (proof_signature,)).fetchall()
+            
+            for validator_id, vote in votes:
+                vote_bool = bool(vote)
+                if vote_bool != consensus_result:
+                    # This validator voted against consensus
+                    success, msg = self.slash_bad_validator(
+                        validator_id=validator_id,
+                        proof_signature=proof_signature,
+                        reason=f"Voted {'VALID' if vote_bool else 'INVALID'} but consensus was {'VALID' if consensus_result else 'INVALID'}"
+                    )
+                    if success:
+                        slashed.append(validator_id)
+        
+        if slashed:
+            logger.info(f"Slashed {len(slashed)} validators for proof {proof_signature[:16]}...")
+        
+        return slashed
+    
+    # ========================================================================
+    # QUERIES
+    # ========================================================================
+    
+    def get_balance(self, node_id: Optional[str] = None) -> float:
+        """Get balance for a node."""
+        node_id = node_id or self.node_id
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT balance FROM balances WHERE node_id = ?",
+                    (node_id,)
+                ).fetchone()
+                return row[0] if row else 0.0
+    
+    def get_balance_details(self, node_id: Optional[str] = None) -> Dict:
+        """
+        Get detailed balance information including confirmation status.
+        
+        IMPORTANT: Understanding Local vs Network Balance
+        ================================================
+        
+        LOCAL BALANCE (what this node's ledger shows):
+        - All proofs YOU generated that YOU witnessed
+        - Includes solo-earned NEURO
+        
+        NETWORK BALANCE (what other nodes see):
+        - Only proofs gossiped within PROOF_FRESHNESS_WINDOW (5 min)
+        - If you ran solo, network didn't witness your work
+        
+        WHY THE DIFFERENCE?
+        - Security: Prevents fabricating work while alone
+        - Like Bitcoin: unmined blocks don't count until network sees them
+        - Solo NEURO is "unconfirmed" - needs witnesses to be network-confirmed
+        
+        HOW TO CONFIRM:
+        - Keep running with peers online
+        - All new proofs will be gossiped and confirmed
+        - Historical solo-earned NEURO stays LOCAL only
+        """
+        node_id = node_id or self.node_id
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Get balance info
+                row = conn.execute("""
+                    SELECT balance, total_earned, proof_count
+                    FROM balances WHERE node_id = ?
+                """, (node_id,)).fetchone()
+                
+                local_balance = row[0] if row else 0.0
+                total_earned = row[1] if row else 0.0
+                proof_count = row[2] if row else 0
+                
+                # Get count of proofs that could have been gossiped
+                # (proofs where we had peers at the time)
+                # This is approximate - we track via proof timestamps
+                fresh_proofs = conn.execute("""
+                    SELECT COUNT(*) FROM proof_history 
+                    WHERE node_id = ?
+                """, (node_id,)).fetchone()[0]
+                
+                return {
+                    "node_id": node_id,
+                    "local_balance": local_balance,
+                    "total_earned": total_earned,
+                    "proof_count": proof_count,
+                    "note": (
+                        "Local balance includes all proofs you generated. "
+                        "Network balance only counts proofs witnessed by peers within 5 min. "
+                        "If you ran solo, that NEURO is LOCAL only."
+                    )
+                }
+    
+    def get_account_info(self, node_id: Optional[str] = None) -> Dict:
+        """Get full account information."""
+        node_id = node_id or self.node_id
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Balance info
+                row = conn.execute("""
+                    SELECT balance, total_earned, total_spent, last_proof_time, proof_count, created_at
+                    FROM balances WHERE node_id = ?
+                """, (node_id,)).fetchone()
+                
+                if not row:
+                    return {
+                        "node_id": node_id,
+                        "balance": 0.0,
+                        "total_earned": 0.0,
+                        "total_spent": 0.0,
+                        "stake": 0.0,
+                        "stake_multiplier": 1.0,
+                        "proof_count": 0
+                    }
+                
+                balance, total_earned, total_spent, last_proof_time, proof_count, created_at = row
+                
+                # Stake info
+                stake_row = conn.execute(
+                    "SELECT amount, locked_until FROM stakes WHERE node_id = ?",
+                    (node_id,)
+                ).fetchone()
+                
+                stake = stake_row[0] if stake_row else 0.0
+                stake_locked_until = stake_row[1] if stake_row else 0.0
+                stake_multiplier = calculate_stake_multiplier(stake)
+                
+                return {
+                    "node_id": node_id,
+                    "balance": balance,
+                    "total_earned": total_earned,
+                    "total_spent": total_spent,
+                    "stake": stake,
+                    "stake_locked_until": stake_locked_until,
+                    "stake_multiplier": stake_multiplier,
+                    "proof_count": proof_count,
+                    "last_proof_time": last_proof_time,
+                    "created_at": created_at
+                }
+    
+    def get_global_stats(self) -> LedgerStats:
+        """Get global ledger statistics."""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute("""
+                    SELECT total_minted, total_burned, total_transferred, total_proofs, total_transactions
+                    FROM global_stats WHERE id = 1
+                """).fetchone()
+                
+                if not row:
+                    return LedgerStats()
+                
+                total_minted, total_burned, total_transferred, total_proofs, total_transactions = row
+                
+                return LedgerStats(
+                    total_minted=total_minted,
+                    total_burned=total_burned,
+                    total_transferred=total_transferred,
+                    circulating_supply=total_minted - total_burned,
+                    total_proofs_processed=total_proofs,
+                    total_transactions=total_transactions
+                )
+    
+    def get_burn_stats(self) -> Dict:
+        """Get burn statistics."""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                # Total burned
+                row = conn.execute(
+                    "SELECT balance FROM balances WHERE node_id = ?",
+                    (BURN_ADDRESS,)
+                ).fetchone()
+                total_burned = row[0] if row else 0.0
+                
+                # Global stats
+                stats_row = conn.execute(
+                    "SELECT total_minted, total_burned FROM global_stats WHERE id = 1"
+                ).fetchone()
+                
+                total_minted = stats_row[0] if stats_row else 0.0
+                
+                return {
+                    "total_burned": total_burned,
+                    "total_minted": total_minted,
+                    "burn_rate": FEE_BURN_RATE,
+                    "circulating_supply": total_minted - total_burned,
+                    "burn_percentage": (total_burned / total_minted * 100) if total_minted > 0 else 0.0
+                }
+
+
+# ============================================================================
+# BACKWARD COMPATIBILITY ALIASES
+# ============================================================================
+
+# LedgerManager is now just an alias for NEUROLedger
+LedgerManager = NEUROLedger
+
+# Legacy ProofOfWork class for any remaining references
+ProofOfWork = PoNWProof

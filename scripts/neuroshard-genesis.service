@@ -1,0 +1,40 @@
+[Unit]
+Description=NeuroShard Genesis Data Population Service
+Documentation=https://github.com/neuroshard/neuroshard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/neuroshard
+
+# Environment
+Environment="PATH=/home/ubuntu/neuroshard/venv_build/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/home/ubuntu/neuroshard"
+EnvironmentFile=-/home/ubuntu/neuroshard/website/.env
+
+# Main execution
+ExecStart=/bin/bash /home/ubuntu/neuroshard/scripts/genesis_service.sh
+
+# Restart policy - restart on failure, but not too aggressively
+Restart=on-failure
+RestartSec=60
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Logging
+StandardOutput=append:/home/ubuntu/neuroshard/logs/genesis_service.log
+StandardError=append:/home/ubuntu/neuroshard/logs/genesis_service.log
+
+# Resource limits for c5.2xlarge (8 vCPU, 16GB RAM)
+MemoryMax=14G
+CPUQuota=700%
+
+[Install]
+WantedBy=multi-user.target
+
