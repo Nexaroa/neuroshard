@@ -2476,14 +2476,29 @@ class DynamicNeuroNode:
         
         elif saved_arch:
             # Checkpoint exists but no network peers (solo mode)
-            saved_memory = saved_arch.estimate_memory_mb()
-            if saved_memory <= self.available_memory_mb:
-                logger.info(f"✅ Solo mode - using saved checkpoint: {saved_arch.num_layers}L × {saved_arch.hidden_dim}H")
-                self.layer_pool.current_architecture = saved_arch
-                self.layer_pool.current_num_layers = saved_arch.num_layers
+            # IMPORTANT: Check ACTUAL layers in checkpoint, not just architecture's num_layers
+            actual_saved_layers = self._get_checkpoint_layer_count()
+            if actual_saved_layers and actual_saved_layers > saved_arch.num_layers:
+                # Model grew beyond base architecture - calculate memory for actual layers
+                memory_per_layer = estimate_memory_per_layer(saved_arch)
+                saved_memory = memory_per_layer * actual_saved_layers * 1.1  # 10% overhead
+                logger.info(f"Checkpoint has {actual_saved_layers} layers (grew from base {saved_arch.num_layers})")
             else:
-                logger.warning(f"⚠️ Saved arch needs {saved_memory}MB but you only have {self.available_memory_mb}MB")
-                logger.warning(f"   → Calculating fresh architecture")
+                saved_memory = saved_arch.estimate_memory_mb()
+                actual_saved_layers = saved_arch.num_layers
+            
+            if saved_memory <= self.available_memory_mb:
+                logger.info(f"✅ Solo mode - using saved checkpoint: {actual_saved_layers}L × {saved_arch.hidden_dim}H")
+                self.layer_pool.current_architecture = saved_arch
+                self.layer_pool.current_num_layers = actual_saved_layers
+            else:
+                # Memory too small for saved checkpoint - calculate what we CAN fit
+                max_layers = calculate_layer_assignment(self.available_memory_mb, saved_arch, safety_factor=0.6)
+                logger.warning(f"⚠️ Saved checkpoint has {actual_saved_layers} layers ({saved_memory:.0f}MB) "
+                              f"but you only have {self.available_memory_mb:.0f}MB")
+                logger.warning(f"   → Will use {max_layers} layers (reduced from checkpoint)")
+                self.layer_pool.current_architecture = saved_arch
+                self.layer_pool.current_num_layers = max_layers
         
         else:
             # No checkpoint, no network - fresh start
@@ -2665,10 +2680,38 @@ class DynamicNeuroNode:
         if deleted_count > 0:
             logger.info(f"Cleaned up {deleted_count} old archived checkpoint(s)")
     
+    def _get_checkpoint_layer_count(self) -> Optional[int]:
+        """
+        Get the actual number of layers saved in checkpoint.
+        
+        This is important because the model may have GROWN beyond the base architecture.
+        The architecture might say 11 layers, but 110 layers could be saved!
+        """
+        path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
+        legacy_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.node_id[:16]}.pt"
+        
+        checkpoint_path = path if path.exists() else (legacy_path if legacy_path.exists() else None)
+        if not checkpoint_path:
+            return None
+        
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            layers = checkpoint.get("layers", {})
+            if layers:
+                return len(layers)
+            # Fall back to layer_ids if present
+            layer_ids = checkpoint.get("layer_ids", [])
+            if layer_ids:
+                return len(layer_ids)
+        except Exception as e:
+            logger.debug(f"Could not get checkpoint layer count: {e}")
+        
+        return None
+    
     def _peek_checkpoint_architecture(self) -> Optional[ModelArchitecture]:
         """
         Peek at checkpoint to get saved architecture WITHOUT loading weights.
-        
+
         This allows us to use the same architecture as the checkpoint,
         preventing architecture drift between restarts on the same machine.
         """
