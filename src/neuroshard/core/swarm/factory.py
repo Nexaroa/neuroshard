@@ -1191,6 +1191,7 @@ def create_swarm_node(
     max_storage_mb: int = 10000,
     max_cpu_threads: int = 4,
     p2p_manager: Optional[Any] = None,
+    device: str = "auto",
 ) -> SwarmEnabledDynamicNode:
     """
     Factory function to create a SwarmEnabledDynamicNode.
@@ -1220,6 +1221,7 @@ def create_swarm_node(
         enable_training=enable_training,
         max_storage_mb=max_storage_mb,
         max_cpu_threads=max_cpu_threads,
+        device=device,
     )
     
     # Wrap with swarm capabilities

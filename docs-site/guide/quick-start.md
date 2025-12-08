@@ -13,15 +13,20 @@ Get your NeuroShard node running and earning NEURO in under 5 minutes.
 ### Install via pip
 
 ```bash
+# Basic install (CPU only)
 pip install nexaroa
+
+# With GPU support (recommended)
+pip install nexaroa[gpu]
 ```
 
-For NVIDIA GPU support, install PyTorch with CUDA first:
+### Platform-Specific
 
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu118
-pip install nexaroa
-```
+| Platform | Install Command |
+|----------|----------------|
+| **x86 Linux/Windows** | `pip install nexaroa[gpu]` |
+| **macOS (Apple Silicon)** | `pip install nexaroa[gpu]` |
+| **NVIDIA Jetson** | See [Jetson Install](/guide/installation#nvidia-jetson-arm64) |
 
 ## Get Your Wallet Token
 
@@ -78,6 +83,11 @@ Visit [neuroshard.com/ledger](https://neuroshard.com/ledger) and search for your
 # Use a custom port
 neuroshard --token YOUR_TOKEN --port 9000
 
+# Force specific device (auto-detected by default)
+neuroshard --token YOUR_TOKEN --device cuda   # NVIDIA GPU
+neuroshard --token YOUR_TOKEN --device mps    # Apple Silicon
+neuroshard --token YOUR_TOKEN --device cpu    # CPU only
+
 # Limit memory usage (in MB)
 neuroshard --token YOUR_TOKEN --memory 4096
 
@@ -86,6 +96,9 @@ neuroshard --token YOUR_TOKEN --no-training
 
 # Run without opening browser
 neuroshard --token YOUR_TOKEN --no-browser
+
+# Run as background daemon (Linux/macOS)
+neuroshard --daemon --token YOUR_TOKEN
 
 # Set CPU thread limit
 neuroshard --token YOUR_TOKEN --cpu-threads 4
@@ -113,10 +126,20 @@ Earnings depend on network activity, model quality, and inference demand. These 
 
 ### "No GPU detected"
 
-Install CUDA-enabled PyTorch:
+If you have an NVIDIA GPU but it's not detected:
+
 ```bash
+# Reinstall with GPU support
+pip install nexaroa[gpu]
+
+# Or install CUDA PyTorch manually
 pip uninstall torch
 pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+You can also force a specific device:
+```bash
+neuroshard --token YOUR_TOKEN --device cuda
 ```
 
 ### "Insufficient memory"

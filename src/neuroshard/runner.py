@@ -2030,6 +2030,7 @@ def run_node(
     max_storage_mb: float = 100.0,
     max_cpu_threads: Optional[int] = None,
     diloco_inner_steps: int = 500,
+    device: str = "auto",
 ):
     """
     Start a NeuroShard node.
@@ -2150,6 +2151,7 @@ def run_node(
         enable_training=enable_training,
         max_storage_mb=max_storage_mb,
         max_cpu_threads=max_cpu_threads,
+        device=device,
     )
     
     STATE["diloco_inner_steps"] = diloco_inner_steps

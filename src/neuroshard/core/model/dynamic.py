@@ -1126,8 +1126,8 @@ class DynamicNeuroNode:
         self.tracker_url = tracker_url
         self.node_token = node_token
         
-        # Detect device automatically if default is used
-        if device == "cpu":
+        # Detect device automatically if "auto" or "cpu" (backward compatibility)
+        if device in ("auto", "cpu"):
             if torch.cuda.is_available():
                 self.device = "cuda"
                 logger.info(f"[NODE] GPU detected: CUDA available")
@@ -2841,6 +2841,7 @@ def create_dynamic_node(
     enable_training: bool = True,
     max_storage_mb: float = 100.0,
     max_cpu_threads: Optional[int] = None,
+    device: str = "auto",
 ) -> DynamicNeuroNode:
     """
     Create and start a dynamic node.
@@ -2880,6 +2881,7 @@ def create_dynamic_node(
         enable_training=enable_training,
         max_storage_mb=max_storage_mb,
         max_cpu_threads=max_cpu_threads,
+        device=device,
     )
     
     # Store instance info for debugging

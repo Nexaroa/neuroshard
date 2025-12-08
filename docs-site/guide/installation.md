@@ -11,7 +11,7 @@ Complete guide to installing NeuroShard on different platforms.
 | **RAM** | 2GB | 8GB+ |
 | **Storage** | 1GB | 10GB+ |
 | **CPU** | 2 cores | 4+ cores |
-| **Python** | 3.10 | 3.11 |
+| **Python** | 3.9 | 3.11 |
 | **Network** | 10 Mbps | 100 Mbps+ |
 
 ### GPU Support
@@ -21,6 +21,7 @@ NeuroShard automatically detects and uses available GPUs:
 | GPU | Support Level |
 |-----|--------------|
 | NVIDIA CUDA | ✅ Full support (recommended) |
+| NVIDIA Jetson (ARM64) | ✅ Full support |
 | Apple Metal (M1/M2/M3) | ✅ Full support |
 | AMD ROCm | ⚠️ Experimental |
 | CPU Only | ✅ Supported (slower) |
@@ -29,35 +30,76 @@ NeuroShard automatically detects and uses available GPUs:
 
 ### Method 1: pip (Recommended)
 
-The simplest way to install NeuroShard:
+NeuroShard is published to PyPI as `nexaroa`.
+
+#### Basic Install (CPU)
 
 ```bash
 # Create a virtual environment (recommended)
 python -m venv neuroshard-env
 source neuroshard-env/bin/activate  # On Windows: neuroshard-env\Scripts\activate
 
-# Install NeuroShard
+# Install NeuroShard (without PyTorch)
 pip install nexaroa
 ```
 
-#### With GPU Support (NVIDIA)
+#### With GPU Support (x86 Linux/Windows)
 
 ```bash
-# Install PyTorch with CUDA first
-pip install torch --index-url https://download.pytorch.org/whl/cu118
-
-# Then install NeuroShard
-pip install nexaroa
+# Install with GPU support - automatically installs PyTorch from PyPI
+pip install nexaroa[gpu]
 ```
 
-#### With GPU Support (Apple Silicon)
-
-PyTorch on macOS with Apple Silicon automatically uses Metal:
+#### With GUI Support (Desktop App)
 
 ```bash
-pip install torch
+# Install with GUI libraries
+pip install nexaroa[gui]
+
+# Or install everything (GPU + GUI)
+pip install nexaroa[full]
+```
+
+### Platform-Specific PyTorch
+
+PyTorch is an **optional dependency** because different platforms need different builds:
+
+#### NVIDIA CUDA (x86 Linux/Windows)
+
+```bash
+# Option A: Use the [gpu] extra (simplest)
+pip install nexaroa[gpu]
+
+# Option B: Install specific CUDA version first
+pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install nexaroa
 ```
+
+#### Apple Silicon (M1/M2/M3/M4)
+
+```bash
+# PyTorch from PyPI includes Metal (MPS) support
+pip install nexaroa[gpu]
+```
+
+#### NVIDIA Jetson (ARM64)
+
+For Jetson Orin, AGX, or other Jetson devices, **install PyTorch from NVIDIA first**:
+
+```bash
+# Step 1: Install NVIDIA's PyTorch (JetPack 6.x)
+pip install torch torchvision --extra-index-url https://developer.download.nvidia.com/compute/redist/jp/v60
+
+# Step 2: Install NeuroShard (no [gpu] needed - torch already installed!)
+pip install nexaroa
+
+# Step 3: Run with CUDA
+neuroshard --token YOUR_TOKEN --device cuda
+```
+
+::: tip Why separate steps for Jetson?
+Jetson uses ARM64 architecture with a custom CUDA build. NVIDIA provides pre-built PyTorch wheels optimized for Jetson that aren't available on PyPI. By pre-installing torch from NVIDIA, pip sees it's already satisfied and won't try to download an incompatible version.
+:::
 
 ### Method 2: Docker
 
@@ -106,13 +148,30 @@ After installation, verify everything works:
 ```bash
 # Check version
 neuroshard --version
-# Output: NeuroShard 0.0.6
 
 # Check available options
 neuroshard --help
 
-# Test without running (shows GPU detection)
-python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
+# Test GPU detection
+python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, MPS: {torch.backends.mps.is_available() if hasattr(torch.backends, \"mps\") else False}')"
+```
+
+### Device Selection
+
+NeuroShard auto-detects the best device, but you can override it:
+
+```bash
+# Auto-detect (default)
+neuroshard --token YOUR_TOKEN --device auto
+
+# Force CUDA
+neuroshard --token YOUR_TOKEN --device cuda
+
+# Force Apple Metal
+neuroshard --token YOUR_TOKEN --device mps
+
+# Force CPU
+neuroshard --token YOUR_TOKEN --device cpu
 ```
 
 ## Platform-Specific Notes
@@ -152,6 +211,17 @@ sudo dnf install python3 python3-pip
 sudo dnf install akmod-nvidia xorg-x11-drv-nvidia-cuda
 ```
 
+### Jetson (JetPack)
+
+```bash
+# Ensure JetPack is installed (includes CUDA, cuDNN)
+# Then install PyTorch from NVIDIA
+pip install torch torchvision --extra-index-url https://developer.download.nvidia.com/compute/redist/jp/v60
+
+# Install NeuroShard
+pip install nexaroa
+```
+
 ## Updating
 
 ### pip
@@ -178,9 +248,48 @@ rm -rf ~/.neuroshard
 rd /s /q %USERPROFILE%\.neuroshard
 ```
 
+## Troubleshooting
+
+### PyTorch Not Found
+
+If you get `ModuleNotFoundError: No module named 'torch'`:
+
+```bash
+# Install with GPU support
+pip install nexaroa[gpu]
+
+# Or install torch manually first
+pip install torch
+pip install nexaroa
+```
+
+### CUDA Not Detected
+
+If GPU isn't detected on a system with NVIDIA GPU:
+
+```bash
+# Check if torch sees CUDA
+python -c "import torch; print(torch.cuda.is_available())"
+
+# If False, reinstall torch with CUDA
+pip uninstall torch
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+### Jetson: Wrong PyTorch Version
+
+If you accidentally installed x86 torch on Jetson:
+
+```bash
+# Remove wrong version
+pip uninstall torch torchvision
+
+# Install NVIDIA's version
+pip install torch torchvision --extra-index-url https://developer.download.nvidia.com/compute/redist/jp/v60
+```
+
 ## Next Steps
 
 - [Running a Node](/guide/running-a-node) — Configure and start your node
 - [Quick Start](/guide/quick-start) — 5-minute setup guide
 - [CLI Reference](/guide/cli-reference) — All command options
-

@@ -275,6 +275,13 @@ Get your wallet token at: https://neuroshard.com/wallet
         help="DiLoCo inner steps before gradient sync (default: 500)"
     )
     
+    # Device options
+    parser.add_argument(
+        "--device", type=str, default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Compute device: auto (default), cuda, mps, or cpu"
+    )
+    
     # Resource limits
     parser.add_argument(
         "--memory", type=int, default=None,
@@ -451,6 +458,7 @@ Get your wallet token at: https://neuroshard.com/wallet
         max_storage_mb=args.max_storage,
         max_cpu_threads=args.cpu_threads,
         diloco_inner_steps=args.diloco_steps,
+        device=args.device,
     )
 
 

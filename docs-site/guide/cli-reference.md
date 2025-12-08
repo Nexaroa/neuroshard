@@ -22,8 +22,19 @@ neuroshard [OPTIONS]
 |--------|---------|-------------|
 | `--port <PORT>` | 8000 | HTTP port for the node |
 | `--tracker <URL>` | `https://neuroshard.com/api/tracker` | Tracker URL for peer discovery |
+| `--device <DEVICE>` | auto | Compute device: `auto`, `cuda`, `mps`, or `cpu` |
 | `--version` | - | Show version and exit |
 | `--help` | - | Show help message and exit |
+
+### Daemon Options (Linux/macOS)
+
+| Option | Description |
+|--------|-------------|
+| `--daemon` / `-d` | Run as background daemon (logs to `~/.neuroshard/node.log`) |
+| `--stop` | Stop the running daemon |
+| `--status` | Check if daemon is running |
+| `--logs` | Show recent daemon logs |
+| `--log-lines <N>` | Number of log lines to show (default: 50) |
 
 ### Network Options
 
@@ -60,6 +71,35 @@ neuroshard [OPTIONS]
 
 ```bash
 neuroshard --token YOUR_WALLET_TOKEN
+```
+
+### Force GPU Device
+
+```bash
+# Force CUDA (NVIDIA)
+neuroshard --token YOUR_TOKEN --device cuda
+
+# Force Apple Metal (MPS)
+neuroshard --token YOUR_TOKEN --device mps
+
+# Force CPU (useful for debugging)
+neuroshard --token YOUR_TOKEN --device cpu
+```
+
+### Run as Daemon (Linux/macOS)
+
+```bash
+# Start as background daemon
+neuroshard --daemon --token YOUR_TOKEN
+
+# Check daemon status
+neuroshard --status
+
+# View daemon logs
+neuroshard --logs
+
+# Stop the daemon
+neuroshard --stop
 ```
 
 ### Custom Port
