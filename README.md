@@ -18,6 +18,7 @@
 <p align="center">
   <a href="https://neuroshard.com">Website</a> •
   <a href="https://docs.neuroshard.com">Documentation</a> •
+  <a href="docs/whitepaper/neuroshard_whitepaper.pdf">Whitepaper</a> •
   <a href="https://discord.gg/4R49xpj7vn">Discord</a> •
   <a href="https://x.com/shardneuro">Twitter</a>
 </p>
