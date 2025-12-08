@@ -163,7 +163,8 @@ settings.local.*
 *.local.yaml
 *.local.json
 
-# Whitepaper build artifacts
+# Whitepaper source and build artifacts
+docs/whitepaper/*.tex
 docs/whitepaper/*.aux
 docs/whitepaper/*.log
 docs/whitepaper/*.out
