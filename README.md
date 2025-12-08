@@ -175,6 +175,7 @@ See [full CLI reference](https://docs.neuroshard.com/guide/cli-reference) for al
 
 ## Documentation
 
+- **[Whitepaper](docs/whitepaper/neuroshard_whitepaper.pdf)** - Technical whitepaper (PDF)
 - **[Getting Started](https://docs.neuroshard.com/guide/quick-start)** - First steps
 - **[Running a Node](https://docs.neuroshard.com/guide/running-a-node)** - Detailed setup
 - **[Architecture](https://docs.neuroshard.com/architecture/overview)** - System design
@@ -189,6 +190,7 @@ See [full CLI reference](https://docs.neuroshard.com/guide/cli-reference) for al
 |----------|------|
 | Website | [neuroshard.com](https://neuroshard.com) |
 | Documentation | [docs.neuroshard.com](https://docs.neuroshard.com) |
+| Whitepaper | [PDF](docs/whitepaper/neuroshard_whitepaper.pdf) |
 | Discord | [discord.gg/4R49xpj7vn](https://discord.gg/4R49xpj7vn) |
 | Twitter | [@shardneuro](https://x.com/shardneuro) |
 | PyPI | [pypi.org/project/neuroshard](https://pypi.org/project/neuroshard/) |
