@@ -24,26 +24,26 @@
 
 ---
 
-## 🧠 What is NeuroShard?
+## What is NeuroShard?
 
 NeuroShard is a **decentralized network** for training large language models. Anyone can contribute GPU/CPU power and earn **NEURO tokens** through Proof of Neural Work.
 
 Unlike centralized AI companies, NeuroShard distributes both the compute AND the rewards across all participants.
 
-### ✨ Key Features
+### Key Features
 
 | Feature | Description |
 |---------|-------------|
-| 🔄 **DiLoCo Training** | Distributed Low-Communication training - sync every 500 steps, not every step |
-| 🛡️ **Byzantine Tolerance** | Robust gradient aggregation (Krum, Trimmed Mean) handles malicious nodes |
-| 💰 **NEURO Rewards** | Earn tokens for contributing compute via Proof of Neural Work |
-| 🔐 **Cryptographic Proofs** | ECDSA-signed proofs ensure trustless verification |
-| 📊 **Web Dashboard** | Real-time monitoring at `http://localhost:8000` |
-| 🌐 **P2P Network** | Decentralized peer discovery and gossip protocol |
+| **DiLoCo Training** | Distributed Low-Communication training - sync every 500 steps, not every step |
+| **Byzantine Tolerance** | Robust gradient aggregation (Krum, Trimmed Mean) handles malicious nodes |
+| **NEURO Rewards** | Earn tokens for contributing compute via Proof of Neural Work |
+| **Cryptographic Proofs** | ECDSA-signed proofs ensure trustless verification |
+| **Web Dashboard** | Real-time monitoring at `http://localhost:8000` |
+| **P2P Network** | Decentralized peer discovery and gossip protocol |
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Installation
 
@@ -73,7 +73,7 @@ Open `http://localhost:8000` to see:
 
 ---
 
-## 💻 System Requirements
+## System Requirements
 
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
@@ -91,7 +91,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cu118
 
 ---
 
-## 📖 How It Works
+## How It Works
 
 ### DiLoCo Distributed Training
 
@@ -130,7 +130,7 @@ All proofs are verified using ECDSA signatures (secp256k1).
 
 ---
 
-## 🔧 Configuration
+## Configuration
 
 ### CLI Options
 
@@ -154,7 +154,7 @@ See [full CLI reference](https://docs.neuroshard.com/guide/cli-reference) for al
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -173,7 +173,7 @@ See [full CLI reference](https://docs.neuroshard.com/guide/cli-reference) for al
 
 ---
 
-## 📚 Documentation
+## Documentation
 
 - **[Getting Started](https://docs.neuroshard.com/guide/quick-start)** - First steps
 - **[Running a Node](https://docs.neuroshard.com/guide/running-a-node)** - Detailed setup
@@ -183,19 +183,19 @@ See [full CLI reference](https://docs.neuroshard.com/guide/cli-reference) for al
 
 ---
 
-## 🔗 Links
+## Links
 
 | Resource | Link |
 |----------|------|
-| 🌐 Website | [neuroshard.com](https://neuroshard.com) |
-| 📖 Documentation | [docs.neuroshard.com](https://docs.neuroshard.com) |
-| 💬 Discord | [discord.gg/4R49xpj7vn](https://discord.gg/4R49xpj7vn) |
-| 🐦 Twitter | [@shardneuro](https://x.com/shardneuro) |
-| 📦 PyPI | [pypi.org/project/neuroshard](https://pypi.org/project/neuroshard/) |
+| Website | [neuroshard.com](https://neuroshard.com) |
+| Documentation | [docs.neuroshard.com](https://docs.neuroshard.com) |
+| Discord | [discord.gg/4R49xpj7vn](https://discord.gg/4R49xpj7vn) |
+| Twitter | [@shardneuro](https://x.com/shardneuro) |
+| PyPI | [pypi.org/project/neuroshard](https://pypi.org/project/neuroshard/) |
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
 
@@ -213,7 +213,7 @@ pytest
 
 ---
 
-## 📄 License
+## License
 
 Apache License 2.0 - see [LICENSE](LICENSE) for details.
 

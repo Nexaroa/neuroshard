@@ -136,6 +136,7 @@ themeConfig: {
       },
 
       socialLinks: [
+        { icon: 'github', link: 'https://github.com/Nexaroa/neuroshard' },
         { icon: 'twitter', link: 'https://x.com/shardneuro' },
         { icon: 'discord', link: 'https://discord.gg/4R49xpj7vn' }
       ],

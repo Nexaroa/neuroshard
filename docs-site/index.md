@@ -15,6 +15,9 @@ hero:
     - theme: alt
       text: Run a Node
       link: /guide/quick-start
+    - theme: alt
+      text: GitHub
+      link: https://github.com/Nexaroa/neuroshard
 
 features:
   - title: Decentralized Training
@@ -141,6 +144,7 @@ Get your token at [neuroshard.com/signup](https://neuroshard.com/signup)
 
 ## Join the Community
 
+- **GitHub**: [github.com/Nexaroa/neuroshard](https://github.com/Nexaroa/neuroshard)
 - **Discord**: [discord.gg/4R49xpj7vn](https://discord.gg/4R49xpj7vn)
 - **X (Twitter)**: [@shardneuro](https://x.com/shardneuro)
 - **Website**: [neuroshard.com](https://neuroshard.com)
