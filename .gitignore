@@ -2,6 +2,27 @@
 # NeuroShard .gitignore
 # ============================================
 
+# -------------------- Private Infrastructure --------------------
+# Website (frontend + backend API) - kept private
+website/
+
+# Docker configuration - kept private
+docker-compose.yml
+docker-compose*.yml
+Dockerfile*
+*.dockerfile
+
+# Server configuration - kept private
+config/
+*.service
+
+# Infrastructure scripts - kept private
+scripts/genesis_*.sh
+scripts/genesis_*.json
+scripts/*_s3.py
+scripts/setup_*.py
+scripts/release.sh
+
 # -------------------- Python --------------------
 __pycache__/
 *.py[cod]
