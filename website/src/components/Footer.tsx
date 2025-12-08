@@ -21,7 +21,7 @@ export const Footer = () => {
             {/* Social Icons */}
             <div className="flex items-center gap-3 mt-5">
               <a 
-                href="https://github.com/neuroshard" 
+                href="https://github.com/Nexaroa/neuroshard" 
                 target="_blank"
                 rel="noopener noreferrer"
                 className="p-2 bg-slate-800/50 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-all"
@@ -121,7 +121,7 @@ export const Footer = () => {
         <div className="container mx-auto px-6 py-4">
           <div className="flex flex-col md:flex-row justify-between items-center gap-3">
             <p className="text-slate-500 text-xs">
-              © {new Date().getFullYear()} NextAroa · MIT License
+              © {new Date().getFullYear()} Nexaroa · Apache 2.0
             </p>
             <p className="text-slate-600 text-xs text-center md:text-right max-w-xl">
               NEURO is a utility token, not an investment. AI outputs may be inaccurate. 

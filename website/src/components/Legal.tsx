@@ -190,7 +190,7 @@ const TermsOfService = () => (
 
     <SubSection title="6. Intellectual Property">
       <p>
-        NeuroShard software is released under the MIT License. NeuroLLM model weights 
+        NeuroShard software is released under the Apache License 2.0. NeuroLLM model weights 
         are collectively owned by the network participants. You retain rights to any 
         data you contribute, subject to the training process.
       </p>

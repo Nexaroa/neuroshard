@@ -7,7 +7,7 @@ name = "nexaroa"
 dynamic = ["version"]
 description = "Decentralized AI Network"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
 authors = [
     {name = "NeuroShard Team", email = "team@neuroshard.com"}
@@ -20,7 +20,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -65,8 +65,8 @@ dev = [
 [project.urls]
 Homepage = "https://neuroshard.com"
 Documentation = "https://docs.neuroshard.com"
-Repository = "https://github.com/neuroshard/neuroshard"
-Issues = "https://github.com/neuroshard/neuroshard/issues"
+Repository = "https://github.com/Nexaroa/neuroshard"
+Issues = "https://github.com/Nexaroa/neuroshard/issues"
 
 [project.scripts]
 # Main entry point - run a node

@@ -141,7 +141,7 @@ themeConfig: {
       ],
 
       footer: {
-        message: 'Released under the MIT License.',
+        message: 'Released under the Apache License 2.0.',
         copyright: 'Copyright © 2024-2025 NeuroShard'
       },
 

@@ -498,14 +498,14 @@ We welcome contributions! See [CONTRIBUTING.md](./CONTRIBUTING.md) for guideline
 
 ## License
 
-NeuroShard is open source under the MIT License.
+NeuroShard is open source under the Apache License 2.0.
 
 ---
 
 ## Contact
 
 - Website: https://neuroshard.com
-- GitHub: https://github.com/LinirZamir/neuroshard
+- GitHub: https://github.com/Nexaroa/neuroshard
 - Discord: [Coming Soon]
 
 ---

@@ -1,6 +1,6 @@
 [Unit]
 Description=NeuroShard Genesis Data Population Service
-Documentation=https://github.com/neuroshard/neuroshard
+Documentation=https://github.com/Nexaroa/neuroshard
 After=network-online.target
 Wants=network-online.target
 

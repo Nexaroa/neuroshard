@@ -11,7 +11,7 @@ pip install nexaroa
 Or from source:
 
 ```bash
-git clone https://github.com/neuroshard/neuroshard
+git clone https://github.com/Nexaroa/neuroshard
 cd neuroshard
 pip install -e .
 ```
