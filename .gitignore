@@ -15,6 +15,12 @@ Dockerfile*
 # Server configuration - kept private
 config/
 *.service
+scripts/backup_to_private.sh
+scripts/manage_tags.sh
+scripts/build_whitepaper.sh
+scripts/install.sh
+scripts/manage_tags.sh
+scripts/manage_tags.sh
 
 # Infrastructure scripts - kept private
 scripts/genesis_*.sh
