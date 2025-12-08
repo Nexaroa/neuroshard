@@ -189,6 +189,7 @@ docker-compose.override.yml
 neuroshard_data/
 .neuroshard/
 node_state/
+.private-repo-sync/
 
 # Genesis cache
 genesis_cache/
