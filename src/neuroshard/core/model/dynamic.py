@@ -1348,69 +1348,143 @@ class DynamicNeuroNode:
             max_seq_len=2048
         )
         
+        # DYNAMIC TRAINING CONFIG: Calculate based on current model size and device
+        # This will be recalculated when model grows via recalculate_training_config()
+        num_layers = len(self.my_layer_ids)
+        
+        # Smart gradient checkpointing decision based on device and memory
+        if self.device == "cuda" and self.available_memory_mb > 16000:
+            # High-memory CUDA (Jetson Orin, RTX 3090+): only checkpoint if > 150 layers
+            self._use_gradient_checkpointing = num_layers > 150
+        elif self.device == "cuda":
+            # Normal CUDA: checkpoint if > 80 layers or low memory
+            self._use_gradient_checkpointing = num_layers > 80 or self.available_memory_mb < 8000
+        else:
+            # CPU/MPS: more conservative
+            self._use_gradient_checkpointing = (
+                self.available_memory_mb < 8000 or
+                (self.device == "mps" and num_layers > 20) or
+                num_layers > 50
+            )
+        
         # Calculate memory-aware training batch size
         self._training_batch_size = self._calculate_training_batch_size()
-        
-        # Enable gradient checkpointing flag (trades compute for memory)
-        # Auto-enable for: low memory, MPS with many layers, or large models
-        num_layers = len(self.my_layer_ids)
-        self._use_gradient_checkpointing = (
-            self.available_memory_mb < 8000 or  # Low memory
-            (self.device == "mps" and num_layers > 20) or  # MPS with many layers
-            num_layers > 50  # Any large model
-        )
-        
+
         logger.info(f"Training initialized: batch_size={self._training_batch_size}, "
-                   f"checkpointing={self._use_gradient_checkpointing}")
+                   f"checkpointing={self._use_gradient_checkpointing}, "
+                   f"layers={num_layers}, device={self.device}")
     
     def _calculate_training_batch_size(self) -> int:
-        """Calculate optimal batch size based on available memory and device."""
+        """
+        Calculate optimal batch size based on available memory, device, and model size.
+        
+        DYNAMIC: This is called initially and can be recalculated when model grows.
+        SMART: Considers GPU memory, gradient checkpointing, and actual model size.
+        """
         seq_len = 512  # Typical sequence length
-        # Get hidden_dim from the dynamic architecture (MUST exist at this point)
         hidden_dim = self.layer_pool.current_architecture.hidden_dim
         num_layers = len(self.my_layer_ids)
         
         # Calculate model memory footprint (params + gradients + optimizer states)
-        # Rough estimate: model_params * 4 bytes * 4 (weights + grads + adam m + adam v)
         model_params = sum(p.numel() for p in self.model.parameters())
+        # Model memory: weights (fp32=4 bytes) × 4 (weights + grads + adam_m + adam_v)
         model_memory_mb = (model_params * 4 * 4) / (1024 * 1024)
         
-        # Memory per sample for activations
-        mem_per_sample_mb = (seq_len * hidden_dim * max(1, num_layers) * 4 * 2) / (1024 * 1024)
+        # For CUDA, check actual GPU memory available
+        if self.device == "cuda":
+            try:
+                gpu_total = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+                gpu_allocated = torch.cuda.memory_allocated(0) / (1024 * 1024)
+                logger.info(f"[NODE] CUDA memory: {gpu_allocated:.0f}MB used / {gpu_total:.0f}MB total")
+                effective_memory_mb = self.available_memory_mb
+            except Exception:
+                effective_memory_mb = self.available_memory_mb
+        else:
+            effective_memory_mb = self.available_memory_mb
         
-        # Device-specific memory budget - MORE CONSERVATIVE
-        # model_memory_mb already accounts for 4x (weights + grads + optimizer states)
-        if self.device == "mps":
-            # MPS: Very limited - only 15% of total for activations
-            training_memory_mb = max(50, self.available_memory_mb * 0.15 - model_memory_mb)
+        # CORRECT FORMULA: Available for activations = Total - Model memory
+        # Leave 10% buffer for system overhead
+        available_for_activations = max(100, (effective_memory_mb * 0.9) - model_memory_mb)
+        
+        # With gradient checkpointing, activation memory is MUCH lower
+        use_checkpointing = getattr(self, '_use_gradient_checkpointing', False)
+        if use_checkpointing:
+            # Checkpointing: Only need to store ~sqrt(num_layers) worth of activations
+            # Plus inputs/outputs at checkpoint boundaries
+            checkpoint_segments = max(1, int(num_layers ** 0.5))
+            # Memory per sample: seq_len × hidden_dim × checkpoint_segments × 4 bytes × 2 (fwd+bwd)
+            mem_per_sample_mb = (seq_len * hidden_dim * checkpoint_segments * 4 * 2) / (1024 * 1024)
+            logger.info(f"[NODE] Gradient checkpointing: {checkpoint_segments} segments "
+                       f"(~{mem_per_sample_mb:.1f}MB/sample)")
+        else:
+            # No checkpointing: full activation memory for all layers
+            mem_per_sample_mb = (seq_len * hidden_dim * num_layers * 4 * 2) / (1024 * 1024)
+        
+        logger.info(f"[NODE] Memory budget: total={effective_memory_mb:.0f}MB, "
+                   f"model={model_memory_mb:.0f}MB, "
+                   f"available_for_activations={available_for_activations:.0f}MB")
+        
+        # Calculate max batch size from available memory
+        max_batch = max(1, int(available_for_activations / max(1, mem_per_sample_mb)))
+        
+        # SMART CLAMPING based on device capability
+        if self.device == "cuda" and effective_memory_mb > 16000:
+            # High-memory CUDA (Jetson Orin 32GB, RTX 3090 24GB): up to 8
+            max_batch = min(max_batch, 8)
+        elif self.device == "cuda" and effective_memory_mb > 8000:
+            # Medium CUDA: up to 4
+            max_batch = min(max_batch, 4)
         elif self.device == "cuda":
-            # CUDA: 20% of total for activations
-            training_memory_mb = max(100, self.available_memory_mb * 0.2 - model_memory_mb)
+            # Small CUDA: up to 2
+            max_batch = min(max_batch, 2)
+        elif num_layers > 100:
+            # Large model on CPU/MPS: conservative
+            max_batch = min(max_batch, 2)
         else:
-            # CPU: More conservative - assume 40% for model+optimizer+grads, 30% for activations
-            training_memory_mb = max(100, self.available_memory_mb * 0.3 - model_memory_mb)
-        
-        logger.info(f"[NODE] Memory budget: model+optimizer={model_memory_mb:.0f}MB, "
-              f"activations={training_memory_mb:.0f}MB, "
-              f"total={model_memory_mb + training_memory_mb:.0f}MB / {self.available_memory_mb:.0f}MB allocated")
-        
-        # Calculate max batch size
-        max_batch = max(1, int(training_memory_mb / max(1, mem_per_sample_mb)))
-        
-        # Clamp based on layer count (more layers = smaller batch needed)
-        if num_layers > 50:
-            max_batch = min(max_batch, 2)  # Large models: batch 1-2
-        elif num_layers > 20:
-            max_batch = min(max_batch, 4)  # Medium models: batch 1-4
-        else:
-            max_batch = min(max_batch, 8)  # Small models: up to 8
+            max_batch = min(max_batch, 4)
         
         batch_size = max(1, max_batch)
         
-        logger.info(f"Memory budget: {self.available_memory_mb:.0f}MB, "
-                   f"model: {model_memory_mb:.0f}MB, batch_size={batch_size}")
+        logger.info(f"[NODE] Training config: batch_size={batch_size}, "
+                   f"model={model_params/1e6:.1f}M params ({num_layers} layers × {hidden_dim} dim), "
+                   f"checkpointing={use_checkpointing}, device={self.device}")
         
         return batch_size
+    
+    def recalculate_training_config(self):
+        """
+        Recalculate training configuration after model architecture changes.
+        
+        Called when:
+        - Model grows (new layers added)
+        - Memory allocation changes
+        - Device changes
+        """
+        old_batch = getattr(self, '_training_batch_size', None)
+        self._training_batch_size = self._calculate_training_batch_size()
+        
+        # Update gradient checkpointing based on new model size
+        num_layers = len(self.my_layer_ids)
+        old_checkpointing = getattr(self, '_use_gradient_checkpointing', False)
+        
+        # More nuanced checkpointing decision
+        if self.device == "cuda" and self.available_memory_mb > 16000:
+            # High-memory CUDA: only checkpoint if > 150 layers
+            self._use_gradient_checkpointing = num_layers > 150
+        elif self.device == "cuda":
+            # Normal CUDA: checkpoint if > 80 layers
+            self._use_gradient_checkpointing = num_layers > 80 or self.available_memory_mb < 8000
+        else:
+            # CPU/MPS: original logic
+            self._use_gradient_checkpointing = (
+                self.available_memory_mb < 8000 or
+                (self.device == "mps" and num_layers > 20) or
+                num_layers > 50
+            )
+        
+        if old_batch != self._training_batch_size or old_checkpointing != self._use_gradient_checkpointing:
+            logger.info(f"[NODE] Training config updated: batch_size={old_batch}→{self._training_batch_size}, "
+                       f"checkpointing={old_checkpointing}→{self._use_gradient_checkpointing}")
     
     def stop(self):
         """Stop the node."""
