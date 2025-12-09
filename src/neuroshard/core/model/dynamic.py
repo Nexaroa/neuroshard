@@ -1369,9 +1369,10 @@ class DynamicNeuroNode:
         )
         self.model.initialize_layers(self.my_layer_ids)
         
-        # 4. Initialize tokenizer
-        from neuroshard.core.model.tokenizer import get_neuro_tokenizer
+        # 4. Initialize tokenizer with learned BPE merges from CDN
+        from neuroshard.core.model.tokenizer import get_neuro_tokenizer, NeuroTokenizer
         self.tokenizer = get_neuro_tokenizer()
+        self._load_learned_tokenizer()  # Update with BPE merges from CDN
         
         # 5. Try to load existing checkpoint (resume training)
         self._load_checkpoint()
@@ -1396,6 +1397,70 @@ class DynamicNeuroNode:
                 logger.error(f"[DEVICE] Model device mismatch! Expected {self.device}, got {param_device}")
             else:
                 logger.info(f"[DEVICE] Model verified on: {param_device}")
+    
+    def _load_learned_tokenizer(self):
+        """
+        Load learned BPE tokenizer from Genesis CDN.
+        
+        This ensures the tokenizer used for inference matches the one used
+        for training data tokenization, providing consistency across the network.
+        """
+        import requests
+        import os
+        
+        GENESIS_CDN_URL = "https://d2l3k2r8q1m0jg.cloudfront.net"
+        cache_dir = os.path.join(os.path.expanduser("~"), ".neuroshard", "data_cache")
+        
+        try:
+            tokenizer_url = f"{GENESIS_CDN_URL}/tokenizer.json"
+            tokenizer_cache_path = os.path.join(cache_dir, "tokenizer.json")
+            
+            # Try to fetch from CDN
+            try:
+                logger.debug(f"[TOKENIZER] Checking for learned tokenizer from {tokenizer_url}...")
+                resp = requests.get(tokenizer_url, timeout=10)
+                
+                if resp.status_code == 200:
+                    remote_tokenizer_data = resp.json()
+                    remote_vocab_size = remote_tokenizer_data.get("next_merge_id", 0)
+                    
+                    # Cache locally
+                    os.makedirs(cache_dir, exist_ok=True)
+                    with open(tokenizer_cache_path, 'w') as f:
+                        f.write(resp.text)
+                    
+                    # Update tokenizer if remote has more merges
+                    if remote_vocab_size > self.tokenizer.next_merge_id:
+                        from neuroshard.core.model.tokenizer import NeuroTokenizer
+                        learned_tokenizer = NeuroTokenizer.load(tokenizer_cache_path)
+                        
+                        self.tokenizer.merges = learned_tokenizer.merges
+                        self.tokenizer.merge_to_tokens = learned_tokenizer.merge_to_tokens
+                        self.tokenizer.next_merge_id = learned_tokenizer.next_merge_id
+                        
+                        logger.info(f"[TOKENIZER] Loaded BPE tokenizer: {self.tokenizer.next_merge_id} tokens, {len(self.tokenizer.merges)} merges")
+                    else:
+                        logger.debug(f"[TOKENIZER] Already up to date: {self.tokenizer.next_merge_id} tokens")
+                    return
+            except requests.RequestException as e:
+                logger.debug(f"[TOKENIZER] CDN fetch failed: {e}")
+            
+            # Fallback to cached version
+            if os.path.exists(tokenizer_cache_path) and self.tokenizer.next_merge_id <= 266:
+                try:
+                    from neuroshard.core.model.tokenizer import NeuroTokenizer
+                    learned_tokenizer = NeuroTokenizer.load(tokenizer_cache_path)
+                    
+                    if learned_tokenizer.next_merge_id > self.tokenizer.next_merge_id:
+                        self.tokenizer.merges = learned_tokenizer.merges
+                        self.tokenizer.merge_to_tokens = learned_tokenizer.merge_to_tokens
+                        self.tokenizer.next_merge_id = learned_tokenizer.next_merge_id
+                        logger.info(f"[TOKENIZER] Loaded cached BPE tokenizer: {self.tokenizer.next_merge_id} tokens")
+                except Exception as e:
+                    logger.warning(f"[TOKENIZER] Failed to load cached tokenizer: {e}")
+                    
+        except Exception as e:
+            logger.warning(f"[TOKENIZER] Error loading learned tokenizer: {e}")
     
     def _setup_training(self):
         """Setup training components."""
