@@ -398,9 +398,10 @@
                                             <label class="text-sm text-dark-400">Max Memory</label>
                                             <span id="mem-limit-value" class="text-sm font-mono text-neuro-400">4096 MB</span>
                                     </div>
-                                    <input id="mem-limit-slider" type="range" min="512" max="32768" value="4096" step="512"
+                                    <input id="mem-limit-slider" type="range" min="512" max="65536" value="4096" step="512"
                                             class="w-full h-2 bg-dark-700 rounded-lg appearance-none cursor-pointer accent-neuro-500"
                                         oninput="updateMemLimit(this.value)">
+                                    <p class="text-xs text-dark-500 mt-1">Memory for model layers (more = more layers = more rewards)</p>
                                 </div>
                                 
                                 <!-- Storage Slider -->
@@ -409,7 +410,7 @@
                                             <label class="text-sm text-dark-400">Training Data Storage</label>
                                             <span id="storage-limit-value" class="text-sm font-mono text-neuro-400">100 MB</span>
                                     </div>
-                                    <input id="storage-limit-slider" type="range" min="50" max="2000" value="100" step="50"
+                                    <input id="storage-limit-slider" type="range" min="50" max="10000" value="100" step="50"
                                             class="w-full h-2 bg-dark-700 rounded-lg appearance-none cursor-pointer accent-neuro-500"
                                         oninput="updateStorageLimit(this.value)">
                                     <p class="text-xs text-dark-500 mt-1">Disk space for training data shards (~10 shards per 100MB)</p>
