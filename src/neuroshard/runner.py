@@ -693,6 +693,13 @@ async def get_api_stats():
     # Add version
     stats["version"] = __version__
     
+    # Add current config settings (for UI sliders)
+    stats["config"] = {
+        "cpu_threads": STATE.get("config_cpu_threads"),
+        "memory_mb": STATE.get("config_memory_mb"),
+        "storage_mb": STATE.get("config_storage_mb", 100),  # Default 100MB
+    }
+    
     return stats
 
 
@@ -1168,6 +1175,7 @@ async def get_stake_info():
 class ThrottleUpdateRequest(BaseModel):
     cpu_threads: Optional[int] = None
     memory_mb: Optional[int] = None
+    storage_mb: Optional[int] = None
 
 
 @node_app.post("/api/throttle")
@@ -1175,7 +1183,7 @@ async def update_throttle(req: ThrottleUpdateRequest):
     """
     Update training throttle settings while node is running.
     
-    This allows the GUI to change CPU/RAM limits without restarting.
+    This allows the GUI to change CPU/RAM/Storage limits without restarting.
     Changes take effect within 5 seconds.
     """
     updated = {}
@@ -1188,10 +1196,19 @@ async def update_throttle(req: ThrottleUpdateRequest):
         STATE["config_memory_mb"] = req.memory_mb
         updated["memory_mb"] = req.memory_mb
     
+    if req.storage_mb is not None:
+        STATE["config_storage_mb"] = req.storage_mb
+        updated["storage_mb"] = req.storage_mb
+        # Update genesis loader if it exists
+        if NEURO_NODE and hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
+            NEURO_NODE.genesis_loader.max_storage_mb = req.storage_mb
+            NEURO_NODE.genesis_loader.max_shards = max(1, int(req.storage_mb / 10))
+            logger.info(f"[NODE] Updated storage limit: {req.storage_mb}MB ({NEURO_NODE.genesis_loader.max_shards} shards)")
+    
     return {
         "success": True,
         "updated": updated,
-        "message": "Throttle settings updated. Changes take effect within 5 seconds.",
+        "message": "Settings updated. Changes take effect within 5 seconds.",
         "current_throttle": {
             "cpu_ratio": STATE.get("throttle_cpu_ratio", 1.0),
             "ram_ratio": STATE.get("throttle_ram_ratio", 1.0),
@@ -2320,6 +2337,7 @@ def run_node(
         # Store initial limits (can be updated via API)
         STATE["config_cpu_threads"] = max_cpu_threads
         STATE["config_memory_mb"] = available_memory_mb
+        STATE["config_storage_mb"] = max_storage_mb
         
         total_cpu_cores = psutil.cpu_count() or 4
         total_ram_mb = psutil.virtual_memory().total / (1024 * 1024)

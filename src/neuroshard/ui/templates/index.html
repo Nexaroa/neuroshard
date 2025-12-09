@@ -402,6 +402,18 @@
                                             class="w-full h-2 bg-dark-700 rounded-lg appearance-none cursor-pointer accent-neuro-500"
                                         oninput="updateMemLimit(this.value)">
                                 </div>
+                                
+                                <!-- Storage Slider -->
+                                <div>
+                                    <div class="flex justify-between mb-2">
+                                            <label class="text-sm text-dark-400">Training Data Storage</label>
+                                            <span id="storage-limit-value" class="text-sm font-mono text-neuro-400">100 MB</span>
+                                    </div>
+                                    <input id="storage-limit-slider" type="range" min="50" max="2000" value="100" step="50"
+                                            class="w-full h-2 bg-dark-700 rounded-lg appearance-none cursor-pointer accent-neuro-500"
+                                        oninput="updateStorageLimit(this.value)">
+                                    <p class="text-xs text-dark-500 mt-1">Disk space for training data shards (~10 shards per 100MB)</p>
+                                </div>
                             </div>
                             
                                 <button onclick="applyThrottle()" class="mt-6 w-full px-4 py-2.5 bg-neuro-600 hover:bg-neuro-500 rounded-lg text-dark-950 font-medium transition-colors">
@@ -588,24 +600,33 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
             document.getElementById('mem-limit-value').textContent = value + ' MB';
         }
         
+        function updateStorageLimit(value) {
+            document.getElementById('storage-limit-value').textContent = value + ' MB';
+        }
+
         async function applyThrottle() {
             const cpu = document.getElementById('cpu-limit-slider').value;
             const mem = document.getElementById('mem-limit-slider').value;
+            const storage = document.getElementById('storage-limit-slider').value;
             
             try {
                 const resp = await fetch('/api/throttle', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ cpu_threads: parseInt(cpu), memory_mb: parseInt(mem) })
+                    body: JSON.stringify({ 
+                        cpu_threads: parseInt(cpu), 
+                        memory_mb: parseInt(mem),
+                        storage_mb: parseInt(storage)
+                    })
                 });
                 
                 if (resp.ok) {
-                    addLog(`Throttle updated: ${cpu} threads, ${mem}MB memory`, 'success');
+                    addLog(`Settings updated: ${cpu} threads, ${mem}MB memory, ${storage}MB storage`, 'success');
                 } else {
-                    addLog('Failed to update throttle', 'error');
+                    addLog('Failed to update settings', 'error');
                 }
             } catch (e) {
-                addLog('Error updating throttle: ' + e.message, 'error');
+                addLog('Error updating settings: ' + e.message, 'error');
             }
         }
         
@@ -789,6 +810,40 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
                     document.getElementById('diloco-outer').textContent = data.diloco.outer_step || 0;
                 } else {
                     document.getElementById('diloco-section').style.display = 'none';
+                }
+                
+                // Initialize sliders with actual config values (once)
+                if (data.config && !window.slidersInitialized) {
+                    window.slidersInitialized = true;
+                    
+                    // CPU threads
+                    if (data.config.cpu_threads) {
+                        const cpuSlider = document.getElementById('cpu-limit-slider');
+                        if (cpuSlider) {
+                            cpuSlider.value = data.config.cpu_threads;
+                            document.getElementById('cpu-limit-value').textContent = data.config.cpu_threads;
+                        }
+                    }
+                    
+                    // Memory
+                    if (data.config.memory_mb) {
+                        const memSlider = document.getElementById('mem-limit-slider');
+                        if (memSlider) {
+                            memSlider.value = data.config.memory_mb;
+                            document.getElementById('mem-limit-value').textContent = data.config.memory_mb + ' MB';
+                        }
+                    }
+                    
+                    // Storage
+                    if (data.config.storage_mb) {
+                        const storageSlider = document.getElementById('storage-limit-slider');
+                        if (storageSlider) {
+                            storageSlider.value = data.config.storage_mb;
+                            document.getElementById('storage-limit-value').textContent = data.config.storage_mb + ' MB';
+                        }
+                    }
+                    
+                    addLog(`Config loaded: CPU=${data.config.cpu_threads || 'auto'}, Memory=${data.config.memory_mb || 'auto'}MB, Storage=${data.config.storage_mb || 100}MB`, 'info');
                 }
                 
             } catch (e) {
