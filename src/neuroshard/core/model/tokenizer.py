@@ -129,37 +129,79 @@ class NeuroTokenizer:
         return [self.byte_to_id[b] for b in text.encode('utf-8')]
     
     def _apply_merges(self, token_ids: List[int]) -> List[int]:
-        """Apply learned BPE merges to a sequence of token IDs."""
-        if not self.merges:
+        """
+        Apply learned BPE merges to a sequence of token IDs.
+        
+        OPTIMIZED: Uses heap-based approach for O(n log n) instead of O(n²).
+        Merges are applied in priority order (lower merge ID = higher priority).
+        """
+        if not self.merges or len(token_ids) <= 1:
             return token_ids
         
-        # Iteratively apply merges (greedy)
-        while len(token_ids) > 1:
-            # Find the best merge (lowest ID = learned earliest = most frequent)
-            best_merge = None
-            best_idx = -1
-            best_merged_id = float('inf')
-            
-            for i in range(len(token_ids) - 1):
-                pair = (token_ids[i], token_ids[i + 1])
-                if pair in self.merges:
-                    merged_id = self.merges[pair]
-                    if merged_id < best_merged_id:
-                        best_merge = pair
-                        best_idx = i
-                        best_merged_id = merged_id
-            
-            if best_merge is None:
-                break
-            
-            # Apply the merge
-            token_ids = (
-                token_ids[:best_idx] + 
-                [best_merged_id] + 
-                token_ids[best_idx + 2:]
-            )
+        import heapq
         
-        return token_ids
+        # Convert to list for in-place modification
+        tokens = list(token_ids)
+        n = len(tokens)
+        
+        # Track which positions are "deleted" (merged into previous)
+        deleted = [False] * n
+        
+        # Build initial heap of mergeable pairs: (merge_id, position)
+        # Lower merge_id = higher priority (learned earlier = more frequent)
+        heap = []
+        for i in range(n - 1):
+            pair = (tokens[i], tokens[i + 1])
+            if pair in self.merges:
+                heapq.heappush(heap, (self.merges[pair], i))
+        
+        while heap:
+            merge_id, pos = heapq.heappop(heap)
+            
+            # Skip if position was already processed
+            if pos >= n - 1 or deleted[pos]:
+                continue
+            
+            # Find actual next non-deleted position
+            next_pos = pos + 1
+            while next_pos < n and deleted[next_pos]:
+                next_pos += 1
+            
+            if next_pos >= n:
+                continue
+            
+            # Check if this merge still applies
+            pair = (tokens[pos], tokens[next_pos])
+            if pair not in self.merges or self.merges[pair] != merge_id:
+                continue
+            
+            # Apply merge: replace token at pos, mark next_pos as deleted
+            tokens[pos] = merge_id
+            deleted[next_pos] = True
+            
+            # Find previous non-deleted position
+            prev_pos = pos - 1
+            while prev_pos >= 0 and deleted[prev_pos]:
+                prev_pos -= 1
+            
+            # Find next-next non-deleted position  
+            next_next_pos = next_pos + 1
+            while next_next_pos < n and deleted[next_next_pos]:
+                next_next_pos += 1
+            
+            # Add new potential merges to heap
+            if prev_pos >= 0:
+                new_pair = (tokens[prev_pos], tokens[pos])
+                if new_pair in self.merges:
+                    heapq.heappush(heap, (self.merges[new_pair], prev_pos))
+            
+            if next_next_pos < n:
+                new_pair = (tokens[pos], tokens[next_next_pos])
+                if new_pair in self.merges:
+                    heapq.heappush(heap, (self.merges[new_pair], pos))
+        
+        # Build result excluding deleted positions
+        return [tokens[i] for i in range(n) if not deleted[i]]
     
     def encode(
         self, 
