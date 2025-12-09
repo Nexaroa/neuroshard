@@ -91,6 +91,19 @@ def request_shutdown():
     except Exception as e:
         logger.error(f"[NODE] gRPC shutdown error: {e}")
     
+    # Stop the node first (sets is_running = False)
+    if NEURO_NODE:
+        try:
+            logger.info("[NODE] Stopping node...")
+            # Get base node for SwarmEnabledDynamicNode
+            base = getattr(NEURO_NODE, 'base_node', NEURO_NODE)
+            if hasattr(base, 'stop'):
+                base.stop()
+            if hasattr(NEURO_NODE, 'stop') and NEURO_NODE != base:
+                NEURO_NODE.stop()
+        except Exception as e:
+            logger.error(f"[NODE] Node stop error: {e}")
+    
     # Stop swarm components if enabled
     if NEURO_NODE and hasattr(NEURO_NODE, 'stop_swarm_sync'):
         try:
@@ -157,22 +170,29 @@ def request_shutdown():
     if _UVICORN_SERVER:
         logger.info("[NODE] Stopping HTTP server...")
         _UVICORN_SERVER.should_exit = True
-        
-        # FORCE EXIT: If uvicorn doesn't stop in 2 seconds, force kill
-        def force_exit():
-            import time as t_module
-            import os
-            t_module.sleep(2.0)
-            logger.warning("[NODE] Force exiting (server didn't stop gracefully)...")
-            os._exit(0)  # Force exit without cleanup
-        
-        force_thread = threading.Thread(target=force_exit, daemon=True)
-        force_thread.start()
-    else:
-        # No server running, just exit
-        logger.info("[NODE] No server to stop, exiting...")
+    
+    # FORCE EXIT: Always force exit after 3 seconds regardless
+    # This handles nohup, daemon, and any other run mode
+    def force_exit():
+        import time as t_module
         import os
-        os._exit(0)
+        import signal
+        t_module.sleep(3.0)
+        logger.warning("[NODE] Force exiting (server didn't stop gracefully)...")
+        # Try SIGTERM first (graceful)
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            pass
+        t_module.sleep(0.5)
+        # If still running, force kill
+        logger.warning("[NODE] Forcing process termination...")
+        os._exit(0)  # Force exit without cleanup
+    
+    # Use non-daemon thread to ensure force_exit runs to completion
+    force_thread = threading.Thread(target=force_exit, daemon=False)
+    force_thread.start()
+    logger.info("[NODE] Force exit scheduled in 3 seconds...")
     
     # Reset globals so next run starts fresh
     NEURO_NODE = None
