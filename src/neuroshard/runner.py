@@ -2377,7 +2377,9 @@ def run_node(
             is_gpu = NEURO_NODE.device in ["cuda", "mps"] if NEURO_NODE else False
             
             # Log device status occasionally to debug "why is it slow?"
-            if now - last_throttle_log >= 60:
+            # Use time.time() directly to avoid closure issues with 'now'
+            current_time = time.time()
+            if current_time - last_throttle_log >= 60:
                  current_device = NEURO_NODE.device if NEURO_NODE else 'None'
                  logger.debug(f"[NODE] Device: {current_device} (is_gpu={is_gpu})")
             
