@@ -1408,7 +1408,7 @@ class DynamicNeuroNode:
         import requests
         import os
         
-        GENESIS_CDN_URL = "https://d2l3k2r8q1m0jg.cloudfront.net"
+        GENESIS_CDN_URL = "https://dwquwt9gkkeil.cloudfront.net"
         cache_dir = os.path.join(os.path.expanduser("~"), ".neuroshard", "data_cache")
         
         try:
