@@ -79,6 +79,14 @@ themeConfig: {
             ]
           },
           {
+            text: 'Data Pipeline',
+            collapsed: false,
+            items: [
+              { text: 'Genesis Data', link: '/architecture/genesis-data' },
+              { text: 'Tokenization (BPE)', link: '/architecture/tokenization' },
+            ]
+          },
+          {
             text: 'Distributed Training',
             collapsed: false,
             items: [

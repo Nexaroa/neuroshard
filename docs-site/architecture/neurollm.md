@@ -39,16 +39,25 @@ Each transformer block contains:
 ```python
 @dataclass
 class ModelArchitecture:
-    num_layers: int = 16        # Depth
-    hidden_dim: int = 1024      # Width  
+    num_layers: int = 16        # Depth (grows with network)
+    hidden_dim: int = 1024      # Width (grows with network)
     num_heads: int = 8          # Attention heads
     num_kv_heads: int = 2       # GQA key-value heads
     ffn_dim: int = 4096         # FFN intermediate (4x hidden)
-    vocab_size: int = 50257     # GPT-2 vocabulary
+    vocab_size: int = dynamic   # Grows without limit!
     max_seq_len: int = 2048     # Context length
     dropout: float = 0.0        # No dropout for inference
     rope_base: float = 10000.0  # RoPE theta
 ```
+
+::: tip Ever-Growing Model
+NeuroShard is designed to grow **without limits**:
+- **Vocabulary**: Expands as tokenizer learns from millions of users
+- **Layers**: Increase as more nodes join the network
+- **Width**: Scales with total network memory
+
+The embedding layer automatically expands in 32K chunks when the tokenizer vocabulary exceeds current capacity. See [Tokenization (BPE)](/architecture/tokenization) for details.
+:::
 
 ## Key Innovations
 

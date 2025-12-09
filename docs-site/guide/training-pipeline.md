@@ -34,15 +34,44 @@ graph TD
 
 ## Genesis Dataset
 
-Training data is drawn from a cryptographically verified manifest of high-quality datasets.
+Training data is drawn from a cryptographically verified manifest of high-quality datasets, pre-tokenized with BPE and distributed via CDN.
+
+::: tip Deep Dive
+For complete details on data processing and tokenization, see:
+- [Genesis Data Pipeline](/architecture/genesis-data) — How shards are created
+- [Tokenization (BPE)](/architecture/tokenization) — How text becomes tokens
+:::
 
 ### Available Sources
 
-| Dataset | Description | Size |
-|---------|-------------|------|
-| FineWeb | High-quality web text | 15TB |
-| RedPajama | Open reproduction of LLaMA data | 5TB |
-| The Pile | Diverse text corpus | 825GB |
+| Dataset | Description | Target Shards | Status |
+|---------|-------------|---------------|--------|
+| FineWeb-Edu | Educational web content | 500,000 | ✅ Active |
+| FineWeb | General web text | 50,000 | Pending |
+| RedPajama | Open reproduction of LLaMA data | 3,000 | Pending |
+| SlimPajama | Cleaned CommonCrawl | 2,000 | Pending |
+| C4 | Colossal Clean Crawled Corpus | 1,000 | Pending |
+
+### Pre-Tokenized Shards
+
+Unlike traditional systems, NeuroShard shards are **pre-tokenized**:
+
+| Property | Value |
+|----------|-------|
+| Tokens per shard | 2,500,000 |
+| File format | PyTorch tensor (.pt) |
+| Tokenizer | BPE (dynamic vocabulary) |
+| Distribution | CloudFront CDN |
+
+```python
+# Each shard is a tensor of token IDs
+shard = torch.load("shard_42.pt")  # Shape: [2,500,000]
+
+# Token types:
+# - 0-9: Special tokens (PAD, BOS, EOS, etc.)
+# - 10-265: Byte tokens (raw UTF-8 bytes)
+# - 266+: BPE merges (learned subword units)
+```
 
 ### Deterministic Sharding
 
@@ -60,25 +89,52 @@ This enables:
 ### Data Flow
 
 ```python
-# Driver node
+# Driver node loads pre-tokenized data
 class GenesisDataLoader:
-    def __init__(self, node_id, tokenizer):
-        self.shard_id = hash(node_id) % TOTAL_SHARDS
-        self.tokenizer = tokenizer
+    GENESIS_CDN_URL = "https://dwquwt9gkkeil.cloudfront.net"
     
-    def get_batch(self, batch_size=4):
-        # Load from assigned shard
-        texts = self.load_shard_data()
+    def __init__(self, node_id):
+        self.manifest = self._fetch_manifest()
+        self._load_learned_tokenizer()  # Sync BPE vocab from CDN
+    
+    def download_shard(self, shard_id: int) -> torch.Tensor:
+        """Download pre-tokenized shard from CDN."""
+        url = f"{self.GENESIS_CDN_URL}/shard_{shard_id}.pt"
+        resp = requests.get(url)
+        return torch.load(BytesIO(resp.content))
+    
+    def get_batch(self, shard: torch.Tensor, batch_size=4, seq_len=512):
+        # Sample random starting positions
+        starts = torch.randint(0, len(shard) - seq_len - 1, (batch_size,))
         
-        # Tokenize
-        tokens = self.tokenizer.encode(texts)
-        
-        # Create input/label pairs
-        input_ids = tokens[:, :-1]
-        labels = tokens[:, 1:]
+        # Create input/label pairs (no tokenization needed!)
+        input_ids = torch.stack([shard[s:s+seq_len] for s in starts])
+        labels = torch.stack([shard[s+1:s+seq_len+1] for s in starts])
         
         return input_ids, labels
 ```
+
+### Tokenizer Synchronization
+
+Training nodes automatically sync their BPE tokenizer from CDN:
+
+```python
+def _load_learned_tokenizer(self):
+    """Update tokenizer with latest BPE merges."""
+    resp = requests.get(f"{self.GENESIS_CDN_URL}/tokenizer.json")
+    remote_tok = resp.json()
+    
+    # Update if remote has more merges
+    if remote_tok["next_merge_id"] > self.tokenizer.next_merge_id:
+        self.tokenizer.merges = remote_tok["merges"]
+        self.tokenizer.next_merge_id = remote_tok["next_merge_id"]
+        logger.info(f"Updated tokenizer: {self.tokenizer.current_vocab_size} vocab")
+```
+
+This ensures:
+- All nodes use the same tokenizer
+- User contributions are tokenized consistently
+- Vocabulary grows as more data is processed
 
 ## Forward Pass
 

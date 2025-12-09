@@ -39,7 +39,11 @@ logger = logging.getLogger(__name__)
 # Dynamic architecture - NO MORE FIXED DIMENSIONS!
 # Architecture is now calculated based on network capacity
 
-VOCAB_SIZE = 32000  # NeuroLLM BPE vocabulary (fixed - tokenizer dependent)
+# Dynamic vocabulary - starts at 32K, expands as needed
+# The embedding/lm_head grow in chunks when tokenizer vocabulary exceeds current capacity
+INITIAL_VOCAB_SIZE = 32000  # Starting size
+VOCAB_GROWTH_CHUNK = 32000  # Expand by 32K at a time (efficient GPU memory alignment)
+MAX_VOCAB_SIZE = 1000000    # 1M tokens max (theoretical limit for massive networks)
 
 # Import the new architecture scaler
 from neuroshard.core.model.scaler import (
@@ -816,14 +820,16 @@ class DynamicNeuroLLM:
         self.my_layer_ids = sorted(layer_ids)
         
         # Initialize embedding if I'm the holder (uses dynamic hidden_dim!)
+        # Vocab capacity can grow dynamically as tokenizer learns more merges
+        self.vocab_capacity = INITIAL_VOCAB_SIZE
         if self.layer_pool.embedding_holder == self.node_id:
-            self.embedding = torch.nn.Embedding(VOCAB_SIZE, self.architecture.hidden_dim)
+            self.embedding = torch.nn.Embedding(self.vocab_capacity, self.architecture.hidden_dim)
             self.embedding.to(self.device)
             self.has_embedding = True
         
         # Initialize LM head if I'm the holder (uses dynamic hidden_dim!)
         if self.layer_pool.lm_head_holder == self.node_id:
-            self.lm_head = torch.nn.Linear(self.architecture.hidden_dim, VOCAB_SIZE, bias=False)
+            self.lm_head = torch.nn.Linear(self.architecture.hidden_dim, self.vocab_capacity, bias=False)
             from neuroshard.core.model.llm import RMSNorm
             self.final_norm = RMSNorm(self.architecture.hidden_dim)
             self.lm_head.to(self.device)
@@ -850,7 +856,7 @@ class DynamicNeuroLLM:
         try:
             from neuroshard.core.model.llm import RMSNorm
             
-            self.lm_head = torch.nn.Linear(self.architecture.hidden_dim, VOCAB_SIZE, bias=False)
+            self.lm_head = torch.nn.Linear(self.architecture.hidden_dim, self.vocab_capacity, bias=False)
             self.final_norm = RMSNorm(self.architecture.hidden_dim)
             self.lm_head.to(self.device)
             self.final_norm.to(self.device)
@@ -901,7 +907,122 @@ class DynamicNeuroLLM:
             return True
         except Exception as e:
             logger.error(f"Failed to disable LM head: {e}")
+    
+    def expand_vocabulary(self, new_vocab_size: int) -> bool:
+        """
+        Expand embedding and lm_head to accommodate a larger vocabulary.
+        
+        This is called when the tokenizer learns new BPE merges that exceed
+        the current vocabulary capacity. The expansion preserves existing
+        token embeddings while initializing new ones.
+        
+        For an ever-growing decentralized LLM, vocabulary expansion is essential
+        as millions of users contribute diverse training data across languages
+        and domains.
+        
+        Args:
+            new_vocab_size: The new vocabulary size (must be > current capacity)
+            
+        Returns:
+            True if expansion was successful, False otherwise
+        """
+        if new_vocab_size <= self.vocab_capacity:
+            return True  # No expansion needed
+        
+        if new_vocab_size > MAX_VOCAB_SIZE:
+            logger.warning(f"Requested vocab {new_vocab_size} exceeds MAX_VOCAB_SIZE {MAX_VOCAB_SIZE}")
+            new_vocab_size = MAX_VOCAB_SIZE
+        
+        # Round up to next VOCAB_GROWTH_CHUNK for efficient memory alignment
+        new_capacity = ((new_vocab_size + VOCAB_GROWTH_CHUNK - 1) // VOCAB_GROWTH_CHUNK) * VOCAB_GROWTH_CHUNK
+        new_capacity = min(new_capacity, MAX_VOCAB_SIZE)
+        
+        logger.info(f"[VOCAB] Expanding vocabulary: {self.vocab_capacity} → {new_capacity}")
+        
+        try:
+            # Expand embedding if we have it
+            if self.has_embedding and self.embedding is not None:
+                old_embedding = self.embedding
+                old_vocab = old_embedding.weight.shape[0]
+                hidden_dim = old_embedding.weight.shape[1]
+                
+                # Create new larger embedding
+                new_embedding = torch.nn.Embedding(new_capacity, hidden_dim)
+                new_embedding.to(self.device)
+                
+                # Copy existing embeddings
+                with torch.no_grad():
+                    new_embedding.weight[:old_vocab] = old_embedding.weight
+                    # Initialize new embeddings with small random values
+                    # (similar to how transformers initialize)
+                    std = 0.02
+                    new_embedding.weight[old_vocab:].normal_(mean=0.0, std=std)
+                
+                # Replace old embedding
+                del self.embedding
+                self.embedding = new_embedding
+                
+                logger.info(f"[VOCAB] Expanded embedding: {old_vocab} → {new_capacity} tokens")
+            
+            # Expand lm_head if we have it
+            if self.has_lm_head and self.lm_head is not None:
+                old_lm_head = self.lm_head
+                old_vocab = old_lm_head.weight.shape[0]
+                hidden_dim = old_lm_head.weight.shape[1]
+                
+                # Create new larger lm_head
+                new_lm_head = torch.nn.Linear(hidden_dim, new_capacity, bias=False)
+                new_lm_head.to(self.device)
+                
+                # Copy existing weights
+                with torch.no_grad():
+                    new_lm_head.weight[:old_vocab] = old_lm_head.weight
+                    # Initialize new output weights
+                    std = 0.02
+                    new_lm_head.weight[old_vocab:].normal_(mean=0.0, std=std)
+                
+                # Replace old lm_head
+                del self.lm_head
+                self.lm_head = new_lm_head
+                
+                logger.info(f"[VOCAB] Expanded lm_head: {old_vocab} → {new_capacity} output classes")
+            
+            # Update capacity
+            old_capacity = self.vocab_capacity
+            self.vocab_capacity = new_capacity
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            logger.info(f"[VOCAB] ✅ Vocabulary expansion complete: {old_capacity} → {new_capacity}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"[VOCAB] Failed to expand vocabulary: {e}")
             return False
+    
+    def check_and_expand_vocab_if_needed(self) -> bool:
+        """
+        Check if tokenizer vocabulary exceeds current capacity and expand if needed.
+        
+        This should be called periodically (e.g., after loading new tokenizer from CDN)
+        to ensure the model can handle all tokens in the current vocabulary.
+        
+        Returns:
+            True if no expansion needed or expansion successful, False on failure
+        """
+        if self.tokenizer is None:
+            return True
+        
+        current_vocab = self.tokenizer.current_vocab_size
+        if current_vocab > self.vocab_capacity:
+            logger.info(f"[VOCAB] Tokenizer vocab ({current_vocab}) exceeds capacity ({self.vocab_capacity})")
+            return self.expand_vocabulary(current_vocab)
+        
+        return True
     
     def forward_my_layers(
         self,
@@ -1458,6 +1579,11 @@ class DynamicNeuroNode:
                         logger.info(f"[TOKENIZER] Loaded cached BPE tokenizer: {self.tokenizer.next_merge_id} tokens")
                 except Exception as e:
                     logger.warning(f"[TOKENIZER] Failed to load cached tokenizer: {e}")
+            
+            # Check if model needs vocabulary expansion
+            if self.model is not None:
+                self.model.tokenizer = self.tokenizer  # Ensure model has reference
+                self.model.check_and_expand_vocab_if_needed()
                     
         except Exception as e:
             logger.warning(f"[TOKENIZER] Error loading learned tokenizer: {e}")

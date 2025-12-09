@@ -211,6 +211,8 @@ graph TD
 ## Next Steps
 
 - [NeuroLLM Model](/architecture/neurollm) — Model architecture
+- [Genesis Data Pipeline](/architecture/genesis-data) — How training data is prepared and distributed
+- [Tokenization (BPE)](/architecture/tokenization) — Byte Pair Encoding tokenizer
 - [Dynamic Scaling](/architecture/dynamic-scaling) — How scaling works
 - [DiLoCo Protocol](/architecture/diloco) — Training protocol
 - [P2P Network](/architecture/p2p-network) — Network layer

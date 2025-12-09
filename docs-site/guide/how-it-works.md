@@ -19,20 +19,26 @@ NeuroShard is fundamentally different from traditional AI systems:
 
 ### 1. Genesis Data Sharding
 
-Training data comes from the **Genesis Dataset** — a cryptographically verified manifest of high-quality, open-source datasets (FineWeb, RedPajama, etc.).
+Training data comes from the **Genesis Dataset** — pre-tokenized shards distributed via CloudFront CDN.
+
+::: tip Deep Dive
+See [Genesis Data Pipeline](/architecture/genesis-data) and [Tokenization (BPE)](/architecture/tokenization) for complete details.
+:::
 
 ```mermaid
 graph TD
-    Genesis["Genesis Dataset"] --> Sharding["Deterministic Sharding<br/>Shard ID = Hash(Node ID) mod N"]
-    Sharding --> A["Node A gets Shard 0"]
-    Sharding --> B["Node B gets Shard 1"]
-    Sharding --> C["Node C gets Shard 2"]
+    Genesis["Genesis Dataset<br/>(Pre-tokenized BPE shards)"] --> CDN["CloudFront CDN"]
+    CDN --> Sharding["Deterministic Assignment<br/>Shard ID = Hash(Node ID) mod N"]
+    Sharding --> A["Node A downloads Shard 0"]
+    Sharding --> B["Node B downloads Shard 1"]
+    Sharding --> C["Node C downloads Shard 2"]
 ```
 
-**Why this matters**:
-- Any peer can verify a Driver's work by downloading the same shard
-- If a Driver sends garbage, the hash of their output will mismatch
-- Forces Drivers to actually process real training data
+**Key features**:
+- **Pre-tokenized**: Shards contain token IDs, not raw text (2.5M tokens each)
+- **BPE vocabulary**: Dynamic vocabulary that grows as more data is processed
+- **CDN distributed**: Low-latency global access via CloudFront
+- **Verifiable**: Any peer can verify a Driver's work by downloading the same shard
 
 ### 2. Forward Pass (Pipeline Parallelism)
 

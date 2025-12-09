@@ -53,7 +53,7 @@ class NeuroTokenizer:
     # Learned merges start at ID 266
     MERGE_OFFSET = 266
     
-    def __init__(self, vocab_size: int = 32000):
+    def __init__(self, vocab_size: int = 1000000):  # 1M max - no practical limit
         """
         Initialize the NeuroLLM tokenizer.
         
