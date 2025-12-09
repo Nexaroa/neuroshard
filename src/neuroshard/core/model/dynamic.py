@@ -242,11 +242,21 @@ class DynamicLayerPool:
             
             # Calculate how many layers this node can hold
             # Uses current architecture's dimensions (dynamic!)
+            # DEVICE-AWARE: CPU needs more conservative factor due to higher memory overhead
+            device_type = getattr(self, '_device_hint', 'cpu')
+            if device_type == 'cuda':
+                safety_factor = 0.6  # GPU: efficient memory usage
+            elif device_type == 'mps':
+                safety_factor = 0.5  # Apple Silicon: moderate overhead
+            else:
+                safety_factor = 0.3  # CPU: high overhead (no VRAM, PyTorch CPU allocator)
+            
             max_layers_for_node = calculate_layer_assignment(
                 available_memory_mb,
                 self.current_architecture,
-                safety_factor=0.6
+                safety_factor=safety_factor
             )
+            logger.info(f"Layer calculation: {available_memory_mb:.0f}MB × {safety_factor} safety = {max_layers_for_node} layers (device={device_type})")
             
             # SCALABILITY: Apply MAX_LAYERS_PER_NODE cap in large networks
             # This prevents single nodes from hogging all layers and ensures
@@ -1321,6 +1331,9 @@ class DynamicNeuroNode:
         if self.p2p_manager and hasattr(self.p2p_manager, 'dht'):
             dht = self.p2p_manager.dht
         self.layer_pool = DynamicLayerPool(dht_protocol=dht)
+        
+        # Pass device hint for memory calculations (CPU needs more conservative limits)
+        self.layer_pool._device_hint = self.device
         
         # 1b. SMART ARCHITECTURE RECONCILIATION
         # This handles the case where the network has evolved while we were offline
