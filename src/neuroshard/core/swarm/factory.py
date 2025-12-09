@@ -671,17 +671,15 @@ class SwarmEnabledDynamicNode:
         else:
             loss = outputs.norm()  # Worker nodes use activation norm
         
-        # Compute gradient norm for tracking
-        grad_norm = 0.0
-        for param in self.model.parameters():
-            if param.grad is not None:
-                grad_norm += param.grad.norm().item() ** 2
-        grad_norm = grad_norm ** 0.5
-        
-        # DiLoCo inner step (no communication)
+        # DiLoCo inner step (backward + optimizer step + zero_grad)
         diloco.inner_step(loss)
         self._current_loss = loss.item()
         self._total_training_rounds += 1
+        
+        # Note: grad_norm is 0 after inner_step because zero_grad() was called
+        # To properly track gradient norm, we'd need to compute it inside inner_step
+        # before zero_grad(). For now, we use pseudo-gradient norm from DiLoCo stats.
+        grad_norm = diloco.stats.avg_pseudo_grad_norm if diloco.stats.avg_pseudo_grad_norm > 0 else 0.0
         
         # Record step in global tracker (for verification)
         if self._global_tracker:

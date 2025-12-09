@@ -2993,22 +2993,42 @@ class DynamicNeuroNode:
             logger.debug("[NODE] Checkpoint save skipped - another save in progress")
             return
         
-        try:
-            # Use wallet_id for stable checkpoint path
-            path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
-            temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
+        # Use wallet_id for stable checkpoint path
+        path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
+        temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
 
-        # 1. Assess memory situation
+        # 1. Assess memory situation (respect configured --memory limit!)
         try:
             total_params = sum(p.numel() for p in self.model.parameters())
             checkpoint_size_mb = (total_params * 4) / (1024 * 1024)
             
+            # Get ACTUAL available memory (respecting configured limit)
             vm = psutil.virtual_memory()
-            available_mb = vm.available / (1024 * 1024)
+            system_available_mb = vm.available / (1024 * 1024)
             
-            # Determine save mode
+            # Check current process memory usage
+            process = psutil.Process()
+            process_used_mb = process.memory_info().rss / (1024 * 1024)
+            
+            # If user set --memory limit, respect it
+            # Available = min(system_available, configured_limit - current_usage)
+            configured_limit = getattr(self, 'available_memory_mb', None)
+            if configured_limit:
+                # How much headroom do we have within our configured limit?
+                headroom_mb = max(0, configured_limit - process_used_mb)
+                # Use the more conservative of system available or our headroom
+                available_mb = min(system_available_mb, headroom_mb)
+                logger.debug(f"[NODE] Memory check: process={process_used_mb:.0f}MB, "
+                           f"limit={configured_limit:.0f}MB, headroom={headroom_mb:.0f}MB, "
+                           f"system_free={system_available_mb:.0f}MB, using={available_mb:.0f}MB")
+            else:
+                available_mb = system_available_mb
+            
+            # Determine save mode based on available headroom
+            # Bulk async needs 2.5x checkpoint size to clone everything
             can_bulk_async = (available_mb > (checkpoint_size_mb * 2.5)) or (available_mb > 32000)
-            can_stream_async = available_mb > 500  # Just need enough for 1 layer + overhead
+            # Streaming async just needs enough for 1 layer (~50-100MB typically)
+            can_stream_async = available_mb > 500
             
         except Exception as e:
             logger.warning(f"[NODE] Could not assess memory: {e}. Using streaming async.")
@@ -3032,20 +3052,37 @@ class DynamicNeuroNode:
                 try:
                     state = diloco.state_dict()
                     
-                    # Deep clone optimizer state (contains momentum buffers as tensor refs!)
+                    # Deep clone optimizer state (handles both PyTorch and custom formats)
                     def _clone_optimizer_state(opt_state):
                         if opt_state is None:
                             return None
-                        cloned = {'param_groups': opt_state.get('param_groups', [])}
-                        if 'state' in opt_state:
-                            cloned['state'] = {}
-                            for k, v in opt_state['state'].items():
-                                cloned['state'][k] = {}
-                                for kk, vv in v.items():
-                                    if isinstance(vv, torch.Tensor):
-                                        cloned['state'][k][kk] = vv.detach().clone().cpu()
+                        cloned = {}
+                        for key, value in opt_state.items():
+                            if isinstance(value, torch.Tensor):
+                                # Direct tensor (e.g., in custom optimizers)
+                                cloned[key] = value.detach().clone().cpu()
+                            elif isinstance(value, dict):
+                                # Nested dict (e.g., 'state' or 'velocity' dicts)
+                                cloned[key] = {}
+                                for k, v in value.items():
+                                    if isinstance(v, torch.Tensor):
+                                        cloned[key][k] = v.detach().clone().cpu()
+                                    elif isinstance(v, dict):
+                                        # PyTorch optimizer 'state' has param_idx -> {key: tensor}
+                                        cloned[key][k] = {}
+                                        for kk, vv in v.items():
+                                            if isinstance(vv, torch.Tensor):
+                                                cloned[key][k][kk] = vv.detach().clone().cpu()
+                                            else:
+                                                cloned[key][k][kk] = vv
                                     else:
-                                        cloned['state'][k][kk] = vv
+                                        cloned[key][k] = v
+                            elif isinstance(value, list):
+                                # List (e.g., param_groups) - shallow copy is fine
+                                cloned[key] = list(value)
+                            else:
+                                # Scalar values (lr, momentum, etc.)
+                                cloned[key] = value
                         return cloned
                     
                     # Deep clone all tensors to CPU for async safety
@@ -3109,7 +3146,8 @@ class DynamicNeuroNode:
                     finally:
                         DynamicNeuroNode._checkpoint_save_lock.release()
                 
-                threading.Thread(target=_do_bulk_save, daemon=True).start()
+                # Use daemon=False so checkpoint completes even during shutdown
+                threading.Thread(target=_do_bulk_save, daemon=False).start()
                 return  # Lock will be released by background thread
             
             # ============ MODE 2: STREAMING ASYNC (memory-efficient) ============
@@ -3182,7 +3220,8 @@ class DynamicNeuroNode:
                     finally:
                         DynamicNeuroNode._checkpoint_save_lock.release()
                 
-                threading.Thread(target=_do_streaming_save, daemon=True).start()
+                # Use daemon=False so checkpoint completes even during shutdown
+                threading.Thread(target=_do_streaming_save, daemon=False).start()
                 return  # Lock will be released by background thread
             
             # ============ MODE 3: SYNC (last resort, very low memory) ============

@@ -190,11 +190,19 @@ class OuterOptimizer:
             'velocity': {k: v.clone() for k, v in self.velocity.items()},
         }
     
-    def load_state_dict(self, state: Dict[str, Any]):
-        """Load optimizer state."""
+    def load_state_dict(self, state: Dict[str, Any], device: str = None):
+        """Load optimizer state.
+        
+        Args:
+            state: State dict to load
+            device: Target device for tensors (if None, keeps original device)
+        """
         self.lr = state.get('lr', self.lr)
         self.momentum = state.get('momentum', self.momentum)
-        self.velocity = {k: v.clone() for k, v in state.get('velocity', {}).items()}
+        if device:
+            self.velocity = {k: v.clone().to(device) for k, v in state.get('velocity', {}).items()}
+        else:
+            self.velocity = {k: v.clone() for k, v in state.get('velocity', {}).items()}
 
 
 class DiLoCoTrainer:
@@ -570,11 +578,12 @@ class DiLoCoTrainer:
                 if hasattr(self.config, k):
                     setattr(self.config, k, v)
             
-            # Load optimizers
+            # Load optimizers (move tensors to model's device)
+            device = next(self.model.parameters()).device if list(self.model.parameters()) else 'cpu'
             if 'inner_optimizer' in state:
                 self.inner_optimizer.load_state_dict(state['inner_optimizer'])
             if 'outer_optimizer' in state:
-                self.outer_optimizer.load_state_dict(state['outer_optimizer'])
+                self.outer_optimizer.load_state_dict(state['outer_optimizer'], device=str(device))
             
             # Load initial weights (move to model's device)
             device = next(self.model.parameters()).device if list(self.model.parameters()) else 'cpu'

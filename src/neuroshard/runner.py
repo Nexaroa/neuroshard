@@ -117,10 +117,21 @@ def request_shutdown():
     if NEURO_NODE:
         try:
             logger.info("[NODE] Saving checkpoint before shutdown...")
-            NEURO_NODE._save_checkpoint()
+            # Force synchronous save during shutdown to ensure it completes
+            NEURO_NODE._save_checkpoint(async_save=False)
             logger.info("[NODE] Checkpoint saved.")
         except Exception as e:
             logger.error(f"[NODE] Failed to save checkpoint: {e}")
+        
+        # Wait for any ongoing async saves to complete
+        try:
+            from neuroshard.core.model.dynamic import DynamicNeuroNode
+            # Try to acquire the lock (will wait if async save in progress)
+            if DynamicNeuroNode._checkpoint_save_lock.acquire(timeout=30):
+                DynamicNeuroNode._checkpoint_save_lock.release()
+                logger.info("[NODE] All checkpoint saves completed.")
+        except Exception as e:
+            logger.warning(f"[NODE] Could not wait for checkpoint save: {e}")
         
         # CRITICAL: Free memory by deleting model and data
         try:
