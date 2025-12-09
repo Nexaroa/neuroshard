@@ -2353,11 +2353,10 @@ class DynamicNeuroNode:
         loss_val = loss.item()
         self.current_loss = loss_val
         
-        # PERIODIC CHECKPOINT: Save every 10 training steps to avoid losing progress
-        # (More frequent saves since training steps take ~1s each)
-        if self.total_training_rounds % 10 == 0:
-            self._save_checkpoint()
-            logger.debug(f"Checkpoint saved at step {self.total_training_rounds}")
+        # PERIODIC CHECKPOINT: Save every 100 training steps (async to avoid blocking)
+        # The SpeculativeCheckpointer handles more frequent saves separately
+        if self.total_training_rounds % 100 == 0:
+            self._save_checkpoint(async_save=True)
         
         return loss_val
     
@@ -2967,77 +2966,95 @@ class DynamicNeuroNode:
                         logger.warning(f"[NODE] Could not restore DiLoCo state: {e}")
             del self._pending_diloco_state
     
-    def _save_checkpoint(self):
+    def _save_checkpoint(self, async_save: bool = True):
         """
         Save my layers to disk with architecture information.
         
         Also saves DiLoCo state and optimizer state for graceful shutdown/restart.
+        
+        Args:
+            async_save: If True, save in background thread to avoid blocking training.
         """
         if not self.model:
             return
         
-        try:
-            checkpoint = {
-                "node_id": self.node_id,
-                "layer_ids": self.my_layer_ids,
-                # CRITICAL: Save architecture for compatibility checking
-                "architecture": self.model.architecture.to_dict(),
-                "architecture_version": self.layer_pool.architecture_version if self.layer_pool else 1,
-                "layers": {
-                    layer_id: layer.state_dict()
-                    for layer_id, layer in self.model.my_layers.items()
-                },
-                "has_embedding": self.model.has_embedding,
-                "has_lm_head": self.model.has_lm_head,
-                "total_training_rounds": self.total_training_rounds,
-                "current_loss": self.current_loss,
-                "timestamp": time.time(),
-            }
-            
-            if self.model.embedding:
-                checkpoint["embedding"] = self.model.embedding.state_dict()
-            if self.model.lm_head:
-                checkpoint["lm_head"] = self.model.lm_head.state_dict()
-            if self.model.final_norm:
-                checkpoint["final_norm"] = self.model.final_norm.state_dict()
-            
-            # Save optimizer state (for resuming training without losing momentum)
-            if hasattr(self, 'optimizer') and self.optimizer:
-                try:
-                    checkpoint["optimizer"] = self.optimizer.state_dict()
-                except Exception:
-                    pass  # Optimizer state is optional
-            
-            # Save DiLoCo trainer state (for resuming inner loop progress)
-            if hasattr(self, 'swarm') and self.swarm:
-                try:
-                    # Check for swarm.diloco_trainer (SwarmEnabledDynamicNode)
-                    diloco = getattr(self.swarm, 'diloco_trainer', None)
-                    if diloco and hasattr(diloco, 'state_dict'):
-                        checkpoint["diloco"] = diloco.state_dict()
-                        logger.info(f"[NODE] Saved DiLoCo state (inner_step={diloco.stats.inner_step_count})")
-                except Exception as e:
-                    logger.warning(f"[NODE] Could not save DiLoCo state: {e}")
-            
-            # Use wallet_id for stable checkpoint path (survives node_id changes)
-            path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
-            temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
-            
-            # Save to temp file first, then rename (atomic on most filesystems)
-            # Use _use_new_zipfile_serialization=False for better compatibility
-            torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=False)
-            
-            # Rename temp to final (atomic)
-            import shutil
-            shutil.move(str(temp_path), str(path))
-            
-            logger.info(f"[NODE] Checkpoint saved ({len(self.my_layer_ids)} layers)")
-        except Exception as e:
-            logger.error(f"[NODE] Checkpoint save failed: {type(e).__name__}: {e}")
-            # Clean up temp file if it exists
-            temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
-            if temp_path.exists():
-                temp_path.unlink()
+        def _do_save():
+            try:
+                # Move tensors to CPU before saving (required for torch.save)
+                checkpoint = {
+                    "node_id": self.node_id,
+                    "layer_ids": self.my_layer_ids,
+                    # CRITICAL: Save architecture for compatibility checking
+                    "architecture": self.model.architecture.to_dict(),
+                    "architecture_version": self.layer_pool.architecture_version if self.layer_pool else 1,
+                    "layers": {
+                        layer_id: {k: v.cpu() for k, v in layer.state_dict().items()}
+                        for layer_id, layer in self.model.my_layers.items()
+                    },
+                    "has_embedding": self.model.has_embedding,
+                    "has_lm_head": self.model.has_lm_head,
+                    "total_training_rounds": self.total_training_rounds,
+                    "current_loss": self.current_loss,
+                    "timestamp": time.time(),
+                }
+                
+                if self.model.embedding:
+                    checkpoint["embedding"] = {k: v.cpu() for k, v in self.model.embedding.state_dict().items()}
+                if self.model.lm_head:
+                    checkpoint["lm_head"] = {k: v.cpu() for k, v in self.model.lm_head.state_dict().items()}
+                if self.model.final_norm:
+                    checkpoint["final_norm"] = {k: v.cpu() for k, v in self.model.final_norm.state_dict().items()}
+                
+                # Save optimizer state (for resuming training without losing momentum)
+                if hasattr(self, 'optimizer') and self.optimizer:
+                    try:
+                        # Optimizer state needs special handling - move to CPU
+                        opt_state = self.optimizer.state_dict()
+                        for state in opt_state['state'].values():
+                            for k, v in state.items():
+                                if isinstance(v, torch.Tensor):
+                                    state[k] = v.cpu()
+                        checkpoint["optimizer"] = opt_state
+                    except Exception:
+                        pass  # Optimizer state is optional
+                
+                # Save DiLoCo trainer state (for resuming inner loop progress)
+                if hasattr(self, 'swarm') and self.swarm:
+                    try:
+                        # Check for swarm.diloco_trainer (SwarmEnabledDynamicNode)
+                        diloco = getattr(self.swarm, 'diloco_trainer', None)
+                        if diloco and hasattr(diloco, 'state_dict'):
+                            checkpoint["diloco"] = diloco.state_dict()
+                    except Exception as e:
+                        logger.warning(f"[NODE] Could not save DiLoCo state: {e}")
+                
+                # Use wallet_id for stable checkpoint path (survives node_id changes)
+                path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
+                temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
+                
+                # Save to temp file first, then rename (atomic on most filesystems)
+                # Use _use_new_zipfile_serialization=False for better compatibility
+                torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=False)
+                
+                # Rename temp to final (atomic)
+                import shutil
+                shutil.move(str(temp_path), str(path))
+                
+                logger.info(f"[NODE] Checkpoint saved ({len(self.my_layer_ids)} layers)")
+            except Exception as e:
+                logger.error(f"[NODE] Checkpoint save failed: {type(e).__name__}: {e}")
+                # Clean up temp file if it exists
+                temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
+                if temp_path.exists():
+                    temp_path.unlink()
+        
+        if async_save:
+            # Run in background thread to avoid blocking training
+            import threading
+            save_thread = threading.Thread(target=_do_save, daemon=True)
+            save_thread.start()
+        else:
+            _do_save()
 
 
 def create_dynamic_node(
