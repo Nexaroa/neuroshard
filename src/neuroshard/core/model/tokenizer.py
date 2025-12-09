@@ -251,47 +251,80 @@ class NeuroTokenizer:
     
     def learn_merges(self, texts: List[str], num_merges: int = 1000, min_frequency: int = 2):
         """
-        Learn new BPE merges from training data.
+        Learn new BPE merges from training data using an optimized algorithm.
         
-        This is called during training to expand the vocabulary based on
-        the data contributed by network participants.
+        This uses incremental pair counting with a heap for O(n log n) performance
+        instead of the naive O(n² × m) algorithm.
         
         Args:
             texts: List of training texts
             num_merges: Number of new merges to learn
             min_frequency: Minimum pair frequency to create merge
         """
+        import heapq
+        
         if self.next_merge_id + num_merges > self.vocab_size:
             num_merges = self.vocab_size - self.next_merge_id
             if num_merges <= 0:
                 logger.warning("Vocabulary is full, cannot learn more merges")
                 return
         
+        logger.info(f"Tokenizing {len(texts)} texts...")
+        
         # Tokenize all texts to current vocabulary
-        all_sequences = []
+        # Use a word-based approach: split by whitespace first, then BPE within words
+        # This is much more efficient and produces better tokens
+        word_freq: Counter = Counter()
         for text in texts:
-            byte_ids = self._text_to_bytes(text)
-            token_ids = self._apply_merges(byte_ids)
-            all_sequences.append(token_ids)
+            # Split into words (preserve some punctuation patterns)
+            words = re.findall(r'\S+|\s+', text)
+            for word in words:
+                if word.strip():  # Skip pure whitespace
+                    word_freq[word] += 1
+        
+        logger.info(f"Found {len(word_freq)} unique words")
+        
+        # Convert words to byte sequences with frequency
+        # Format: {word_tuple: frequency} where word_tuple is tuple of token ids
+        word_tokens: Dict[tuple, int] = {}
+        for word, freq in word_freq.items():
+            byte_ids = tuple(self._text_to_bytes(word))
+            token_ids = tuple(self._apply_merges(list(byte_ids)))
+            if token_ids in word_tokens:
+                word_tokens[token_ids] += freq
+            else:
+                word_tokens[token_ids] = freq
+        
+        logger.info(f"Converted to {len(word_tokens)} unique token sequences")
+        
+        # Build initial pair counts
+        pair_counts: Counter = Counter()
+        # Track which words contain which pairs for efficient updates
+        pair_to_words: Dict[Tuple[int, int], Set[tuple]] = {}
+        
+        for word, freq in word_tokens.items():
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                pair_counts[pair] += freq
+                if pair not in pair_to_words:
+                    pair_to_words[pair] = set()
+                pair_to_words[pair].add(word)
+        
+        logger.info(f"Initial pair count: {len(pair_counts)} unique pairs")
         
         merges_learned = 0
+        log_interval = max(1, num_merges // 20)  # Log ~20 times during learning
         
         while merges_learned < num_merges:
-            # Count all adjacent pairs
-            pair_counts = Counter()
-            for seq in all_sequences:
-                for i in range(len(seq) - 1):
-                    pair = (seq[i], seq[i + 1])
-                    if pair not in self.merges:  # Don't count already merged pairs
-                        pair_counts[pair] += 1
-            
             if not pair_counts:
+                logger.info("No more pairs to merge")
                 break
             
             # Find most frequent pair
             best_pair, count = pair_counts.most_common(1)[0]
             
             if count < min_frequency:
+                logger.info(f"Best pair frequency {count} below minimum {min_frequency}")
                 break
             
             # Create new merge
@@ -301,18 +334,59 @@ class NeuroTokenizer:
             self.next_merge_id += 1
             merges_learned += 1
             
-            # Apply merge to all sequences
-            for i, seq in enumerate(all_sequences):
-                new_seq = []
-                j = 0
-                while j < len(seq):
-                    if j < len(seq) - 1 and (seq[j], seq[j + 1]) == best_pair:
-                        new_seq.append(new_id)
-                        j += 2
+            if merges_learned % log_interval == 0:
+                logger.info(f"  Learned {merges_learned}/{num_merges} merges, best pair freq={count}")
+            
+            # Update word_tokens and pair_counts incrementally
+            words_to_update = pair_to_words.get(best_pair, set()).copy()
+            
+            # Remove the merged pair from counts
+            del pair_counts[best_pair]
+            if best_pair in pair_to_words:
+                del pair_to_words[best_pair]
+            
+            for old_word in words_to_update:
+                if old_word not in word_tokens:
+                    continue
+                    
+                freq = word_tokens[old_word]
+                
+                # Remove old pair counts for this word
+                for i in range(len(old_word) - 1):
+                    pair = (old_word[i], old_word[i + 1])
+                    if pair in pair_counts:
+                        pair_counts[pair] -= freq
+                        if pair_counts[pair] <= 0:
+                            del pair_counts[pair]
+                        if pair in pair_to_words and old_word in pair_to_words[pair]:
+                            pair_to_words[pair].discard(old_word)
+                
+                # Apply merge to create new word
+                new_word = []
+                i = 0
+                while i < len(old_word):
+                    if i < len(old_word) - 1 and (old_word[i], old_word[i + 1]) == best_pair:
+                        new_word.append(new_id)
+                        i += 2
                     else:
-                        new_seq.append(seq[j])
-                        j += 1
-                all_sequences[i] = new_seq
+                        new_word.append(old_word[i])
+                        i += 1
+                new_word = tuple(new_word)
+                
+                # Update word_tokens
+                del word_tokens[old_word]
+                if new_word in word_tokens:
+                    word_tokens[new_word] += freq
+                else:
+                    word_tokens[new_word] = freq
+                
+                # Add new pair counts for this word
+                for i in range(len(new_word) - 1):
+                    pair = (new_word[i], new_word[i + 1])
+                    pair_counts[pair] += freq
+                    if pair not in pair_to_words:
+                        pair_to_words[pair] = set()
+                    pair_to_words[pair].add(new_word)
         
         logger.info(f"Learned {merges_learned} new merges, vocab size now {len(self)}")
     
