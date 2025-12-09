@@ -669,7 +669,13 @@ class SwarmEnabledDynamicNode:
                 labels.view(-1).to(self.device)
             )
         else:
-            loss = outputs.norm()  # Worker nodes use activation norm
+            # WARNING: This path should rarely be hit.
+            # - Worker nodes (no embedding) return None from _get_training_batch()
+            # - Driver nodes typically also have lm_head (full nodes)
+            # Using activation norm is a placeholder that doesn't train useful representations.
+            # If you see this in production, the node configuration is likely wrong.
+            logger.warning("[TRAIN] No lm_head - using activation norm as loss (training may be ineffective)")
+            loss = outputs.norm()
         
         # DiLoCo inner step (backward + optimizer step + zero_grad)
         diloco.inner_step(loss)
