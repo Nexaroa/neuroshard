@@ -1386,6 +1386,15 @@ class DynamicNeuroNode:
         logger.info(f"Node started: {contribution['my_params']/1e6:.1f}M params, "
                    f"{len(self.my_layer_ids)} layers, "
                    f"embed={self.model.has_embedding}, head={self.model.has_lm_head}")
+        
+        # Verify model is actually on the expected device
+        if self.my_layer_ids and self.model.my_layers:
+            first_layer = self.model.my_layers[self.my_layer_ids[0]]
+            param_device = next(first_layer.parameters()).device
+            if str(param_device) != self.device and not (self.device == "cuda" and "cuda" in str(param_device)):
+                logger.error(f"[DEVICE] Model device mismatch! Expected {self.device}, got {param_device}")
+            else:
+                logger.info(f"[DEVICE] Model verified on: {param_device}")
     
     def _setup_training(self):
         """Setup training components."""
@@ -1434,6 +1443,22 @@ class DynamicNeuroNode:
         logger.info(f"Training initialized: batch_size={self._training_batch_size}, "
                    f"checkpointing={self._use_gradient_checkpointing}, "
                    f"layers={num_layers}, device={self.device}")
+        
+        # CUDA sanity check: verify GPU is actually usable
+        if self.device == "cuda":
+            try:
+                import time as _time
+                test_tensor = torch.randn(1000, 1000, device="cuda")
+                start = _time.time()
+                _ = torch.matmul(test_tensor, test_tensor)
+                torch.cuda.synchronize()
+                elapsed = _time.time() - start
+                del test_tensor
+                torch.cuda.empty_cache()
+                logger.info(f"[CUDA] GPU sanity check passed: 1000x1000 matmul in {elapsed*1000:.1f}ms")
+            except Exception as e:
+                logger.error(f"[CUDA] GPU sanity check FAILED: {e}")
+                logger.error("[CUDA] Training will likely run on CPU despite device=cuda!")
     
     def _calculate_training_batch_size(self) -> int:
         """
@@ -2284,6 +2309,15 @@ class DynamicNeuroNode:
         When we have ALL components (embedding + layers + LM head), we can
         train entirely locally without any network overhead.
         """
+        # DIAGNOSTIC: Verify device placement periodically
+        if self.total_training_rounds % 100 == 0:
+            try:
+                emb_device = next(self.model.embedding.parameters()).device if self.model.embedding else 'N/A'
+                layer_device = next(iter(self.model.my_layers.values())).parameters().__next__().device if self.model.my_layers else 'N/A'
+                logger.info(f"[TRAIN] Device check: input={input_ids.device}, embedding={emb_device}, layer0={layer_device}")
+            except Exception as e:
+                logger.warning(f"[TRAIN] Device check failed: {e}")
+        
         # Forward pass with optional gradient checkpointing
         embeddings = self.model.embed(input_ids)
         
