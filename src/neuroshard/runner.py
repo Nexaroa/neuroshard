@@ -2546,43 +2546,39 @@ def run_node(
             )
             
             if should_train:
-                # ENFORCE MEMORY LIMIT: Check if node is using too much RAM
+                # MEMORY WARNING: Log if over limit (rate-limited to once per 60s)
+                # Note: This is informational only - we don't skip training because
+                # the --memory flag is a HINT for layer calculation, not a hard cap
                 try:
                     import os
                     process = psutil.Process(os.getpid())
                     process_mem_mb = process.memory_info().rss / (1024 * 1024)
                     memory_limit = STATE.get("config_memory_mb") or available_memory_mb
                     
-                    if memory_limit and process_mem_mb > memory_limit * 1.2:  # 20% over limit
-                        logger.warning(f"[NODE] Memory limit exceeded: using {process_mem_mb:.0f}MB / {memory_limit}MB limit")
-                        logger.info(f"[NODE] Clearing caches to reduce memory...")
+                    # Rate-limit warning to once per 60 seconds
+                    last_mem_warning = STATE.get("_last_mem_warning", 0)
+                    if memory_limit and process_mem_mb > memory_limit * 1.2 and (now - last_mem_warning) >= 60:
+                        STATE["_last_mem_warning"] = now
+                        system_mem = psutil.virtual_memory()
+                        logger.info(f"[NODE] Memory note: process={process_mem_mb:.0f}MB (limit={memory_limit}MB is a hint, not cap)")
+                        logger.info(f"[NODE] System has {system_mem.available / (1024**3):.1f}GB available - training continues normally")
                         
-                        # Clear loaded shards (keep only current one)
-                        if hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
-                            loader = NEURO_NODE.genesis_loader
-                            current_shard = loader.assigned_shard_ids[loader.current_shard_idx % len(loader.assigned_shard_ids)] if loader.assigned_shard_ids else None
-                            
-                            # Clear all but current shard
-                            shards_to_remove = [sid for sid in loader.loaded_shards.keys() if sid != current_shard]
-                            for sid in shards_to_remove:
-                                del loader.loaded_shards[sid]
-                            loader._prefetch_ready.clear()
-                            
-                            logger.info(f"[NODE] Cleared {len(shards_to_remove)} cached shards")
-                        
-                        # Force garbage collection
-                        import gc
-                        gc.collect()
-                        
-                        # Clear GPU cache
-                        if NEURO_NODE.device == "cuda":
-                            torch.cuda.empty_cache()
-                        elif NEURO_NODE.device == "mps":
-                            torch.mps.empty_cache()
-                        
-                        # Skip this training step
-                        time.sleep(2)
-                        continue
+                        # Only clear caches if system memory is actually low (>80% used)
+                        if system_mem.percent > 80:
+                            logger.warning(f"[NODE] System memory high ({system_mem.percent}%), clearing caches...")
+                            if hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
+                                loader = NEURO_NODE.genesis_loader
+                                current_shard = loader.assigned_shard_ids[loader.current_shard_idx % len(loader.assigned_shard_ids)] if loader.assigned_shard_ids else None
+                                shards_to_remove = [sid for sid in loader.loaded_shards.keys() if sid != current_shard]
+                                for sid in shards_to_remove:
+                                    del loader.loaded_shards[sid]
+                                loader._prefetch_ready.clear()
+                            import gc
+                            gc.collect()
+                            if NEURO_NODE.device == "cuda":
+                                torch.cuda.empty_cache()
+                            elif NEURO_NODE.device == "mps":
+                                torch.mps.empty_cache()
                 except Exception:
                     pass
                 
