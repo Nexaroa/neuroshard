@@ -704,9 +704,11 @@ class SwarmEnabledDynamicNode:
         if diloco.should_sync():
             self._do_diloco_sync()
         
-        # PERIODIC CHECKPOINT: Save every 10 training steps to avoid losing progress
-        if self._total_training_rounds % 10 == 0:
-            self._save_checkpoint()
+        # NOTE: Checkpoint saving is handled by DiLoCo outer sync (every 500 steps)
+        # We removed the per-100-step checkpoint because:
+        # 1. It caused 70-80s delays on memory-constrained systems
+        # 2. DiLoCo outer sync already saves after each 500-step cycle
+        # 3. Worst case loss on crash: 500 steps (acceptable)
         
         return self._current_loss
     
@@ -766,12 +768,17 @@ class SwarmEnabledDynamicNode:
         if self.p2p_manager:
             # Get list of peers
             peers = list(self.p2p_manager.known_peers.keys())
+            routing_peers = []
             if self.p2p_manager.routing_table:
                 for n in self.p2p_manager.routing_table.get_all_nodes():
-                    peers.append(f"http://{n.ip}:{n.port}")
+                    routing_peers.append(f"http://{n.ip}:{n.port}")
             
+            peers.extend(routing_peers)
             # Deduplicate
             peers = list(set(peers))
+            
+            logger.debug(f"[SWARM] Peer discovery: known_peers={len(self.p2p_manager.known_peers)}, "
+                        f"routing_table={len(routing_peers)}, total_unique={len(peers)}")
             
             if peers:
                 # DYNAMIC GOSSIP FANOUT for network scaling
@@ -892,6 +899,10 @@ class SwarmEnabledDynamicNode:
                 logger.error(traceback.format_exc())
                 aggregated_grads = pseudo_grad
         
+        # Capture stats BEFORE apply_outer_update (which resets them)
+        avg_loss_before_reset = diloco.stats.avg_inner_loss
+        outer_step_before = diloco.stats.outer_step_count
+        
         # Step 5: Apply aggregated update
         diloco.apply_outer_update(aggregated_grads)
         
@@ -904,9 +915,9 @@ class SwarmEnabledDynamicNode:
         
         sync_status = "distributed" if peers_synced > 0 else "local-only"
         logger.info(
-            f"[SWARM] DiLoCo outer sync #{diloco.stats.outer_step_count} ({sync_status}): "
+            f"[SWARM] DiLoCo outer sync #{outer_step_before + 1} ({sync_status}): "
             f"peers={peers_synced}, contributions={len(all_contributions)}, "
-            f"avg_loss={diloco.stats.avg_inner_loss:.4f}"
+            f"avg_loss={avg_loss_before_reset:.4f}"
         )
         
         # IMPORTANT: Save checkpoint after each outer sync (this is a major milestone!)

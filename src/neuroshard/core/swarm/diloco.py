@@ -368,8 +368,16 @@ class DiLoCoTrainer:
         """
         Compute pseudo-gradient (delta from initial weights).
         
-        Pseudo-gradient = initial_weights - current_weights
-        (direction of improvement over the inner loop)
+        Pseudo-gradient = current_weights - initial_weights
+        This represents the DIRECTION we improved during the inner loop.
+        
+        The outer optimizer will then AMPLIFY this direction with momentum,
+        effectively saying "we moved this way and it reduced loss, so let's
+        continue moving this way".
+        
+        NOTE: The sign here is CRITICAL for training to work!
+        - current - initial = direction we moved (positive = training progress)
+        - The outer optimizer ADDs this to weights, amplifying the improvement
         
         Returns:
             Dict of name -> pseudo-gradient tensor
@@ -382,8 +390,9 @@ class DiLoCoTrainer:
             
             for name, param in self.model.named_parameters():
                 if name in self.initial_weights:
-                    # Delta = initial - current (direction we improved)
-                    delta = self.initial_weights[name] - param.data
+                    # Delta = current - initial (direction we moved during training)
+                    # This is POSITIVE when training made progress
+                    delta = param.data - self.initial_weights[name]
                     pseudo_grads[name] = delta
                     total_norm += delta.norm().item() ** 2
             
@@ -567,9 +576,10 @@ class DiLoCoTrainer:
             if 'outer_optimizer' in state:
                 self.outer_optimizer.load_state_dict(state['outer_optimizer'])
             
-            # Load initial weights
+            # Load initial weights (move to model's device)
+            device = next(self.model.parameters()).device if list(self.model.parameters()) else 'cpu'
             self.initial_weights = {
-                k: v.clone() for k, v in state.get('initial_weights', {}).items()
+                k: v.clone().to(device) for k, v in state.get('initial_weights', {}).items()
             }
             
             # Load stats

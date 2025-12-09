@@ -593,6 +593,82 @@ async def verify_training():
         }
 
 
+@node_app.get("/api/training/history")
+async def get_local_training_history():
+    """
+    Get LOCAL loss history to verify model is improving.
+    
+    Returns loss checkpoints recorded during training.
+    Use this to see if YOUR node's training is working.
+    """
+    if not NEURO_NODE:
+        raise HTTPException(status_code=503, detail="Node not ready")
+    
+    result = {
+        "total_steps": NEURO_NODE.total_training_rounds,
+        "current_loss": NEURO_NODE.current_loss if NEURO_NODE.current_loss != float('inf') else None,
+        "loss_checkpoints": [],
+        "loss_trend": "unknown",
+        "improvement_percent": 0.0,
+        "training_verified": False,
+        "analysis": {},
+    }
+    
+    # Get loss checkpoints from global tracker
+    if hasattr(NEURO_NODE, '_global_tracker') and NEURO_NODE._global_tracker:
+        tracker = NEURO_NODE._global_tracker
+        
+        # Get loss checkpoints (list of (step, loss) tuples)
+        checkpoints = getattr(tracker, '_loss_checkpoints', [])
+        result["loss_checkpoints"] = [
+            {"step": step, "loss": round(loss, 4)} 
+            for step, loss in checkpoints
+        ]
+        
+        # Analyze trend
+        if len(checkpoints) >= 5:
+            losses = [loss for _, loss in checkpoints]
+            
+            # Compare first 20% to last 20%
+            n = len(losses)
+            first_n = max(1, n // 5)
+            first_avg = sum(losses[:first_n]) / first_n
+            last_avg = sum(losses[-first_n:]) / first_n
+            
+            if first_avg > 0:
+                improvement = (first_avg - last_avg) / first_avg * 100
+                result["improvement_percent"] = round(improvement, 2)
+                
+                if improvement > 10:
+                    result["loss_trend"] = "improving_strongly"
+                    result["training_verified"] = True
+                elif improvement > 2:
+                    result["loss_trend"] = "improving"
+                    result["training_verified"] = True
+                elif improvement > -2:
+                    result["loss_trend"] = "stable"
+                    result["training_verified"] = n > 20  # Stable after many steps = converged
+                elif improvement > -10:
+                    result["loss_trend"] = "degrading_slightly"
+                else:
+                    result["loss_trend"] = "degrading"
+            
+            result["analysis"] = {
+                "data_points": n,
+                "first_avg_loss": round(first_avg, 4),
+                "last_avg_loss": round(last_avg, 4),
+                "min_loss_seen": round(min(losses), 4),
+                "max_loss_seen": round(max(losses), 4),
+                "expected_initial_loss": "~10-11 (random init for 50k vocab)",
+                "good_loss_range": "< 4.0 (perplexity < 55)",
+                "great_loss_range": "< 2.5 (perplexity < 12)",
+            }
+    else:
+        result["analysis"]["note"] = "Global tracker not initialized - restart node to enable"
+    
+    return result
+
+
 # ==================== STATS & PONW ENDPOINTS ====================
 
 @node_app.get("/api/stats")

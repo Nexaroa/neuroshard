@@ -92,12 +92,6 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             
             # Forward pass through DynamicNeuroNode
             output = self.model.forward(input_tensor, session_id=request.session_id)
-            
-            # Track Token Count for PoNW
-            if hasattr(output, 'shape') and self.p2p.state_ref is not None:
-                tokens_processed = output.shape[0] * output.shape[1]
-                self.p2p.state_ref["token_count"] = self.p2p.state_ref.get("token_count", 0) + tokens_processed
-
             # Return result directly
             return neuroshard_pb2.InferenceResponse(
                 success=True,

@@ -603,17 +603,28 @@ class P2PManager:
                 tokens_processed = self.state_ref.get("token_count", 0)
                 training_batches = self.state_ref.get("training_batches", 0)
                 
+                # Get pending inference request IDs (only paid inference gets rewards)
+                pending_request_ids = self.state_ref.get("pending_inference_requests", [])
+                
                 # Reset counters after snapshot
                 self.state_ref["token_count"] = 0
                 self.state_ref["training_batches"] = 0
+                self.state_ref["pending_inference_requests"] = []
                 
                 # Determine proof type based on activity
+                # IMPORTANT: Inference proofs REQUIRE a request_id (paid request)
+                # Tokens processed without a request_id don't earn inference rewards
                 if training_batches > 0:
                     proof_type = ProofType.TRAINING
-                elif tokens_processed > 0:
+                    # Note: tokens_processed during training doesn't count as inference
+                    tokens_processed = 0  # Don't double-count training tokens
+                elif tokens_processed > 0 and pending_request_ids:
+                    # Only create inference proof if we have actual paid requests
                     proof_type = ProofType.INFERENCE
                 else:
+                    # Default to uptime - unpaid inference doesn't earn rewards
                     proof_type = ProofType.UPTIME
+                    tokens_processed = 0  # Unpaid tokens don't count
                 
                 # Get node info for role multipliers
                 layers_held = len(self.state_ref.get("assigned_layers", []))

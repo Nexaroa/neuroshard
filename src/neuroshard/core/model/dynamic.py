@@ -2967,53 +2967,227 @@ class DynamicNeuroNode:
                         logger.warning(f"[NODE] Could not restore DiLoCo state: {e}")
             del self._pending_diloco_state
     
+    # Class-level save lock to prevent concurrent checkpoint saves
+    _checkpoint_save_lock = threading.Lock()
+    _checkpoint_save_in_progress = False
+    
     def _save_checkpoint(self, async_save: bool = True):
         """
-        Smart checkpoint saving that adapts to hardware capabilities.
+        Smart checkpoint saving with STREAMING ASYNC for memory-constrained systems.
         
-        HARDWARE AGNOSTIC STRATEGY:
-        1. Checks available system RAM.
-        2. Estimates memory required to clone model for async save.
-        3. If memory is tight (< 2.5x model size free), forces SYNCHRONOUS save to avoid OOM/Swap.
-        4. If memory is ample, uses ASYNC save for zero blocking.
+        THREE MODES:
+        1. BULK ASYNC (>32GB free OR >2.5x checkpoint): Clone all, save in thread
+        2. STREAMING ASYNC (>500MB free): Clone one layer at a time, save incrementally
+        3. SYNC (<500MB free): Blocking save (last resort)
         
-        This allows NeuroShard to run optimally on both:
-        - Constrained Edge Devices (Jetson, Laptops) -> Safe Sync Save
-        - High-End Servers (H100/A100 rigs) -> Fast Async Save
+        Streaming async blocks training only during the brief snapshot (~1-2s for 110 layers),
+        then saves to disk in background (~10-60s) while training continues.
+        
+        Thread-safe: concurrent saves are serialized via lock.
         """
         if not self.model:
             return
-
-        # 1. Adaptive Strategy: Check if we can afford async save
+        
+        # Prevent concurrent saves (async save might still be in progress)
+        if not DynamicNeuroNode._checkpoint_save_lock.acquire(blocking=False):
+            logger.debug("[NODE] Checkpoint save skipped - another save in progress")
+            return
+        
         try:
-            # Estimate checkpoint size (sum of parameters)
-            # 4 bytes per float32 param
+            # Use wallet_id for stable checkpoint path
+            path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
+            temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
+
+        # 1. Assess memory situation
+        try:
             total_params = sum(p.numel() for p in self.model.parameters())
             checkpoint_size_mb = (total_params * 4) / (1024 * 1024)
             
-            # Check system memory
             vm = psutil.virtual_memory()
             available_mb = vm.available / (1024 * 1024)
             
-            # Heuristic: We need ~2.5x the checkpoint size in FREE ram to safely clone without pressure
-            # (1x for clone, 1x for overhead/buffers, 0.5x safety margin)
-            # OR if we have > 32GB free, assume we're fine.
-            can_afford_async = (available_mb > (checkpoint_size_mb * 2.5)) or (available_mb > 32000)
+            # Determine save mode
+            can_bulk_async = (available_mb > (checkpoint_size_mb * 2.5)) or (available_mb > 32000)
+            can_stream_async = available_mb > 500  # Just need enough for 1 layer + overhead
             
-            if async_save and not can_afford_async:
-                logger.info(f"[NODE] Adaptive Save: Memory tight (Free: {available_mb:.0f}MB, Needed: ~{checkpoint_size_mb*2.5:.0f}MB). "
-                            f"Switching to SYNCHRONOUS save to prevent swap/OOM.")
-                async_save = False
-            elif async_save:
-                logger.debug(f"[NODE] Adaptive Save: Memory ample (Free: {available_mb:.0f}MB). Using non-blocking ASYNC save.")
-                
         except Exception as e:
-            logger.warning(f"[NODE] Could not assess memory for adaptive save: {e}. Defaulting to sync.")
-            async_save = False
-
+            logger.warning(f"[NODE] Could not assess memory: {e}. Using streaming async.")
+            can_bulk_async = False
+            can_stream_async = True
+            checkpoint_size_mb = 0
+            available_mb = 0
         
         try:
-            # Prepare data structure (lightweight metadata)
+            # ============ ATOMIC SNAPSHOT PHASE ============
+            # ALL state must be captured together to ensure consistency.
+            # DiLoCo state + model weights must be from the same "moment in time".
+            
+            # Helper to deep-clone DiLoCo state (ALL tensors to CPU for async safety)
+            def _clone_diloco_state():
+                if not hasattr(self, 'swarm') or not self.swarm:
+                    return None
+                diloco = getattr(self.swarm, 'diloco_trainer', None)
+                if not diloco or not hasattr(diloco, 'state_dict'):
+                    return None
+                try:
+                    state = diloco.state_dict()
+                    
+                    # Deep clone optimizer state (contains momentum buffers as tensor refs!)
+                    def _clone_optimizer_state(opt_state):
+                        if opt_state is None:
+                            return None
+                        cloned = {'param_groups': opt_state.get('param_groups', [])}
+                        if 'state' in opt_state:
+                            cloned['state'] = {}
+                            for k, v in opt_state['state'].items():
+                                cloned['state'][k] = {}
+                                for kk, vv in v.items():
+                                    if isinstance(vv, torch.Tensor):
+                                        cloned['state'][k][kk] = vv.detach().clone().cpu()
+                                    else:
+                                        cloned['state'][k][kk] = vv
+                        return cloned
+                    
+                    # Deep clone all tensors to CPU for async safety
+                    cloned = {
+                        'config': dict(state.get('config', {})),
+                        'inner_optimizer': _clone_optimizer_state(state.get('inner_optimizer')),
+                        'outer_optimizer': _clone_optimizer_state(state.get('outer_optimizer')),
+                        'initial_weights': {
+                            k: v.detach().clone().cpu() 
+                            for k, v in state.get('initial_weights', {}).items()
+                        },
+                        'stats': dict(state.get('stats', {})),
+                        'phase': state.get('phase', 'idle'),
+                    }
+                    return cloned
+                except Exception as e:
+                    logger.warning(f"[NODE] Could not snapshot DiLoCo state: {e}")
+                    return None
+            
+            # ============ MODE 1: BULK ASYNC (plenty of memory) ============
+            if async_save and can_bulk_async:
+                logger.debug(f"[NODE] Checkpoint: BULK ASYNC (Free: {available_mb:.0f}MB)")
+                
+                # Capture everything atomically
+                checkpoint = {
+                    "node_id": self.node_id,
+                    "layer_ids": list(self.my_layer_ids),
+                    "architecture": self.model.architecture.to_dict(),
+                    "architecture_version": self.layer_pool.architecture_version if self.layer_pool else 1,
+                    "has_embedding": self.model.has_embedding,
+                    "has_lm_head": self.model.has_lm_head,
+                    "total_training_rounds": self.total_training_rounds,
+                    "current_loss": self.current_loss,
+                    "timestamp": time.time(),
+                    "layers": {
+                        layer_id: {k: v.clone().cpu() for k, v in layer.state_dict().items()}
+                        for layer_id, layer in self.model.my_layers.items()
+                    },
+                }
+                if self.model.embedding:
+                    checkpoint["embedding"] = {k: v.clone().cpu() for k, v in self.model.embedding.state_dict().items()}
+                if self.model.lm_head:
+                    checkpoint["lm_head"] = {k: v.clone().cpu() for k, v in self.model.lm_head.state_dict().items()}
+                if self.model.final_norm:
+                    checkpoint["final_norm"] = {k: v.clone().cpu() for k, v in self.model.final_norm.state_dict().items()}
+                
+                # DiLoCo state captured AFTER model weights (both in same atomic snapshot)
+                diloco_state = _clone_diloco_state()
+                if diloco_state:
+                    checkpoint["diloco"] = diloco_state
+                
+                def _do_bulk_save():
+                    try:
+                        torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=False)
+                        import shutil
+                        shutil.move(str(temp_path), str(path))
+                        logger.info(f"[NODE] Checkpoint saved ({len(self.my_layer_ids)} layers)")
+                    except Exception as e:
+                        logger.error(f"[NODE] Checkpoint save failed: {e}")
+                        if temp_path.exists(): temp_path.unlink()
+                    finally:
+                        DynamicNeuroNode._checkpoint_save_lock.release()
+                
+                threading.Thread(target=_do_bulk_save, daemon=True).start()
+                return  # Lock will be released by background thread
+            
+            # ============ MODE 2: STREAMING ASYNC (memory-efficient) ============
+            if async_save and can_stream_async:
+                logger.info(f"[NODE] Checkpoint: STREAMING ASYNC (Free: {available_mb:.0f}MB, cloning {len(self.model.my_layers)} layers)")
+                
+                # SNAPSHOT PHASE: Clone one layer at a time into a list
+                # This brief pause (~1-2s) ensures consistency without needing full clone memory
+                snapshot_start = time.time()
+                
+                # Capture metadata first (lightweight)
+                checkpoint_meta = {
+                    "node_id": self.node_id,
+                    "layer_ids": list(self.my_layer_ids),
+                    "architecture": self.model.architecture.to_dict(),
+                    "architecture_version": self.layer_pool.architecture_version if self.layer_pool else 1,
+                    "has_embedding": self.model.has_embedding,
+                    "has_lm_head": self.model.has_lm_head,
+                    "total_training_rounds": self.total_training_rounds,
+                    "current_loss": self.current_loss,
+                    "timestamp": time.time(),
+                }
+                
+                # Clone layers one at a time (memory efficient)
+                layer_snapshots = []
+                for layer_id, layer in self.model.my_layers.items():
+                    layer_state = {k: v.detach().clone().cpu() for k, v in layer.state_dict().items()}
+                    layer_snapshots.append((layer_id, layer_state))
+                
+                # Clone special modules
+                embedding_snapshot = None
+                lm_head_snapshot = None
+                final_norm_snapshot = None
+                
+                if self.model.embedding:
+                    embedding_snapshot = {k: v.detach().clone().cpu() for k, v in self.model.embedding.state_dict().items()}
+                if self.model.lm_head:
+                    lm_head_snapshot = {k: v.detach().clone().cpu() for k, v in self.model.lm_head.state_dict().items()}
+                if self.model.final_norm:
+                    final_norm_snapshot = {k: v.detach().clone().cpu() for k, v in self.model.final_norm.state_dict().items()}
+                
+                # DiLoCo state - captured in SAME snapshot window as model weights
+                diloco_snapshot = _clone_diloco_state()
+                
+                snapshot_time = time.time() - snapshot_start
+                logger.debug(f"[NODE] Snapshot complete in {snapshot_time:.1f}s, starting async save")
+                
+                # ASYNC SAVE PHASE: Write to disk in background thread
+                # All data is now cloned and owned by this closure - safe for async
+                def _do_streaming_save():
+                    try:
+                        checkpoint = dict(checkpoint_meta)
+                        checkpoint["layers"] = {lid: lstate for lid, lstate in layer_snapshots}
+                        if embedding_snapshot:
+                            checkpoint["embedding"] = embedding_snapshot
+                        if lm_head_snapshot:
+                            checkpoint["lm_head"] = lm_head_snapshot
+                        if final_norm_snapshot:
+                            checkpoint["final_norm"] = final_norm_snapshot
+                        if diloco_snapshot:
+                            checkpoint["diloco"] = diloco_snapshot
+                        
+                        torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=False)
+                        import shutil
+                        shutil.move(str(temp_path), str(path))
+                        logger.info(f"[NODE] Checkpoint saved ({len(layer_snapshots)} layers)")
+                    except Exception as e:
+                        logger.error(f"[NODE] Checkpoint save failed: {e}")
+                        if temp_path.exists(): temp_path.unlink()
+                    finally:
+                        DynamicNeuroNode._checkpoint_save_lock.release()
+                
+                threading.Thread(target=_do_streaming_save, daemon=True).start()
+                return  # Lock will be released by background thread
+            
+            # ============ MODE 3: SYNC (last resort, very low memory) ============
+            logger.warning(f"[NODE] Checkpoint: SYNC mode (Free: {available_mb:.0f}MB < 500MB minimum)")
+            
             checkpoint = {
                 "node_id": self.node_id,
                 "layer_ids": list(self.my_layer_ids),
@@ -3024,79 +3198,39 @@ class DynamicNeuroNode:
                 "total_training_rounds": self.total_training_rounds,
                 "current_loss": self.current_loss,
                 "timestamp": time.time(),
-            }
-
-            # Helper to extract state dicts
-            # If async: CLONE tensors to CPU (memory intensive, but fast main-thread release)
-            # If sync: Just reference tensors (low memory, but blocks main thread during I/O)
-            def get_state(module, clone=False):
-                if clone:
-                    return {k: v.clone().cpu() for k, v in module.state_dict().items()}
-                else:
-                    return module.state_dict()
-
-            # ASYNC PATH: Clone everything now
-            if async_save:
-                checkpoint["layers"] = {
-                    layer_id: get_state(layer, clone=True)
-                    for layer_id, layer in self.model.my_layers.items()
-                }
-                if self.model.embedding:
-                    checkpoint["embedding"] = get_state(self.model.embedding, clone=True)
-                if self.model.lm_head:
-                    checkpoint["lm_head"] = get_state(self.model.lm_head, clone=True)
-                if self.model.final_norm:
-                    checkpoint["final_norm"] = get_state(self.model.final_norm, clone=True)
-            
-            # SYNC PATH: Reference only (torch.save will handle serialization one-by-one)
-            else:
-                checkpoint["layers"] = {
+                "layers": {
                     layer_id: layer.state_dict()
                     for layer_id, layer in self.model.my_layers.items()
-                }
-                if self.model.embedding:
-                    checkpoint["embedding"] = self.model.embedding.state_dict()
-                if self.model.lm_head:
-                    checkpoint["lm_head"] = self.model.lm_head.state_dict()
-                if self.model.final_norm:
-                    checkpoint["final_norm"] = self.model.final_norm.state_dict()
-
-            # Save DiLoCo state if available
-            if hasattr(self, 'swarm') and self.swarm:
-                try:
-                    diloco = getattr(self.swarm, 'diloco_trainer', None)
-                    if diloco and hasattr(diloco, 'state_dict'):
-                        checkpoint["diloco"] = diloco.state_dict()
-                except Exception:
-                    pass
+                },
+            }
+            if self.model.embedding:
+                checkpoint["embedding"] = self.model.embedding.state_dict()
+            if self.model.lm_head:
+                checkpoint["lm_head"] = self.model.lm_head.state_dict()
+            if self.model.final_norm:
+                checkpoint["final_norm"] = self.model.final_norm.state_dict()
             
-            # Use wallet_id for stable checkpoint path
-            path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
-            temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
-
-            # Actual Save Function (IO Bound)
-            def _do_io_save(data_to_save):
-                try:
-                    torch.save(data_to_save, temp_path, _use_new_zipfile_serialization=False)
-                    import shutil
-                    shutil.move(str(temp_path), str(path))
-                    logger.info(f"[NODE] Checkpoint saved ({len(self.my_layer_ids)} layers)")
-                except Exception as e:
-                    logger.error(f"[NODE] Checkpoint save failed: {e}")
-                    if temp_path.exists(): temp_path.unlink()
-
-            if async_save:
-                # Threaded Save: Main thread continues immediately
-                import threading
-                save_thread = threading.Thread(target=_do_io_save, args=(checkpoint,), daemon=True)
-                save_thread.start()
-            else:
-                # Blocking Save: Safe for low memory
-                _do_io_save(checkpoint)
+            # DiLoCo state (no need to clone for sync - we block anyway)
+            diloco_state = _clone_diloco_state()
+            if diloco_state:
+                checkpoint["diloco"] = diloco_state
+            
+            torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=False)
+            import shutil
+            shutil.move(str(temp_path), str(path))
+            logger.info(f"[NODE] Checkpoint saved ({len(self.my_layer_ids)} layers)")
+            
+            # Sync mode completed successfully, release lock
+            DynamicNeuroNode._checkpoint_save_lock.release()
             
         except Exception as e:
             logger.error(f"[NODE] Checkpoint preparation failed: {type(e).__name__}: {e}")
-            if temp_path.exists(): temp_path.unlink()
+            try:
+                if temp_path.exists(): temp_path.unlink()
+            except:
+                pass
+            # Release lock on exception
+            DynamicNeuroNode._checkpoint_save_lock.release()
 
 
 def create_dynamic_node(
