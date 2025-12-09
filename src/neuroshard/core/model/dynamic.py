@@ -39,11 +39,18 @@ logger = logging.getLogger(__name__)
 # Dynamic architecture - NO MORE FIXED DIMENSIONS!
 # Architecture is now calculated based on network capacity
 
-# Dynamic vocabulary - starts at 32K, expands as needed
+# Dynamic vocabulary - starts at 32K, expands WITHOUT LIMIT as network grows
 # The embedding/lm_head grow in chunks when tokenizer vocabulary exceeds current capacity
-INITIAL_VOCAB_SIZE = 32000  # Starting size
-VOCAB_GROWTH_CHUNK = 32000  # Expand by 32K at a time (efficient GPU memory alignment)
-MAX_VOCAB_SIZE = 1000000    # 1M tokens max (theoretical limit for massive networks)
+INITIAL_VOCAB_SIZE = 32000   # Starting size (efficient for small networks)
+VOCAB_GROWTH_CHUNK = 32000   # Expand by 32K at a time (efficient GPU memory alignment)
+
+# NO HARD LIMIT - vocabulary grows with the network
+# The only real constraints are:
+#   - Memory: ~4KB per token (at hidden_dim=1024) or ~16KB (at hidden_dim=4096)
+#   - Practical: Most use cases covered under 1M tokens
+# For reference: GPT-4 ~100K, Claude ~100K, Gemini ~256K
+# NeuroShard can grow FAR beyond these as a truly decentralized, ever-growing LLM
+MAX_VOCAB_SIZE = None  # None = unlimited (constrained only by available memory)
 
 # Import the new architecture scaler
 from neuroshard.core.model.scaler import (
@@ -929,13 +936,15 @@ class DynamicNeuroLLM:
         if new_vocab_size <= self.vocab_capacity:
             return True  # No expansion needed
         
-        if new_vocab_size > MAX_VOCAB_SIZE:
+        # Check against max (if set)
+        if MAX_VOCAB_SIZE is not None and new_vocab_size > MAX_VOCAB_SIZE:
             logger.warning(f"Requested vocab {new_vocab_size} exceeds MAX_VOCAB_SIZE {MAX_VOCAB_SIZE}")
             new_vocab_size = MAX_VOCAB_SIZE
         
         # Round up to next VOCAB_GROWTH_CHUNK for efficient memory alignment
         new_capacity = ((new_vocab_size + VOCAB_GROWTH_CHUNK - 1) // VOCAB_GROWTH_CHUNK) * VOCAB_GROWTH_CHUNK
-        new_capacity = min(new_capacity, MAX_VOCAB_SIZE)
+        if MAX_VOCAB_SIZE is not None:
+            new_capacity = min(new_capacity, MAX_VOCAB_SIZE)
         
         logger.info(f"[VOCAB] Expanding vocabulary: {self.vocab_capacity} → {new_capacity}")
         

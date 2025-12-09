@@ -53,12 +53,14 @@ class NeuroTokenizer:
     # Learned merges start at ID 266
     MERGE_OFFSET = 266
     
-    def __init__(self, vocab_size: int = 1000000):  # 1M max - no practical limit
+    def __init__(self, vocab_size: int = 10_000_000):  # 10M - effectively unlimited
         """
         Initialize the NeuroLLM tokenizer.
         
         Args:
-            vocab_size: Maximum vocabulary size (default 32000)
+            vocab_size: Maximum vocabulary size. Default 10M is effectively unlimited.
+                       The tokenizer can grow as large as needed - memory is the only
+                       real constraint. For reference: GPT-4 ~100K, most LLMs ~32K-256K.
         """
         self.vocab_size = vocab_size
         
