@@ -448,7 +448,7 @@ class DHTServiceMixin:
             # Record the vote in our ledger
             with self.ledger.lock:
                 import sqlite3
-                with sqlite3.connect(self.ledger.db_path) as conn:
+                with sqlite3.connect(self.ledger.db_path, timeout=60.0) as conn:
                     # Ensure table exists
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS validation_votes (

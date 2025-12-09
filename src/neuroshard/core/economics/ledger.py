@@ -322,7 +322,13 @@ class NEUROLedger:
     def _init_db(self):
         """Initialize SQLite database with all required tables."""
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
+                # Enable Write-Ahead Logging for better concurrency
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                except Exception as e:
+                    logger.warning(f"Failed to enable WAL mode: {e}")
+
                 # Main balances table
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS balances (
@@ -625,7 +631,7 @@ class NEUROLedger:
             return False, "Proof timestamp in future"
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # 3. Check for replay
                 existing = conn.execute(
                     "SELECT 1 FROM proof_history WHERE signature = ?",
@@ -765,7 +771,7 @@ class NEUROLedger:
         reward = self._calculate_reward(proof)
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Double-check replay (in case of race)
                 existing = conn.execute(
                     "SELECT 1 FROM proof_history WHERE signature = ?",
@@ -1014,7 +1020,7 @@ class NEUROLedger:
     
     def _get_stake(self, node_id: str) -> float:
         """Get staked amount for a node."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=60.0) as conn:
             row = conn.execute(
                 "SELECT amount FROM stakes WHERE node_id = ? AND locked_until > ?",
                 (node_id, time.time())
@@ -1182,7 +1188,7 @@ class NEUROLedger:
         my_stake = self._get_stake(self.node_id)
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Create validation_votes table if not exists
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS validation_votes (
@@ -1242,7 +1248,7 @@ class NEUROLedger:
         
         Returns stake-weighted vote tallies and consensus status.
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=60.0) as conn:
             # Check if validation_votes table exists
             table_exists = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='validation_votes'"
@@ -1326,7 +1332,7 @@ class NEUROLedger:
         """
         import random
         
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=60.0) as conn:
             # Get all nodes with sufficient stake
             eligible = conn.execute("""
                 SELECT node_id, amount
@@ -1410,7 +1416,7 @@ class NEUROLedger:
         tx.signature = self._sign(tx.canonical_payload())
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Check sender balance
                 row = conn.execute(
                     "SELECT balance FROM balances WHERE node_id = ?",
@@ -1490,7 +1496,7 @@ class NEUROLedger:
         total_cost = cost + fee
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Check balance
                 row = conn.execute(
                     "SELECT balance FROM balances WHERE node_id = ?",
@@ -1548,7 +1554,7 @@ class NEUROLedger:
         lock_until = time.time() + (duration_days * 24 * 3600)
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Check balance
                 row = conn.execute(
                     "SELECT balance FROM balances WHERE node_id = ?",
@@ -1600,7 +1606,7 @@ class NEUROLedger:
         Returns: (success, amount_unstaked, message)
         """
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 row = conn.execute(
                     "SELECT amount, locked_until FROM stakes WHERE node_id = ?",
                     (self.node_id,)
@@ -1664,7 +1670,7 @@ class NEUROLedger:
         
         try:
             with self.lock:
-                with sqlite3.connect(self.db_path) as conn:
+                with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                     # Mark this as a REMOTE stake (not locally verified)
                     conn.execute("""
                         INSERT INTO stakes (node_id, amount, locked_until, updated_at)
@@ -1721,7 +1727,7 @@ class NEUROLedger:
         ).hexdigest()
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 conn.execute("""
                     INSERT INTO fraud_reports 
                     (report_id, reporter_id, accused_id, proof_signature, reason, evidence, created_at)
@@ -1743,7 +1749,7 @@ class NEUROLedger:
         Called by consensus mechanism after fraud is confirmed.
         """
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Get accused balance
                 row = conn.execute(
                     "SELECT balance FROM balances WHERE node_id = ?",
@@ -1807,7 +1813,7 @@ class NEUROLedger:
         slash_amount = SLASH_AMOUNT * VALIDATOR_SLASH_MULTIPLIER
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Get validator's stake (they lose from stake first)
                 stake_row = conn.execute(
                     "SELECT amount FROM stakes WHERE node_id = ?",
@@ -1896,7 +1902,7 @@ class NEUROLedger:
         consensus_result = status["consensus_result"]
         slashed = []
         
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=60.0) as conn:
             # Get all votes for this proof
             votes = conn.execute("""
                 SELECT validator_id, vote
@@ -1930,7 +1936,7 @@ class NEUROLedger:
         node_id = node_id or self.node_id
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 row = conn.execute(
                     "SELECT balance FROM balances WHERE node_id = ?",
                     (node_id,)
@@ -1965,7 +1971,7 @@ class NEUROLedger:
         node_id = node_id or self.node_id
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Get balance info
                 row = conn.execute("""
                     SELECT balance, total_earned, proof_count
@@ -2001,7 +2007,7 @@ class NEUROLedger:
         node_id = node_id or self.node_id
         
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Balance info
                 row = conn.execute("""
                     SELECT balance, total_earned, total_spent, last_proof_time, proof_count, created_at
@@ -2047,7 +2053,7 @@ class NEUROLedger:
     def get_global_stats(self) -> LedgerStats:
         """Get global ledger statistics."""
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 row = conn.execute("""
                     SELECT total_minted, total_burned, total_transferred, total_proofs, total_transactions
                     FROM global_stats WHERE id = 1
@@ -2070,7 +2076,7 @@ class NEUROLedger:
     def get_burn_stats(self) -> Dict:
         """Get burn statistics."""
         with self.lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
                 # Total burned
                 row = conn.execute(
                     "SELECT balance FROM balances WHERE node_id = ?",

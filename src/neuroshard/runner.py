@@ -2375,6 +2375,12 @@ def run_node(
             
             # GPU nodes can train much faster without lagging the system
             is_gpu = NEURO_NODE.device in ["cuda", "mps"] if NEURO_NODE else False
+            
+            # Log device status occasionally to debug "why is it slow?"
+            if now - last_throttle_log >= 60:
+                 current_device = NEURO_NODE.device if NEURO_NODE else 'None'
+                 logger.debug(f"[NODE] Device: {current_device} (is_gpu={is_gpu})")
+            
             base_interval = 0.01 if is_gpu else 2.0
             
             interval = max(base_interval, base_interval / max(0.1, resource_ratio))
@@ -2874,6 +2880,7 @@ def run_node(
     # 6. Run HTTP Server
     logger.info("=" * 50)
     logger.info("NeuroShard Node Ready!")
+    logger.info(f"   Device: {NEURO_NODE.device.upper()}")
     logger.info(f"   My Layers: {NEURO_NODE.my_layer_ids}")
     logger.info(f"   My Params: {NEURO_NODE.model.get_num_params() / 1e6:.1f}M")
     logger.info(f"   Embedding: {NEURO_NODE.model.has_embedding}")
