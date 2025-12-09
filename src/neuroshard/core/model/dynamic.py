@@ -27,6 +27,7 @@ import time
 import logging
 import hashlib
 import math
+import psutil  # For adaptive memory management
 from typing import Optional, Dict, List, Tuple, Any, Set
 from dataclasses import dataclass, field
 from collections import defaultdict
@@ -2966,45 +2967,101 @@ class DynamicNeuroNode:
                         logger.warning(f"[NODE] Could not restore DiLoCo state: {e}")
             del self._pending_diloco_state
     
-    def _save_checkpoint(self, async_save: bool = False):
+    def _save_checkpoint(self, async_save: bool = True):
         """
-        Save my layers to disk with architecture information.
+        Smart checkpoint saving that adapts to hardware capabilities.
         
-        Synchronous save to avoid memory pressure from cloning all tensors at once.
-        On Jetson/unified memory systems, async cloning doubles memory usage temporarily.
+        HARDWARE AGNOSTIC STRATEGY:
+        1. Checks available system RAM.
+        2. Estimates memory required to clone model for async save.
+        3. If memory is tight (< 2.5x model size free), forces SYNCHRONOUS save to avoid OOM/Swap.
+        4. If memory is ample, uses ASYNC save for zero blocking.
+        
+        This allows NeuroShard to run optimally on both:
+        - Constrained Edge Devices (Jetson, Laptops) -> Safe Sync Save
+        - High-End Servers (H100/A100 rigs) -> Fast Async Save
         """
         if not self.model:
             return
+
+        # 1. Adaptive Strategy: Check if we can afford async save
+        try:
+            # Estimate checkpoint size (sum of parameters)
+            # 4 bytes per float32 param
+            total_params = sum(p.numel() for p in self.model.parameters())
+            checkpoint_size_mb = (total_params * 4) / (1024 * 1024)
+            
+            # Check system memory
+            vm = psutil.virtual_memory()
+            available_mb = vm.available / (1024 * 1024)
+            
+            # Heuristic: We need ~2.5x the checkpoint size in FREE ram to safely clone without pressure
+            # (1x for clone, 1x for overhead/buffers, 0.5x safety margin)
+            # OR if we have > 32GB free, assume we're fine.
+            can_afford_async = (available_mb > (checkpoint_size_mb * 2.5)) or (available_mb > 32000)
+            
+            if async_save and not can_afford_async:
+                logger.info(f"[NODE] Adaptive Save: Memory tight (Free: {available_mb:.0f}MB, Needed: ~{checkpoint_size_mb*2.5:.0f}MB). "
+                            f"Switching to SYNCHRONOUS save to prevent swap/OOM.")
+                async_save = False
+            elif async_save:
+                logger.debug(f"[NODE] Adaptive Save: Memory ample (Free: {available_mb:.0f}MB). Using non-blocking ASYNC save.")
+                
+        except Exception as e:
+            logger.warning(f"[NODE] Could not assess memory for adaptive save: {e}. Defaulting to sync.")
+            async_save = False
+
         
         try:
-            # Build checkpoint with state_dicts directly (no cloning - torch.save handles it)
+            # Prepare data structure (lightweight metadata)
             checkpoint = {
                 "node_id": self.node_id,
                 "layer_ids": list(self.my_layer_ids),
                 "architecture": self.model.architecture.to_dict(),
                 "architecture_version": self.layer_pool.architecture_version if self.layer_pool else 1,
-                "layers": {
-                    layer_id: layer.state_dict()
-                    for layer_id, layer in self.model.my_layers.items()
-                },
                 "has_embedding": self.model.has_embedding,
                 "has_lm_head": self.model.has_lm_head,
                 "total_training_rounds": self.total_training_rounds,
                 "current_loss": self.current_loss,
                 "timestamp": time.time(),
             }
+
+            # Helper to extract state dicts
+            # If async: CLONE tensors to CPU (memory intensive, but fast main-thread release)
+            # If sync: Just reference tensors (low memory, but blocks main thread during I/O)
+            def get_state(module, clone=False):
+                if clone:
+                    return {k: v.clone().cpu() for k, v in module.state_dict().items()}
+                else:
+                    return module.state_dict()
+
+            # ASYNC PATH: Clone everything now
+            if async_save:
+                checkpoint["layers"] = {
+                    layer_id: get_state(layer, clone=True)
+                    for layer_id, layer in self.model.my_layers.items()
+                }
+                if self.model.embedding:
+                    checkpoint["embedding"] = get_state(self.model.embedding, clone=True)
+                if self.model.lm_head:
+                    checkpoint["lm_head"] = get_state(self.model.lm_head, clone=True)
+                if self.model.final_norm:
+                    checkpoint["final_norm"] = get_state(self.model.final_norm, clone=True)
             
-            if self.model.embedding:
-                checkpoint["embedding"] = self.model.embedding.state_dict()
-            if self.model.lm_head:
-                checkpoint["lm_head"] = self.model.lm_head.state_dict()
-            if self.model.final_norm:
-                checkpoint["final_norm"] = self.model.final_norm.state_dict()
-            
-            # Skip optimizer state to reduce checkpoint size/time
-            # (Optimizer will reinitialize on load - minor impact on training continuity)
-            
-            # Save DiLoCo trainer state (small, worth keeping)
+            # SYNC PATH: Reference only (torch.save will handle serialization one-by-one)
+            else:
+                checkpoint["layers"] = {
+                    layer_id: layer.state_dict()
+                    for layer_id, layer in self.model.my_layers.items()
+                }
+                if self.model.embedding:
+                    checkpoint["embedding"] = self.model.embedding.state_dict()
+                if self.model.lm_head:
+                    checkpoint["lm_head"] = self.model.lm_head.state_dict()
+                if self.model.final_norm:
+                    checkpoint["final_norm"] = self.model.final_norm.state_dict()
+
+            # Save DiLoCo state if available
             if hasattr(self, 'swarm') and self.swarm:
                 try:
                     diloco = getattr(self.swarm, 'diloco_trainer', None)
@@ -3016,20 +3073,30 @@ class DynamicNeuroNode:
             # Use wallet_id for stable checkpoint path
             path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
             temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
-            
-            # Save to temp file first, then rename (atomic)
-            torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=False)
-            
-            import shutil
-            shutil.move(str(temp_path), str(path))
-            
-            logger.info(f"[NODE] Checkpoint saved ({len(self.my_layer_ids)} layers)")
+
+            # Actual Save Function (IO Bound)
+            def _do_io_save(data_to_save):
+                try:
+                    torch.save(data_to_save, temp_path, _use_new_zipfile_serialization=False)
+                    import shutil
+                    shutil.move(str(temp_path), str(path))
+                    logger.info(f"[NODE] Checkpoint saved ({len(self.my_layer_ids)} layers)")
+                except Exception as e:
+                    logger.error(f"[NODE] Checkpoint save failed: {e}")
+                    if temp_path.exists(): temp_path.unlink()
+
+            if async_save:
+                # Threaded Save: Main thread continues immediately
+                import threading
+                save_thread = threading.Thread(target=_do_io_save, args=(checkpoint,), daemon=True)
+                save_thread.start()
+            else:
+                # Blocking Save: Safe for low memory
+                _do_io_save(checkpoint)
             
         except Exception as e:
-            logger.error(f"[NODE] Checkpoint save failed: {type(e).__name__}: {e}")
-            temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
-            if temp_path.exists():
-                temp_path.unlink()
+            logger.error(f"[NODE] Checkpoint preparation failed: {type(e).__name__}: {e}")
+            if temp_path.exists(): temp_path.unlink()
 
 
 def create_dynamic_node(
