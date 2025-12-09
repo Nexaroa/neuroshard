@@ -2373,9 +2373,14 @@ def run_node(
             ram_ratio = min(1.0, user_ram_limit / total_ram_mb)
             resource_ratio = min(cpu_ratio, ram_ratio)
             
-            base_interval = 2
+            # GPU nodes can train much faster without lagging the system
+            is_gpu = NEURO_NODE.device in ["cuda", "mps"] if NEURO_NODE else False
+            base_interval = 0.01 if is_gpu else 2.0
+            
             interval = max(base_interval, base_interval / max(0.1, resource_ratio))
-            max_steps = max(5, int(30 * resource_ratio))
+            # Allow much higher steps per minute on GPU
+            base_max_steps = 600 if is_gpu else 30
+            max_steps = max(5, int(base_max_steps * resource_ratio))
             
             # Store for API access
             STATE["throttle_cpu_ratio"] = cpu_ratio

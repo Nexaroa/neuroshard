@@ -2285,9 +2285,7 @@ class DynamicNeuroNode:
         train entirely locally without any network overhead.
         """
         # Forward pass with optional gradient checkpointing
-        # Note: time.sleep(0) yields GIL to keep HTTP server responsive
         embeddings = self.model.embed(input_ids)
-        time.sleep(0)  # Yield GIL
         
         # Use gradient checkpointing if enabled (trades CPU for memory)
         if getattr(self, '_use_gradient_checkpointing', False):
@@ -2298,11 +2296,9 @@ class DynamicNeuroNode:
             )
         else:
             output = self.model.forward_my_layers(embeddings)
-        time.sleep(0)  # Yield GIL after forward pass
         
         # Compute logits and loss
         logits = self.model.compute_logits(output)
-        time.sleep(0)  # Yield GIL
         
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -2313,16 +2309,15 @@ class DynamicNeuroNode:
         # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
-        time.sleep(0)  # Yield GIL after backward pass
         
         # Gradient clipping and optimizer step
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
-        time.sleep(0)  # Yield GIL after optimizer step
         
         # Update stats
         self.total_training_rounds += 1
-        self.current_loss = loss.item()
+        loss_val = loss.item()
+        self.current_loss = loss_val
         
         # PERIODIC CHECKPOINT: Save every 10 training steps to avoid losing progress
         # (More frequent saves since training steps take ~1s each)
@@ -2330,7 +2325,7 @@ class DynamicNeuroNode:
             self._save_checkpoint()
             logger.debug(f"Checkpoint saved at step {self.total_training_rounds}")
         
-        return loss.item()
+        return loss_val
     
     # ==================== STATS & PONW ====================
     
