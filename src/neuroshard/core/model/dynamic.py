@@ -334,17 +334,26 @@ class DynamicLayerPool:
                 dht_layers = self._discover_network_layers_from_dht()
                 if dht_layers:
                     highest_layer = max(dht_layers)
-                    # SANITY CHECK: Only trust DHT if layers are "reasonable"
+                    num_dht_layers = len(dht_layers)
+                    
+                    # AGGRESSIVE STALE DETECTION:
+                    # DHT entries persist until TTL expires, so we may see old announcements.
+                    # Be very conservative: if DHT shows way more layers than reasonable, it's stale.
                     max_reasonable = max(32, self.current_num_layers * 2)
-                    if highest_layer >= self.current_num_layers and highest_layer < max_reasonable:
-                        self.current_num_layers = highest_layer + 1
-                        logger.info(f"DHT discovery: network has {self.current_num_layers} layers")
-                    elif highest_layer >= max_reasonable:
-                        logger.warning(f"DHT shows {highest_layer + 1} layers but seems stale")
-                        logger.warning(f"Ignoring stale DHT data - will use checkpoint layer count")
-                        # CRITICAL: Clear stale DHT data so it doesn't affect full_node detection!
+                    
+                    # Case 1: DHT has WAY too many layers (stale from previous larger run)
+                    if num_dht_layers > 32 or highest_layer > 32:
+                        logger.warning(f"DHT shows {num_dht_layers} layers (highest={highest_layer}) - likely stale")
+                        logger.warning(f"Clearing stale DHT data (max_reasonable={max_reasonable})")
                         dht_layers = set()
                         dht_is_stale = True
+                    # Case 2: Reasonable layer count, accept it
+                    elif highest_layer >= self.current_num_layers and highest_layer < max_reasonable:
+                        self.current_num_layers = highest_layer + 1
+                        logger.info(f"DHT discovery: network has {self.current_num_layers} layers")
+                    # Case 3: Fewer layers than expected (normal for small network)
+                    else:
+                        logger.info(f"DHT shows {num_dht_layers} layers (0-{highest_layer}), accepting")
                 else:
                     logger.info("DHT: No existing layers found - this may be first node or peers not yet discovered")
             else:
