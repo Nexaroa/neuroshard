@@ -2383,6 +2383,11 @@ def run_node(
     STATE["shard_range"] = shard_range
     logger.info(f"P2P shard_range: {shard_range} (layers {layer_ids})")
     
+    # CRITICAL: Re-announce with correct layers IMMEDIATELY after assignment!
+    # The initial announce happened with "0-0" before model creation.
+    # This corrects it so other nodes can discover our actual layers.
+    P2P._announce_once(verbose=True)
+    
     # Set node role info for PoNW reward calculation
     STATE["assigned_layers"] = NEURO_NODE.my_layer_ids
     STATE["has_embedding"] = NEURO_NODE.model.has_embedding
