@@ -1716,6 +1716,10 @@ class DynamicNeuroNode:
         self.data_manager = None
         self.gradient_gossip = None
         
+        # Training lock to prevent concurrent training operations
+        # (local training vs pipeline training conflict)
+        self._training_lock = threading.Lock()
+        
         # P2P
         self.p2p_manager = None
         
@@ -2254,29 +2258,31 @@ class DynamicNeuroNode:
                     ignore_index=-100
                 )
                 
-                # Trigger Backward Pass
-                self.optimizer.zero_grad()
-                loss.backward()
-                
-                # Propagate gradient back to previous node
-                if sender_url and session_id:
-                    # The gradient we send back is dL/d(input_hidden_states)
-                    # hidden_states.grad is populated by backward()
-                    if hidden_states.grad is not None:
-                        self._backward_to_peer(
-                            sender_url, 
-                            hidden_states.grad, 
-                            # Target shard is whatever layer sent this to us. 
-                            # Assuming sender holds previous layers.
-                            # We send to the sender's LAST layer.
-                            # Simplified: just send to the node, it routes.
-                            0, 
-                            session_id
-                        )
-                
-                # Step Optimizer
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
+                # Use training lock to prevent conflict with local training
+                with self._training_lock:
+                    # Trigger Backward Pass
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    
+                    # Propagate gradient back to previous node
+                    if sender_url and session_id:
+                        # The gradient we send back is dL/d(input_hidden_states)
+                        # hidden_states.grad is populated by backward()
+                        if hidden_states.grad is not None:
+                            self._backward_to_peer(
+                                sender_url, 
+                                hidden_states.grad, 
+                                # Target shard is whatever layer sent this to us. 
+                                # Assuming sender holds previous layers.
+                                # We send to the sender's LAST layer.
+                                # Simplified: just send to the node, it routes.
+                                0, 
+                                session_id
+                            )
+                    
+                    # Step Optimizer
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optimizer.step()
                 
                 self.total_training_rounds += 1
                 self.current_loss = loss.item()
@@ -2316,21 +2322,23 @@ class DynamicNeuroNode:
         input_tensor = ctx["input"]
         sender_url = ctx["sender_url"]
         
-        # Run local backward
-        # output is the tensor we produced in forward_pipeline
-        # grad_output is dL/d(output) received from next peer
-        self.optimizer.zero_grad()
-        output.backward(grad_output)
-        
-        # Propagate back
-        if sender_url and input_tensor.grad is not None:
-             # Find previous layer ID? Not strictly needed for routing if we have direct sender URL
-             # But _backward_to_peer takes layer_id
-             self._backward_to_peer(sender_url, input_tensor.grad, 0, session_id)
-             
-        # Step Optimizer
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
+        # Use training lock to prevent conflict with local training
+        with self._training_lock:
+            # Run local backward
+            # output is the tensor we produced in forward_pipeline
+            # grad_output is dL/d(output) received from next peer
+            self.optimizer.zero_grad()
+            output.backward(grad_output)
+            
+            # Propagate back
+            if sender_url and input_tensor.grad is not None:
+                 # Find previous layer ID? Not strictly needed for routing if we have direct sender URL
+                 # But _backward_to_peer takes layer_id
+                 self._backward_to_peer(sender_url, input_tensor.grad, 0, session_id)
+                 
+            # Step Optimizer
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
         
         # Cleanup
         del self.training_context[session_id]
@@ -2856,13 +2864,15 @@ class DynamicNeuroNode:
             ignore_index=-100
         )
         
-        # Backward pass
-        self.optimizer.zero_grad()
-        loss.backward()
-        
-        # Gradient clipping and optimizer step
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
+        # Use training lock to prevent conflict with pipeline training
+        with self._training_lock:
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping and optimizer step
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
         
         # Update stats
         self.total_training_rounds += 1

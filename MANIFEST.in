@@ -25,7 +25,4 @@ prune *.egg-info
 
 # Exclude documentation and whitepaper (website only)
 prune docs
-prune whitepaper
-global-exclude *.tex
-global-exclude *.pdf
-global-exclude *.bib
+prune docs-site
