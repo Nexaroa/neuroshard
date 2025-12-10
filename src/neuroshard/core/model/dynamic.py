@@ -369,9 +369,12 @@ class DynamicLayerPool:
             # 6. If we still have capacity, grow the model
             if remaining_capacity > 0:
                 # CAP MODEL GROWTH for solo/early network as safety net
-                # The training_overhead calculation should handle this, but this is a fallback
-                # 64 layers is plenty for a single node (~300M params with 512 hidden)
-                MAX_SOLO_LAYERS = 64  # Safety cap for solo node training
+                # Even with gradient checkpointing, too many layers cause OOM due to:
+                # - Optimizer states (2x model size for Adam)
+                # - Gradient accumulation during backward pass
+                # - PyTorch memory fragmentation
+                # 32 layers is safe for most devices (~200M params with 512 hidden)
+                MAX_SOLO_LAYERS = 32  # Conservative cap for solo node training
                 total_nodes = len(set(
                     a.node_id for assignments in self.layer_assignments.values() 
                     for a in assignments
@@ -1855,45 +1858,24 @@ class DynamicNeuroNode:
         # This will be recalculated when model grows via recalculate_training_config()
         num_layers = len(self.my_layer_ids)
         
-        # Smart gradient checkpointing decision based on device, memory, and model size
-        # Key insight: Attention scores = batch × heads × seq² × layers × 4 bytes
-        # With 46 layers, 16 heads, 2048 seq, batch 8 → ~98GB without checkpointing!
+        # Smart gradient checkpointing decision
+        # CRITICAL: Always enable checkpointing for models with many layers!
+        # Without checkpointing, attention scores alone need: batch × heads × seq² × layers × 4 bytes
+        # For 46 layers: 8 × 16 × 2048² × 46 × 4 = ~92GB (way more than any GPU!)
         
-        # Get architecture from model or layer_pool
-        arch = None
-        if hasattr(self, 'model') and self.model and hasattr(self.model, 'architecture'):
-            arch = self.model.architecture
-        elif hasattr(self, 'layer_pool') and self.layer_pool and hasattr(self.layer_pool, 'current_architecture'):
-            arch = self.layer_pool.current_architecture
-        
-        # Calculate attention memory estimate (the real OOM culprit)
-        batch_estimate = 8  # Typical batch size
-        seq_len = 2048
-        num_heads = arch.num_heads if arch else 16
-        hidden_dim = arch.hidden_dim if arch else 512
-        attn_memory_gb = (batch_estimate * num_heads * seq_len * seq_len * num_layers * 4) / (1024**3)
-        
-        # Also consider vocab size - large vocab means less memory for activations
-        vocab_size = getattr(self, 'vocab_capacity', 32000)
-        vocab_memory_gb = (2 * vocab_size * hidden_dim * 16) / (1024**3)
-        
-        # Total activation memory estimate
-        total_activation_memory_gb = attn_memory_gb + vocab_memory_gb
-        available_gb = self.available_memory_mb / 1024
-        
-        # Enable checkpointing if activation memory would exceed 50% of available
-        need_checkpointing = total_activation_memory_gb > (available_gb * 0.5)
-        
-        # Also use layer count as fallback
-        if self.device == "cuda":
-            self._use_gradient_checkpointing = need_checkpointing or num_layers > 24
+        # SIMPLE RULE: Enable checkpointing if layers > 16 (always safe)
+        # This avoids complex calculations that can have bugs with timing of vocab expansion
+        if num_layers > 16:
+            self._use_gradient_checkpointing = True
+            logger.info(f"[NODE] Gradient checkpointing: ENABLED (layers={num_layers} > 16)")
+        elif self.device != "cuda":
+            # CPU/MPS always use checkpointing for memory efficiency
+            self._use_gradient_checkpointing = True
+            logger.info(f"[NODE] Gradient checkpointing: ENABLED (device={self.device})")
         else:
-            # CPU/MPS: more conservative
-            self._use_gradient_checkpointing = need_checkpointing or num_layers > 16
-        
-        logger.info(f"[NODE] Gradient checkpointing: {self._use_gradient_checkpointing} "
-                   f"(attn_mem={attn_memory_gb:.1f}GB, vocab_mem={vocab_memory_gb:.1f}GB, "
-                   f"available={available_gb:.1f}GB, layers={num_layers})")
+            # Small CUDA models can skip checkpointing for speed
+            self._use_gradient_checkpointing = False
+            logger.info(f"[NODE] Gradient checkpointing: DISABLED (layers={num_layers} ≤ 16, CUDA)")
         
         # Calculate memory-aware training batch size
         self._training_batch_size = self._calculate_training_batch_size()
@@ -2011,28 +1993,13 @@ class DynamicNeuroNode:
         num_layers = len(self.my_layer_ids)
         old_checkpointing = getattr(self, '_use_gradient_checkpointing', False)
         
-        # Recalculate checkpointing based on actual memory needs
-        arch = None
-        if hasattr(self, 'model') and self.model and hasattr(self.model, 'architecture'):
-            arch = self.model.architecture
-        elif hasattr(self, 'layer_pool') and self.layer_pool and hasattr(self.layer_pool, 'current_architecture'):
-            arch = self.layer_pool.current_architecture
-            
-        batch_estimate = 8
-        seq_len = 2048
-        num_heads = arch.num_heads if arch else 16
-        hidden_dim = arch.hidden_dim if arch else 512
-        attn_memory_gb = (batch_estimate * num_heads * seq_len * seq_len * num_layers * 4) / (1024**3)
-        vocab_size = getattr(self, 'vocab_capacity', 32000)
-        vocab_memory_gb = (2 * vocab_size * hidden_dim * 16) / (1024**3)
-        available_gb = self.available_memory_mb / 1024
-        
-        need_checkpointing = (attn_memory_gb + vocab_memory_gb) > (available_gb * 0.5)
-        
-        if self.device == "cuda":
-            self._use_gradient_checkpointing = need_checkpointing or num_layers > 24
+        # Simple checkpointing rule: enable if layers > 16
+        if num_layers > 16:
+            self._use_gradient_checkpointing = True
+        elif self.device != "cuda":
+            self._use_gradient_checkpointing = True
         else:
-            self._use_gradient_checkpointing = need_checkpointing or num_layers > 16
+            self._use_gradient_checkpointing = False
         
         if old_batch != self._training_batch_size or old_checkpointing != self._use_gradient_checkpointing:
             logger.info(f"[NODE] Training config updated: batch_size={old_batch}→{self._training_batch_size}, "
