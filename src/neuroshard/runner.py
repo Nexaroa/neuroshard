@@ -2290,6 +2290,7 @@ def run_node(
     # The background thread might not have run yet, so we do it explicitly here.
     logger.info("DHT bootstrapping... (discovering existing nodes)")
     import time
+    import hashlib as hashlib_module  # Avoid shadowing issues
     
     try:
         import requests
@@ -2310,8 +2311,7 @@ def run_node(
                             p_parsed = urlparse(p["url"])
                             p_ip = p_parsed.hostname
                             p_port = p_parsed.port or 80
-                            import hashlib
-                            p_id = int(hashlib.sha1(f"{p['url']}".encode()).hexdigest(), 16)
+                            p_id = int(hashlib_module.sha1(f"{p['url']}".encode()).hexdigest(), 16)
                             P2P.routing_table.add_contact(Node(p_id, p_ip, p_port))
                             peer_count += 1
                         except:
