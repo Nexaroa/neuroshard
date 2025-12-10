@@ -717,7 +717,7 @@ class GenesisDataLoader:
         self.manifest = None
         self.total_shards = 0
         self.manifest_last_fetch = 0
-        self.MANIFEST_REFRESH_INTERVAL = 3600  # Refresh manifest every hour
+        self.MANIFEST_REFRESH_INTERVAL = 600  # Refresh manifest every 10 minutes (auto-update tokenizer)
         
         # Shard management
         self.max_shards = max(1, int(max_storage_mb / self.SHARD_SIZE_MB))
