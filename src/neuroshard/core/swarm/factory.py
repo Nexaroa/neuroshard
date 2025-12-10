@@ -633,20 +633,34 @@ class SwarmEnabledDynamicNode:
         """
         Execute a training step with DiLoCo lazy gradient sync.
         
-        Includes global training verification:
-        - Records loss/step in global tracker
-        - Tracks model hash for convergence verification
-        - Gossips training stats to peers
+        Supports both local and distributed training:
+        - Full nodes (embedding + LM head): Train locally with DiLoCo
+        - Partial nodes (embedding only): Use pipeline training to Validator
+        - Workers (no embedding): Wait for activations via gRPC
         
         Returns loss value or None if no data available.
         """
         if not self.enable_training:
             return None
         
-        # Ensure global tracker is initialized (should be done at startup, but fallback here)
+        # Ensure global tracker is initialized
         if not hasattr(self, '_global_tracker') or self._global_tracker is None:
             self._init_global_tracker()
         
+        # Check if we can do LOCAL training (need embedding + LM head)
+        is_full_node = self.model.has_embedding and self.model.has_lm_head
+        
+        if not self.model.has_embedding:
+            # WORKER: No embedding = wait for activations via gRPC
+            # Training happens reactively in forward_pipeline/backward_pipeline
+            return None
+        
+        if not is_full_node:
+            # DISTRIBUTED TRAINING: Has embedding but no LM head
+            # Use pipeline training - forward to Validator, receive gradients back
+            return self.base_node.train_step()
+        
+        # LOCAL TRAINING: Full node with embedding + LM head
         diloco = self.swarm.diloco_trainer
         
         # Get training data
@@ -662,21 +676,12 @@ class SwarmEnabledDynamicNode:
             self.model.embed(input_ids.to(self.device))
         )
         
-        # Compute loss
-        if self.model.has_lm_head:
-            logits = self.model.compute_logits(outputs)
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1).to(self.device)
-            )
-        else:
-            # WARNING: This path should rarely be hit.
-            # - Worker nodes (no embedding) return None from _get_training_batch()
-            # - Driver nodes typically also have lm_head (full nodes)
-            # Using activation norm is a placeholder that doesn't train useful representations.
-            # If you see this in production, the node configuration is likely wrong.
-            logger.warning("[TRAIN] No lm_head - using activation norm as loss (training may be ineffective)")
-            loss = outputs.norm()
+        # Compute loss locally
+        logits = self.model.compute_logits(outputs)
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1).to(self.device)
+        )
         
         # DiLoCo inner step (backward + optimizer step + zero_grad)
         diloco.inner_step(loss)

@@ -269,15 +269,53 @@ class DynamicLayerPool:
             else:
                 safety_factor = 0.5  # CPU: increased from 0.3 (checkpointing reduces overhead)
             
+            # SMART DISTRIBUTED TRAINING with MIN_REPLICAS support:
+            # Ensures network has at least MIN_REPLICAS Drivers and Validators for:
+            # - Fault tolerance (if one dies, others continue)
+            # - Parallel training (multiple pipelines can run)
+            # - Load balancing (multiple nodes can serve inference)
+            
+            driver_count = len(self.layer_assignments.get(0, []))
+            validator_layer = max(0, self.current_num_layers - 1) if self.current_num_layers > 0 else 0
+            validator_count = len(self.layer_assignments.get(validator_layer, []))
+            
+            # Check against MIN_REPLICAS (default=2 for redundancy)
+            needs_more_drivers = driver_count < self.MIN_REPLICAS
+            needs_more_validators = validator_count < self.MIN_REPLICAS
+            
+            # ROLE ASSIGNMENT PRIORITY:
+            # 1. If network needs more Drivers → become Driver (need embedding)
+            # 2. If network needs more Validators → become Worker+Validator (need LM head)  
+            # 3. If both have MIN_REPLICAS → become Worker (provide layer redundancy)
+            
+            if needs_more_drivers:
+                # Network needs more Drivers for MIN_REPLICAS
+                role_hint = "DRIVER"
+                needs_embedding = True
+                logger.info(f"Network needs more Drivers ({driver_count}/{self.MIN_REPLICAS})")
+            elif needs_more_validators and self.current_num_layers > 1:
+                # Network needs more Validators for MIN_REPLICAS
+                # Become Worker+Validator: middle layers + last layer (LM head)
+                role_hint = "WORKER+VALIDATOR"
+                needs_embedding = False  # Don't need embedding, saves 4.5GB!
+                logger.info(f"Network needs more Validators ({validator_count}/{self.MIN_REPLICAS})")
+            else:
+                # Network has enough of both → become Worker for layer redundancy
+                role_hint = "WORKER"
+                needs_embedding = False
+                logger.info(f"Network has enough Drivers ({driver_count}) and Validators ({validator_count})")
+            
             max_layers_for_node = calculate_layer_assignment(
                 available_memory_mb,
                 self.current_architecture,
                 safety_factor=safety_factor,
                 vocab_capacity=self.vocab_capacity,
-                training_mode=True  # Always assume training (conservative - prevents OOM)
+                training_mode=True,
+                needs_embedding=needs_embedding
             )
-            logger.info(f"Layer calculation: {available_memory_mb:.0f}MB × {safety_factor} safety = {max_layers_for_node} layers "
-                       f"(device={device_type}, vocab={self.vocab_capacity:,}, training_overhead=35%)")
+            
+            logger.info(f"Layer calculation ({role_hint}): {available_memory_mb:.0f}MB × {safety_factor} safety = {max_layers_for_node} layers "
+                       f"(needs_embedding={needs_embedding}, drivers={driver_count}, validators={validator_count})")
             
             # SCALABILITY: Apply MAX_LAYERS_PER_NODE cap in large networks
             # This prevents single nodes from hogging all layers and ensures
@@ -311,20 +349,34 @@ class DynamicLayerPool:
             required_validator_stake = get_dynamic_validator_stake(num_validators)
             has_validator_stake = staked_amount >= required_validator_stake
             
-            # Driver: Just needs memory (no stake requirement)
-            should_be_driver = is_high_capacity or (is_medium_capacity and num_drivers < 2)
+            # DISTRIBUTED TRAINING ASSIGNMENT:
+            # Based on role_hint from capacity calculation, assign appropriate layers
             
-            # Validator: Needs memory AND dynamic stake
-            should_be_validator = (
-                has_validator_stake and 
-                (is_high_capacity or (is_medium_capacity and num_validators < 2))
-            )
+            last_layer = max(0, self.current_num_layers - 1) if self.current_num_layers > 0 else 0
             
-            if not has_validator_stake and is_medium_capacity:
-                logger.info(f"Node {node_id[:8]}... has capacity for Validator but insufficient stake "
-                           f"({staked_amount:.2f} < {required_validator_stake:.0f} NEURO required for {num_validators} validators)")
+            # Determine role based on network needs and node capacity
+            if role_hint == "DRIVER":
+                # Become Driver: get Layer 0 + as many layers as we can
+                should_be_driver = True
+                should_be_validator = False  # Driver doesn't need to also be Validator
+                logger.info(f"Node {node_id[:8]}... assigned as DRIVER (first node, will embed data)")
+                
+            elif role_hint == "WORKER+VALIDATOR":
+                # Become Worker+Validator: skip Layer 0, get middle + last layer
+                # This is the KEY for distributed training - enables pipeline with loss computation
+                should_be_driver = False
+                should_be_validator = True  # Need LM head to compute loss!
+                # For bootstrap, allow Validator without stake requirement
+                has_validator_stake = True  # Bootstrap mode - stake checked later
+                logger.info(f"Node {node_id[:8]}... assigned as WORKER+VALIDATOR (will compute loss, enable distributed training)")
+                
+            else:  # "WORKER"
+                # Become Worker: middle layers only (redundancy)
+                should_be_driver = False
+                should_be_validator = False
+                logger.info(f"Node {node_id[:8]}... assigned as WORKER (middle layers, redundancy)")
             
-            # Assign Layer 0 (Driver)
+            # Assign Layer 0 (Driver) - if we should be Driver
             if should_be_driver and len(assigned_layers) < max_layers_for_node:
                 if not any(a.node_id == node_id for a in self.layer_assignments[0]):
                     self._assign_layer(0, node_id, node_url, grpc_addr)
@@ -333,24 +385,46 @@ class DynamicLayerPool:
                     if self.current_num_layers == 0:
                         self.current_num_layers = 1
             
-            # 2. Fill gaps (layers with < MIN_REPLICAS)
-            for layer_id in range(self.current_num_layers):
-                if len(assigned_layers) >= max_layers_for_node:
-                    break
-                    
-                current_replicas = len(self.layer_assignments[layer_id])
-                if current_replicas < self.MIN_REPLICAS:
-                    # Check if this node already has this layer
+            # 2. DISTRIBUTED LAYER ASSIGNMENT
+            # Based on role, fill appropriate layers for pipeline parallelism
+            is_driver = 0 in assigned_layers
+            last_layer = max(0, self.current_num_layers - 1)
+            
+            if role_hint == "WORKER+VALIDATOR":
+                # CRITICAL: Assign LAST layer FIRST (for LM head) to ensure we can compute loss
+                if len(assigned_layers) < max_layers_for_node:
+                    if last_layer not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[last_layer]):
+                        self._assign_layer(last_layer, node_id, node_url, grpc_addr)
+                        assigned_layers.append(last_layer)
+                        logger.info(f"Node {node_id[:8]}... assigned last layer {last_layer} (Validator role)")
+                
+                # Then fill middle layers from the END (closer to Validator)
+                # This creates contiguous layer ranges: Driver has 0-N, Validator has M-31
+                for layer_id in range(last_layer - 1, 0, -1):  # Reverse order, skip layer 0
+                    if len(assigned_layers) >= max_layers_for_node:
+                        break
                     if layer_id not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[layer_id]):
                         self._assign_layer(layer_id, node_id, node_url, grpc_addr)
                         assigned_layers.append(layer_id)
-            
-            # 3. Assign Last Layer (Validator) if we still have space and qualify
-            last_layer = max(0, self.current_num_layers - 1)
-            if should_be_validator and len(assigned_layers) < max_layers_for_node:
-                 if last_layer not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[last_layer]):
-                    self._assign_layer(last_layer, node_id, node_url, grpc_addr)
-                    assigned_layers.append(last_layer)
+            else:
+                # Driver or Worker: fill from layer 1 onwards
+                layers_to_check = range(1, self.current_num_layers)
+                    
+                for layer_id in layers_to_check:
+                    if len(assigned_layers) >= max_layers_for_node:
+                        break
+                        
+                    current_replicas = len(self.layer_assignments[layer_id])
+                    if current_replicas < self.MIN_REPLICAS:
+                        if layer_id not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[layer_id]):
+                            self._assign_layer(layer_id, node_id, node_url, grpc_addr)
+                            assigned_layers.append(layer_id)
+                
+                # 3. Assign Last Layer (Validator) if Driver with extra capacity
+                if should_be_validator and len(assigned_layers) < max_layers_for_node:
+                    if last_layer not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[last_layer]):
+                        self._assign_layer(last_layer, node_id, node_url, grpc_addr)
+                        assigned_layers.append(last_layer)
 
             # 4. Calculate remaining capacity
             remaining_capacity = max_layers_for_node - len(assigned_layers)
@@ -2525,9 +2599,17 @@ class DynamicNeuroNode:
         
         Returns:
             Tuple of (input_ids, labels) or None if data not available.
+            
+        Note: Only Drivers (with embedding) load training data.
+              Workers wait for activations via pipeline, they don't need data directly.
         """
         if not self.enable_training:
             return None
+        
+        # WORKERS DON'T LOAD DATA - they receive activations via pipeline
+        # Only Drivers (with embedding) need to load training data
+        if not self.model.has_embedding:
+            return None  # Worker - skip training data loading
         
         # Initialize genesis loader if needed
         if not hasattr(self, 'genesis_loader') or self.genesis_loader is None:
