@@ -351,8 +351,42 @@ class GradientGossip:
 | Parameter | Default | Range | Notes |
 |-----------|---------|-------|-------|
 | `inner_steps` | 500 | 100-1000 | More = less communication, potentially worse convergence |
-| `inner_lr` | 1e-4 | 1e-5 to 1e-3 | Standard learning rate |
+| `inner_lr` | 1e-4 | 1e-5 to 1e-3 | Base learning rate (before scheduling) |
 | `batch_size` | 8 | 1-32 | Per-node batch size |
+
+### Learning Rate Scheduling
+
+DiLoCo uses cosine annealing with linear warmup:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `warmup_steps` | 1000 | Linear ramp from 0 to `inner_lr` |
+| `lr_decay_steps` | 50000 | Full cosine decay cycle |
+| `min_lr_ratio` | 0.1 | Final LR = 10% of base LR |
+
+```python
+def compute_lr(step: int) -> float:
+    """Cosine annealing with warmup."""
+    if step < warmup_steps:
+        # Linear warmup
+        return base_lr * (step / warmup_steps)
+    elif step < lr_decay_steps:
+        # Cosine decay
+        progress = (step - warmup_steps) / (lr_decay_steps - warmup_steps)
+        return min_lr + (base_lr - min_lr) * 0.5 * (1 + cos(pi * progress))
+    else:
+        return min_lr
+```
+
+**LR Schedule Example:**
+
+```
+Step     0: LR = 0.00e+00  (warmup start)
+Step   500: LR = 5.00e-05  (mid-warmup)
+Step  1000: LR = 1.00e-04  (warmup complete - base LR)
+Step 25000: LR = 5.64e-05  (mid-decay)
+Step 50000: LR = 1.00e-05  (minimum LR reached)
+```
 
 ### Outer Loop
 

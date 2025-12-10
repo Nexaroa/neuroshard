@@ -429,6 +429,50 @@ def validate_gradient(submitted, reference):
 | `max_grad_norm` | 1.0 | Gradient clipping |
 | `trim_fraction` | 0.1 | Trimmed mean fraction |
 
+### Learning Rate Scheduling
+
+DiLoCo uses cosine annealing with warmup for stable training:
+
+```python
+# LR Schedule
+warmup_steps = 1000        # Linear warmup from 0 to base_lr
+lr_decay_steps = 50000     # Cosine decay over 50K steps
+min_lr_ratio = 0.1         # Final LR = 10% of base_lr
+
+# Example LR values:
+# Step     0: LR = 0.00e+00  (warmup start)
+# Step  1000: LR = 1.00e-04  (warmup complete)
+# Step 25000: LR = 5.64e-05  (mid-decay)
+# Step 50000: LR = 1.00e-05  (minimum LR)
+```
+
+**Why this matters:**
+- Warmup prevents unstable early training
+- Cosine decay allows fine-tuning as loss decreases
+- Prevents overshooting when loss is already low
+
+### Adaptive Shard Rotation
+
+Training data rotates based on learning progress, not just data exhaustion:
+
+| Trigger | Condition | Result |
+|---------|-----------|--------|
+| Data exhausted | All tokens in shard used | Move to next shard |
+| **Loss plateau** | Low variance + low loss | Rotate to fresh data |
+
+```python
+# Plateau detection parameters
+loss_history_max = 50           # Track last 50 losses
+loss_plateau_threshold = 0.02   # Variance threshold
+min_steps_per_shard = 100       # Minimum before checking
+
+# Example log output:
+# [GENESIS] Loss plateau detected: avg=0.0100, variance=0.000001
+# [GENESIS] Rotating to fresh data for continued learning
+```
+
+This ensures the model sees diverse training data rather than overfitting on a few shards.
+
 ### Memory-Adaptive Batch Size
 
 ```python

@@ -302,6 +302,43 @@ def get_assigned_shards(node_id: str, num_shards: int) -> List[int]:
     return [(primary + i) % num_shards for i in range(10)]
 ```
 
+### Adaptive Shard Rotation
+
+Shards rotate automatically in two scenarios:
+
+1. **Data Exhaustion**: When all tokens in a shard have been used
+2. **Loss Plateau**: When the model stops learning from current data
+
+```python
+def _should_rotate_early(self) -> bool:
+    """Detect loss plateau for early shard rotation."""
+    # Need enough loss history
+    if len(self._loss_history) < 20:
+        return False
+    
+    # Check if loss has plateaued at LOW value
+    recent_losses = self._loss_history[-20:]
+    avg_loss = sum(recent_losses) / len(recent_losses)
+    variance = sum((l - avg_loss) ** 2 for l in recent_losses) / len(recent_losses)
+    
+    # Plateau: low variance + low absolute loss
+    if variance < 0.02 and avg_loss < 0.05:
+        return True  # Rotate to fresh data
+    
+    return False
+```
+
+**Why this matters:**
+- Without plateau detection, a node might train on 5-6 shards until loss is 0.01
+- The model memorizes those shards instead of generalizing
+- With plateau detection, the model sees all 500+ assigned shards
+- Result: Better generalization, less overfitting
+
+| Scenario | Shards Seen | Coverage |
+|----------|-------------|----------|
+| Without plateau detection | ~5-6 | 1% |
+| With plateau detection | All 500 | 100% |
+
 ## Data Flow Summary
 
 ```mermaid

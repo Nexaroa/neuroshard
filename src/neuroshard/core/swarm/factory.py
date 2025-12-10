@@ -1105,18 +1105,22 @@ class SwarmEnabledDynamicNode:
         """Forward pass - delegates to base node."""
         return self.base_node.forward(input_ids, **kwargs)
     
-    def _save_checkpoint(self):
+    def _save_checkpoint(self, async_save: bool = True):
         """
         Save checkpoint with swarm state.
         
         Syncs the swarm node's training counters to base node before saving.
+        
+        Args:
+            async_save: If True, save in background thread (default).
+                        If False, block until save completes (for shutdown).
         """
         # Sync training state to base node before saving
         self.base_node.total_training_rounds = self._total_training_rounds
         self.base_node.current_loss = self._current_loss
         
         # Delegate to base node's checkpoint saving
-        return self.base_node._save_checkpoint()
+        return self.base_node._save_checkpoint(async_save=async_save)
     
     def __getattr__(self, name):
         """Delegate unknown attributes to base node."""
