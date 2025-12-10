@@ -353,11 +353,11 @@ def calculate_layer_assignment(
     
     # TRAINING vs INFERENCE memory overhead
     # Training needs: forward activations + backward gradients + optimizer peak
-    # With gradient checkpointing, activations are reduced but still significant
+    # With gradient checkpointing (always on for >16 layers), activations are minimal
     if training_mode:
-        # Reserve 35% for training overhead (activations, gradients, optimizer peaks)
-        # This prevents OOM during training even with gradient checkpointing
-        training_overhead_ratio = 0.35
+        # Reserve 20% for training overhead (checkpointed activations, optimizer peaks)
+        # Reduced from 35% since gradient checkpointing is now always enabled
+        training_overhead_ratio = 0.20
     else:
         # Inference only needs 5% buffer
         training_overhead_ratio = 0.05

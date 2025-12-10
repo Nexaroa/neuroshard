@@ -2976,18 +2976,13 @@ class DynamicNeuroNode:
                 pass
             logger.debug(f"[VOCAB] Could not prefetch vocab size: {e}, using default {INITIAL_VOCAB_SIZE}")
         
-        # HEADROOM: Reserve extra capacity for vocab growth during this session
-        # Without headroom, we'd need to reduce layers mid-training (not supported)
-        # With 2x chunk headroom, we can absorb ~64K new tokens before issues
-        VOCAB_HEADROOM_CHUNKS = 2  # Reserve 2 × 32K = 64K tokens headroom
-        
+        # Round up to next chunk boundary (no headroom - recalculate if vocab grows)
+        # Previously used 64K headroom but this wastes ~1GB memory on limited devices
         vocab_capacity = ((vocab_size + VOCAB_GROWTH_CHUNK - 1) // VOCAB_GROWTH_CHUNK) * VOCAB_GROWTH_CHUNK
-        vocab_capacity += VOCAB_HEADROOM_CHUNKS * VOCAB_GROWTH_CHUNK
         
         # Update layer pool's vocab_capacity for accurate layer assignment
         self.layer_pool.vocab_capacity = vocab_capacity
-        logger.info(f"[VOCAB] Layer pool vocab_capacity set to {vocab_capacity:,} "
-                   f"(current: {vocab_size:,}, headroom: {VOCAB_HEADROOM_CHUNKS * VOCAB_GROWTH_CHUNK:,} for growth)")
+        logger.info(f"[VOCAB] Layer pool vocab_capacity set to {vocab_capacity:,} (current vocab: {vocab_size:,})")
     
     def _reconcile_architecture(self):
         """
