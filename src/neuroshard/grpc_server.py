@@ -819,12 +819,18 @@ def serve_grpc(port: int, model, p2p: P2PManager, swap_controller=None):
     
     # Server options for P2P network - be lenient with keepalive pings
     # This is critical for decentralized networks where nodes ping frequently
+    # IMPORTANT: Increase message size for activation tensors in pipeline training!
+    # Activation size = batch_size * seq_len * hidden_dim * 4 bytes
+    # For batch=4, seq=512, hidden=512: ~4MB, but we need headroom
+    MAX_MESSAGE_SIZE = 64 * 1024 * 1024  # 64MB for large batches/sequences
     options = [
         ('grpc.keepalive_time_ms', 10000),  # Send keepalive every 10s
         ('grpc.keepalive_timeout_ms', 5000),  # 5s timeout for response
         ('grpc.keepalive_permit_without_calls', True),  # Allow pings without active RPCs
         ('grpc.http2.min_recv_ping_interval_without_data_ms', 5000),  # Accept pings every 5s
         ('grpc.http2.max_ping_strikes', 0),  # Don't penalize frequent pings
+        ('grpc.max_receive_message_length', MAX_MESSAGE_SIZE),  # For receiving activations
+        ('grpc.max_send_message_length', MAX_MESSAGE_SIZE),  # For sending responses
     ]
     
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10), options=options)
