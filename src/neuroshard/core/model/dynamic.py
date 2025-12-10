@@ -269,41 +269,104 @@ class DynamicLayerPool:
             else:
                 safety_factor = 0.5  # CPU: increased from 0.3 (checkpointing reduces overhead)
             
-            # SMART DISTRIBUTED TRAINING with MIN_REPLICAS support:
-            # Ensures network has at least MIN_REPLICAS Drivers and Validators for:
-            # - Fault tolerance (if one dies, others continue)
-            # - Parallel training (multiple pipelines can run)
-            # - Load balancing (multiple nodes can serve inference)
+            # SMART DISTRIBUTED TRAINING DESIGN:
+            # Goal: Enable meaningful training for ANY network size
+            #
+            # KEY INSIGHT: When a "full node" exists (has embedding + LM head), 
+            # new nodes should NOT become Drivers (would create broken overlap).
+            # Instead, they should become WORKER+VALIDATOR to enable proper pipeline.
+            #
+            # Network States:
+            # 1. Empty network → First node becomes DRIVER, grows to full node
+            # 2. One full node exists → New node becomes WORKER+VALIDATOR (pipeline!)
+            # 3. Multiple partial nodes → Fill based on MIN_REPLICAS
+            
+            # CRITICAL FIX: Discover network state from DHT BEFORE making role decisions!
+            # Each node has its own LOCAL layer_pool, so we need DHT for network-wide view.
+            dht_layers = set()
+            if self.dht:
+                dht_layers = self._discover_network_layers_from_dht()
+                if dht_layers:
+                    # Update our view of network size
+                    highest_layer = max(dht_layers)
+                    if highest_layer >= self.current_num_layers:
+                        self.current_num_layers = highest_layer + 1
+                        logger.info(f"DHT discovery: network has {self.current_num_layers} layers")
             
             driver_count = len(self.layer_assignments.get(0, []))
             validator_layer = max(0, self.current_num_layers - 1) if self.current_num_layers > 0 else 0
             validator_count = len(self.layer_assignments.get(validator_layer, []))
             
-            # Check against MIN_REPLICAS (default=2 for redundancy)
-            needs_more_drivers = driver_count < self.MIN_REPLICAS
-            needs_more_validators = validator_count < self.MIN_REPLICAS
+            # CRITICAL: Check if a FULL NODE exists (via DHT, not local state!)
+            # A full node has BOTH layer 0 (embedding) AND last layer (LM head)
+            has_full_node = False
+            full_node_id = None
             
-            # ROLE ASSIGNMENT PRIORITY:
-            # 1. If network needs more Drivers → become Driver (need embedding)
-            # 2. If network needs more Validators → become Worker+Validator (need LM head)  
-            # 3. If both have MIN_REPLICAS → become Worker (provide layer redundancy)
+            # First check local assignments
+            if self.current_num_layers > 0:
+                layer_0_holders = {a.node_id for a in self.layer_assignments.get(0, [])}
+                last_layer_holders = {a.node_id for a in self.layer_assignments.get(validator_layer, [])}
+                full_node_ids = layer_0_holders & last_layer_holders  # Intersection
+                if full_node_ids:
+                    has_full_node = True
+                    full_node_id = next(iter(full_node_ids))
+                    logger.info(f"Full node detected (local): {full_node_id[:8]}... (has layers 0-{validator_layer})")
             
-            if needs_more_drivers:
-                # Network needs more Drivers for MIN_REPLICAS
-                role_hint = "DRIVER"
-                needs_embedding = True
-                logger.info(f"Network needs more Drivers ({driver_count}/{self.MIN_REPLICAS})")
-            elif needs_more_validators and self.current_num_layers > 1:
-                # Network needs more Validators for MIN_REPLICAS
-                # Become Worker+Validator: middle layers + last layer (LM head)
-                role_hint = "WORKER+VALIDATOR"
-                needs_embedding = False  # Don't need embedding, saves 4.5GB!
-                logger.info(f"Network needs more Validators ({validator_count}/{self.MIN_REPLICAS})")
+            # THEN check DHT - if both layer 0 AND last layer exist in DHT, a full node likely exists
+            if not has_full_node and dht_layers:
+                if 0 in dht_layers and validator_layer in dht_layers:
+                    # Both embedding and LM head layers exist in network
+                    # This means at least one node has them (possibly same node = full node)
+                    has_full_node = True
+                    full_node_id = "unknown_from_dht"  # We don't know the exact node_id
+                    logger.info(f"Full node detected (DHT): network has layers 0-{validator_layer}")
+            
+            # ROLE ASSIGNMENT PRIORITY (redesigned for proper distributed training):
+            # 
+            # If NO full node exists:
+            #   1. First node → DRIVER (will grow to full node)
+            #   2. Additional nodes → fill based on MIN_REPLICAS
+            #
+            # If a FULL NODE exists:
+            #   - DON'T create another Driver (would overlap and break training!)
+            #   - New nodes become WORKER+VALIDATOR for proper pipeline
+            #   - This creates: FullNode[0-N] → NewNode[N+1 to Last] pipeline
+            
+            if has_full_node:
+                # A full node exists - new nodes should NOT overlap with it
+                # Become WORKER+VALIDATOR to enable pipeline training!
+                if node_id == full_node_id:
+                    # This IS the full node re-registering
+                    role_hint = "DRIVER"  # Keep as driver (already full)
+                    needs_embedding = True
+                    logger.info(f"This is the full node - keeping as DRIVER")
+                else:
+                    # New node joining a network with a full node
+                    # Become WORKER+VALIDATOR: get last layer + work backwards
+                    # This enables pipeline: FullNode[embedding→layers] → Us[layers→LM_head]
+                    role_hint = "WORKER+VALIDATOR"
+                    needs_embedding = False  # Don't need embedding, saves memory!
+                    logger.info(f"Full node exists - becoming WORKER+VALIDATOR for pipeline training")
             else:
-                # Network has enough of both → become Worker for layer redundancy
-                role_hint = "WORKER"
-                needs_embedding = False
-                logger.info(f"Network has enough Drivers ({driver_count}) and Validators ({validator_count})")
+                # No full node - use standard role assignment
+                needs_more_drivers = driver_count < self.MIN_REPLICAS
+                needs_more_validators = validator_count < self.MIN_REPLICAS
+                
+                if needs_more_drivers:
+                    # Network needs more Drivers for MIN_REPLICAS
+                    role_hint = "DRIVER"
+                    needs_embedding = True
+                    logger.info(f"Network needs more Drivers ({driver_count}/{self.MIN_REPLICAS})")
+                elif needs_more_validators and self.current_num_layers > 1:
+                    # Network needs more Validators for MIN_REPLICAS
+                    role_hint = "WORKER+VALIDATOR"
+                    needs_embedding = False
+                    logger.info(f"Network needs more Validators ({validator_count}/{self.MIN_REPLICAS})")
+                else:
+                    # Network has enough of both → become Worker for layer redundancy
+                    role_hint = "WORKER"
+                    needs_embedding = False
+                    logger.info(f"Network has enough Drivers ({driver_count}) and Validators ({validator_count})")
             
             max_layers_for_node = calculate_layer_assignment(
                 available_memory_mb,
@@ -429,17 +492,8 @@ class DynamicLayerPool:
             # 4. Calculate remaining capacity
             remaining_capacity = max_layers_for_node - len(assigned_layers)
             
-            # 5. DECENTRALIZED: Query DHT for existing layers before growing
-            # This prevents overlap when multiple nodes start simultaneously
-            if self.dht and remaining_capacity > 0:
-                dht_layers = self._discover_network_layers_from_dht()
-                if dht_layers:
-                    # Other nodes exist! Start from after the highest known layer
-                    highest_known = max(dht_layers)
-                    if highest_known >= self.current_num_layers:
-                        self.current_num_layers = highest_known + 1
-                        logger.info(f"DHT discovery: network has {highest_known + 1} layers, "
-                                   f"will grow from layer {self.current_num_layers}")
+            # 5. DHT layer discovery already done above (at role assignment)
+            # dht_layers variable is already populated
             
             # 6. If we still have capacity, grow the model
             if remaining_capacity > 0:
@@ -2247,7 +2301,13 @@ class DynamicNeuroNode:
                 del self.training_context[s]
         
         # If we are the Validator (Last Layer holder)
-        if self.model.has_lm_head:
+        # DYNAMIC CHECK: Query layer_pool for current lm_head_holder
+        # This handles the case where a new Validator joined and took over
+        is_current_validator = self.model.has_lm_head
+        if hasattr(self, 'layer_pool') and self.layer_pool:
+            is_current_validator = (self.layer_pool.lm_head_holder == self.node_id)
+        
+        if is_current_validator:
             logits = self.model.compute_logits(output)
             
             # Calculate Loss if labels present
@@ -2365,7 +2425,8 @@ class DynamicNeuroNode:
             
         # Call peer - Send input_ids to Layer 0 holder
         # The receiver's forward_pipeline will detect it's input_ids and run embed()
-        return self._forward_to_peer(peer_url, input_ids, 0)
+        result, _ = self._forward_to_peer(peer_url, input_ids, 0)
+        return result
     
     def _forward_to_peer(self, peer_url: str, hidden: torch.Tensor, layer_id: int, labels: Optional[torch.Tensor] = None, session_id: str = None) -> torch.Tensor:
         """
@@ -2459,11 +2520,11 @@ class DynamicNeuroNode:
                             logger.debug(f"[AUDIT] Stored checksum for layer {layer_id} in session")
                             break
             
-            return result.to(self.device)
+            return result.to(self.device), None
             
         except Exception as e:
             logger.error(f"Failed to forward to peer {peer_url}: {e}")
-            return hidden
+            return hidden, None
 
     def _backward_to_peer(self, peer_url: str, grad_output: torch.Tensor, layer_id: int, session_id: str):
         """Send gradients back to the previous peer."""
@@ -2686,7 +2747,13 @@ class DynamicNeuroNode:
         
         try:
             # SINGLE-NODE OPTIMIZATION: Check if we're a full node (Driver + Worker + Validator)
-            is_full_node = self.model.has_embedding and self.model.has_lm_head
+            # DYNAMIC CHECK: Use layer_pool to get current lm_head_holder
+            # This handles the case where a new Validator joined and took over the LM head
+            am_current_validator = self.model.has_lm_head
+            if hasattr(self, 'layer_pool') and self.layer_pool:
+                am_current_validator = (self.layer_pool.lm_head_holder == self.node_id)
+            
+            is_full_node = self.model.has_embedding and am_current_validator
             
             if self.model.has_embedding:
                 # I am a Driver (Layer 0)
@@ -2774,7 +2841,7 @@ class DynamicNeuroNode:
                             "timestamp": time.time()
                         }
                         
-                        self._forward_to_peer(
+                        result, _ = self._forward_to_peer(
                             next_hop, 
                             output, 
                             next_layer, 
@@ -2782,10 +2849,22 @@ class DynamicNeuroNode:
                             session_id=session_id
                         )
                         
+                        # Check if forward succeeded (result should be different from output if it was processed)
+                        # If the peer rejected or failed, result will be the original output (unchanged)
+                        forward_succeeded = result is not output
+                        
+                        if not forward_succeeded:
+                            # Pipeline forward failed - peer rejected or error
+                            # Clean up the training context
+                            if session_id in self.training_context:
+                                del self.training_context[session_id]
+                            logger.warning(f"[DISTRIBUTED] Pipeline forward failed - skipping training step")
+                            return None
+                        
                         # We don't get loss immediately in distributed pipeline
                         # It comes back later via backward pass or status update
-                        # For now, return None or previous loss
-                        return self.current_loss
+                        # For now, return None (not inf!)
+                        return None
                 
                 return None
                 

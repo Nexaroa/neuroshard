@@ -648,7 +648,13 @@ class SwarmEnabledDynamicNode:
             self._init_global_tracker()
         
         # Check if we can do LOCAL training (need embedding + LM head)
-        is_full_node = self.model.has_embedding and self.model.has_lm_head
+        # DYNAMIC CHECK: Use layer_pool to get CURRENT lm_head_holder
+        # This handles the case where a new Validator joined and took over the LM head
+        am_current_validator = self.model.has_lm_head
+        if hasattr(self.base_node, 'layer_pool') and self.base_node.layer_pool:
+            am_current_validator = (self.base_node.layer_pool.lm_head_holder == self.base_node.node_id)
+        
+        is_full_node = self.model.has_embedding and am_current_validator
         
         if not self.model.has_embedding:
             # WORKER: No embedding = wait for activations via gRPC
@@ -657,6 +663,7 @@ class SwarmEnabledDynamicNode:
         
         if not is_full_node:
             # DISTRIBUTED TRAINING: Has embedding but no LM head
+            # OR: We WERE a full node but new Validator took over → use pipeline!
             # Use pipeline training - forward to Validator, receive gradients back
             return self.base_node.train_step()
         
