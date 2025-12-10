@@ -323,12 +323,19 @@ class DynamicLayerPool:
                     full_node_id = next(iter(full_node_ids))
                     logger.info(f"Full node detected (local): {full_node_id[:8]}... (has layers 0-{validator_layer})")
             
-            # Also check DHT - if both layer 0 AND last layer exist, a full node likely exists
+            # Also check DHT - if layer 0 exists and layers are contiguous, a full node likely exists
+            # NOTE: We check against the highest DISCOVERED layer, not the theoretical network size
+            # because a node holding 0-5 out of 11 layers IS a full node for training purposes
             if not has_full_node and dht_layers:
-                if 0 in dht_layers and validator_layer in dht_layers:
-                    has_full_node = True
-                    full_node_id = "unknown_from_dht"
-                    logger.info(f"Full node detected (DHT): network has layers 0-{validator_layer}")
+                if 0 in dht_layers:
+                    highest_dht_layer = max(dht_layers)
+                    # Check for contiguous layers from 0 to highest - this indicates a full node
+                    # (A full node holds embedding [layer 0] through LM head [its highest layer])
+                    expected_layers = set(range(0, highest_dht_layer + 1))
+                    if dht_layers == expected_layers or len(dht_layers) == highest_dht_layer + 1:
+                        has_full_node = True
+                        full_node_id = "unknown_from_dht"
+                        logger.info(f"Full node detected (DHT): network has contiguous layers 0-{highest_dht_layer}")
             
             # ROLE ASSIGNMENT PRIORITY (redesigned for proper distributed training):
             # 
@@ -460,18 +467,31 @@ class DynamicLayerPool:
             # 2. DISTRIBUTED LAYER ASSIGNMENT
             # Based on role, fill appropriate layers for pipeline parallelism
             is_driver = 0 in assigned_layers
-            last_layer = max(0, self.current_num_layers - 1)
+            
+            # CRITICAL FOR SCALABILITY: Use ACTUAL highest layer (from DHT), not theoretical network size!
+            # This ensures new nodes join at the ACTUAL frontier, not a gap.
+            # Example: If Jetson has 0-5 and network is "11 layers", EC2 should get layer 5 (overlap),
+            #          NOT layer 10 (which would create a gap 6-9 with no holders!)
+            if dht_layers:
+                actual_last_layer = max(dht_layers)  # Highest layer actually held by any node
+            else:
+                actual_last_layer = max(0, self.current_num_layers - 1)
+            
+            # For WORKER+VALIDATOR, use the actual last layer for LM head assignment
+            last_layer = actual_last_layer if role_hint == "WORKER+VALIDATOR" else max(0, self.current_num_layers - 1)
             
             if role_hint == "WORKER+VALIDATOR":
-                # CRITICAL: Assign LAST layer FIRST (for LM head) to ensure we can compute loss
+                # CRITICAL: Assign the ACTUAL last layer FIRST (for LM head) to ensure we can compute loss
+                # This creates REDUNDANCY: both original full node and new node hold the last layer
                 if len(assigned_layers) < max_layers_for_node:
                     if last_layer not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[last_layer]):
                         self._assign_layer(last_layer, node_id, node_url, grpc_addr)
                         assigned_layers.append(last_layer)
-                        logger.info(f"Node {node_id[:8]}... assigned last layer {last_layer} (Validator role)")
+                        logger.info(f"Node {node_id[:8]}... assigned layer {last_layer} (Validator role - overlaps with full node)")
                 
                 # Then fill middle layers from the END (closer to Validator)
-                # This creates contiguous layer ranges: Driver has 0-N, Validator has M-31
+                # This creates OVERLAPPING coverage for fault tolerance:
+                # FullNode[0-5] + NewNode[5,4,3,2,1] → Both can train independently!
                 for layer_id in range(last_layer - 1, 0, -1):  # Reverse order, skip layer 0
                     if len(assigned_layers) >= max_layers_for_node:
                         break
