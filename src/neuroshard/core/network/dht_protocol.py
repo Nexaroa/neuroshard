@@ -202,11 +202,28 @@ class DHTProtocol:
         Value is our connection info.
         """
         import hashlib
+        import json
         # Hash the key string to get the 160-bit Key ID
         key_id = int(hashlib.sha1(key_string.encode()).hexdigest(), 16)
         value = f"{self.local_node.ip}:{self.local_node.port}"
         
-        # Find K closest nodes to the KEY ID
+        # CRITICAL: ALWAYS store locally so other nodes can find us!
+        # When we're a solo node, we ARE the closest node to any key.
+        # Without local storage, DHT lookups will fail.
+        try:
+            # Store as list to support multiple holders
+            existing = self.storage.get(key_id)
+            if existing:
+                holders = json.loads(existing)
+                if value not in holders:
+                    holders.append(value)
+            else:
+                holders = [value]
+            self.storage[key_id] = json.dumps(holders)
+        except Exception as e:
+            logger.debug(f"Local DHT storage failed: {e}")
+        
+        # Find K closest nodes to the KEY ID (for replication to other nodes)
         nodes = self.lookup_node(key_id)
         
         store_count = 0
