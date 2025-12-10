@@ -71,8 +71,14 @@ The tokenizer learns common byte pairs from training data:
 ### Learning Algorithm
 
 ```python
-def learn_merges(texts: List[str], num_merges: int = 31734):
-    """Learn BPE merges from training data."""
+def learn_merges(texts: List[str], num_merges: int = 100000):
+    """
+    Learn BPE merges from training data.
+    
+    Each data source contributes ~100K merges for rich vocabulary.
+    With 10M vocab capacity, the network can grow to support
+    millions of unique tokens across all languages and domains.
+    """
     
     # Count all byte pairs in corpus
     pair_counts = Counter()
@@ -178,16 +184,21 @@ graph TD
         Base["Byte tokens only<br/>No merges"]
     end
     
-    subgraph T1["After FineWeb-Edu (2,771 vocab)"]
-        FW["2,505 merges learned<br/>English-focused"]
+    subgraph T1["Early Stage (~30K vocab)"]
+        FW["First sources contribute<br/>100K merges each"]
     end
     
-    subgraph T2["After All Sources (~32K vocab)"]
-        Full["31,734 merges<br/>Multi-domain coverage"]
+    subgraph T2["Growing (100K+ vocab)"]
+        Growing["Multiple sources<br/>Rich multi-domain"]
+    end
+    
+    subgraph T3["Unlimited Growth"]
+        Full["Millions of tokens<br/>All languages & domains"]
     end
     
     T0 --> T1
     T1 --> T2
+    T2 --> T3
 ```
 
 ### How Vocabulary Grows
@@ -217,11 +228,11 @@ https://dwquwt9gkkeil.cloudfront.net/tokenizer.json
 
 ```json
 {
-  "vocab_size": 32000,
-  "next_merge_id": 2771,
+  "vocab_size": 10000000,
+  "next_merge_id": 126711,
   "merges": {
-    "[116, 104]": 266,
-    "[105, 110]": 267,
+    "116_104": 266,
+    "105_110": 267,
     ...
   },
   "merge_to_tokens": {
@@ -230,13 +241,17 @@ https://dwquwt9gkkeil.cloudfront.net/tokenizer.json
     ...
   },
   "sources_contributed": {
-    "fineweb-edu": {
-      "merges_added": 2505,
-      "timestamp": 1733781600
-    }
+    "fineweb-edu": 100000,
+    "fineweb": 100000,
+    "redpajama": 100000,
+    "c4": 100000
   }
 }
 ```
+
+::: info Unlimited Vocabulary
+The `vocab_size` of 10M is effectively unlimited. Each data source contributes ~100K merges, and the vocabulary grows continuously as more sources and domains are added.
+:::
 
 ## Training Node Integration
 
@@ -306,11 +321,16 @@ BPE achieves significant compression over byte-level encoding:
 | Metric | Value |
 |--------|-------|
 | Base vocabulary | 266 tokens (bytes + special) |
-| Learned merges | 2,505 |
-| Current vocab | 2,771 |
-| Max vocabulary | **Unlimited** (grows with network) |
-| Sources processed | fineweb-edu |
-| Pending sources | fineweb, redpajama, slimpajama, c4 |
+| Current vocab | **Growing** (check CDN for latest) |
+| Max vocabulary | **10M** (effectively unlimited) |
+| Allocation per source | ~100K merges each |
+| Auto-update interval | 10 minutes |
+
+::: tip Check Live Status
+```bash
+curl -s https://dwquwt9gkkeil.cloudfront.net/tokenizer.json | jq '{vocab_size, next_merge_id, sources: .sources_contributed}'
+```
+:::
 
 ## Dynamic Vocabulary Growth
 
@@ -354,9 +374,9 @@ tokens = tokenizer.encode("Hello, world!")
 text = tokenizer.decode(tokens)
 
 # Check vocabulary size
-print(tokenizer.current_vocab_size)  # 2771
-print(tokenizer.vocab_size)          # 32000 (max)
-print(len(tokenizer.merges))         # 2505
+print(tokenizer.current_vocab_size)  # Dynamic - grows over time
+print(tokenizer.vocab_size)          # 10000000 (unlimited)
+print(len(tokenizer.merges))         # Grows as sources contribute
 ```
 
 ## Next Steps

@@ -58,7 +58,7 @@ class NeuroLLMConfig:
     phase: NeuroLLMPhase = NeuroLLMPhase.BOOTSTRAP
     
     # Architecture - Bootstrap phase (125M params)
-    vocab_size: int = 32000          # NeuroLLM BPE vocabulary (grows with network)
+    vocab_size: int = 32000          # Initial vocab - auto-expands to unlimited as tokenizer learns
     hidden_dim: int = 768            # Hidden dimension
     num_layers: int = 12             # Transformer layers
     num_heads: int = 12              # Attention heads

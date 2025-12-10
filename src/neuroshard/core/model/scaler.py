@@ -27,7 +27,7 @@ class ModelArchitecture:
     num_layers: int
     num_heads: int
     num_kv_heads: int
-    vocab_size: int = 32000  # Can be upgraded via tokenizer_registry (32k → 64k → 100k)
+    vocab_size: int = 32000  # Initial size - expands automatically as tokenizer grows (unlimited)
     max_seq_len: int = 2048
     dropout: float = 0.0
     rope_theta: float = 10000.0

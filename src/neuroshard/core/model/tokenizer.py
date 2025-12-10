@@ -119,7 +119,7 @@ class NeuroTokenizer:
         This grows as the tokenizer learns BPE merges:
         - Initial: 266 (10 special + 256 bytes)
         - After learning: 266 + num_merges
-        - Maximum: vocab_size (32000)
+        - Maximum: vocab_size (10M default - effectively unlimited)
         
         IMPORTANT: During inference, only tokens 0 to current_vocab_size-1 are valid.
         Tokens beyond this have no learned representation and should not be sampled.
@@ -507,7 +507,7 @@ class NeuroTokenizer:
         with open(path) as f:
             config = json.load(f)
         
-        tokenizer = cls(vocab_size=config.get("vocab_size", 32000))
+        tokenizer = cls(vocab_size=config.get("vocab_size", 10_000_000))  # Default to unlimited
         tokenizer.next_merge_id = config.get("next_merge_id", cls.MERGE_OFFSET)
         tokenizer.total_tokens_processed = config.get("total_tokens_processed", 0)
         tokenizer.sources_contributed = config.get("sources_contributed", {})
