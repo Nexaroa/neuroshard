@@ -2316,9 +2316,17 @@ def run_node(
     
     my_url = f"http://{ip_addr}:{final_announce_port}"
     
-    # For dynamic model, shard_range is just a marker
-    shard_range = f"dynamic-{len(NEURO_NODE.my_layer_ids)}-layers"
+    # Shard range in "start-end" format for P2PManager to announce all layers
+    # This enables distributed training pipeline routing!
+    layer_ids = NEURO_NODE.my_layer_ids
+    if layer_ids:
+        start_layer = min(layer_ids)
+        end_layer = max(layer_ids)
+        shard_range = f"{start_layer}-{end_layer}"
+    else:
+        shard_range = "0-0"
     STATE["shard_range"] = shard_range
+    logger.info(f"P2P shard_range: {shard_range} (layers {layer_ids})")
     
     # Set node role info for PoNW reward calculation
     STATE["assigned_layers"] = NEURO_NODE.my_layer_ids
