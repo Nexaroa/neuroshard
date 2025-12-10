@@ -259,14 +259,15 @@ class DynamicLayerPool:
             
             # Calculate how many layers this node can hold
             # Uses current architecture's dimensions (dynamic!)
-            # DEVICE-AWARE: CPU needs more conservative factor due to higher memory overhead
+            # DEVICE-AWARE safety factors
+            # With gradient checkpointing always enabled, CPU can use higher factor
             device_type = getattr(self, '_device_hint', 'cpu')
             if device_type == 'cuda':
                 safety_factor = 0.6  # GPU: efficient memory usage
             elif device_type == 'mps':
                 safety_factor = 0.5  # Apple Silicon: moderate overhead
             else:
-                safety_factor = 0.3  # CPU: high overhead (no VRAM, PyTorch CPU allocator)
+                safety_factor = 0.5  # CPU: increased from 0.3 (checkpointing reduces overhead)
             
             max_layers_for_node = calculate_layer_assignment(
                 available_memory_mb,
