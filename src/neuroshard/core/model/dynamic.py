@@ -272,10 +272,11 @@ class DynamicLayerPool:
                 available_memory_mb,
                 self.current_architecture,
                 safety_factor=safety_factor,
-                vocab_capacity=self.vocab_capacity
+                vocab_capacity=self.vocab_capacity,
+                training_mode=True  # Always assume training (conservative - prevents OOM)
             )
             logger.info(f"Layer calculation: {available_memory_mb:.0f}MB × {safety_factor} safety = {max_layers_for_node} layers "
-                       f"(device={device_type}, vocab={self.vocab_capacity:,})")
+                       f"(device={device_type}, vocab={self.vocab_capacity:,}, training_overhead=35%)")
             
             # SCALABILITY: Apply MAX_LAYERS_PER_NODE cap in large networks
             # This prevents single nodes from hogging all layers and ensures
@@ -367,6 +368,22 @@ class DynamicLayerPool:
             
             # 6. If we still have capacity, grow the model
             if remaining_capacity > 0:
+                # CAP MODEL GROWTH for solo/early network as safety net
+                # The training_overhead calculation should handle this, but this is a fallback
+                # 64 layers is plenty for a single node (~300M params with 512 hidden)
+                MAX_SOLO_LAYERS = 64  # Safety cap for solo node training
+                total_nodes = len(set(
+                    a.node_id for assignments in self.layer_assignments.values() 
+                    for a in assignments
+                ))
+                
+                if total_nodes <= 2:  # Solo or near-solo mode
+                    max_growth = max(0, MAX_SOLO_LAYERS - len(assigned_layers))
+                    if remaining_capacity > max_growth:
+                        logger.warning(f"[SOLO MODE] Capping growth from {remaining_capacity} to {max_growth} layers "
+                                      f"(MAX_SOLO_LAYERS={MAX_SOLO_LAYERS} prevents OOM)")
+                        remaining_capacity = max_growth
+                
                 # Add new layers to grow the model
                 new_layers = self._grow_model(remaining_capacity, node_id, node_url, grpc_addr)
                 assigned_layers.extend(new_layers)
@@ -3067,7 +3084,8 @@ class DynamicNeuroNode:
                 vocab_cap = getattr(self.layer_pool, 'vocab_capacity', INITIAL_VOCAB_SIZE)
                 max_layers = calculate_layer_assignment(
                     self.available_memory_mb, saved_arch, 
-                    safety_factor=0.6, vocab_capacity=vocab_cap
+                    safety_factor=0.6, vocab_capacity=vocab_cap,
+                    training_mode=True  # Conservative for training
                 )
                 logger.warning(f"⚠️ Saved checkpoint has {actual_saved_layers} layers ({saved_memory:.0f}MB) "
                               f"but you only have {self.available_memory_mb:.0f}MB")

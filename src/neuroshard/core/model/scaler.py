@@ -320,7 +320,9 @@ def calculate_layer_assignment(
     available_memory_mb: float,
     arch: ModelArchitecture,
     safety_factor: float = 0.6,
-    vocab_capacity: int = 32000
+    vocab_capacity: int = 32000,
+    training_mode: bool = True,
+    needs_embedding: bool = True
 ) -> int:
     """
     Calculate how many layers a node can hold.
@@ -328,8 +330,11 @@ def calculate_layer_assignment(
     Args:
         available_memory_mb: Node's available memory
         arch: Current network architecture
-        safety_factor: Use only 60% of memory for safety
+        safety_factor: Use only 60% of memory for safety (GPU) or 30% (CPU)
         vocab_capacity: Current vocab capacity for embedding/LM head (dynamic!)
+        training_mode: If True, reserve more memory for gradients/optimizer
+        needs_embedding: If True, reserve memory for embedding/LM head (Driver/Validator only!)
+                        Workers (middle layers) don't need embedding and can hold MORE layers!
     
     Returns:
         Number of layers this node can hold
@@ -339,17 +344,44 @@ def calculate_layer_assignment(
     
     # DYNAMIC: Calculate actual embedding/LM head memory based on vocab capacity
     # This is critical for dynamic vocabulary - as vocab grows, less memory for layers!
-    embedding_memory = estimate_embedding_memory_mb(arch.hidden_dim, vocab_capacity)
+    # NOTE: Only Drivers (Layer 0) and Validators (Last Layer) need embedding memory!
+    # Workers (middle layers) skip this and can hold MORE layers!
+    if needs_embedding:
+        embedding_memory = estimate_embedding_memory_mb(arch.hidden_dim, vocab_capacity)
+    else:
+        embedding_memory = 0  # Workers don't need embedding/LM head!
     
-    # Reserve memory for embedding, LM head, plus 5% buffer for activations
-    activation_buffer = usable_memory * 0.05
-    usable_for_layers = usable_memory - embedding_memory - activation_buffer
+    # TRAINING vs INFERENCE memory overhead
+    # Training needs: forward activations + backward gradients + optimizer peak
+    # With gradient checkpointing, activations are reduced but still significant
+    if training_mode:
+        # Reserve 35% for training overhead (activations, gradients, optimizer peaks)
+        # This prevents OOM during training even with gradient checkpointing
+        training_overhead_ratio = 0.35
+    else:
+        # Inference only needs 5% buffer
+        training_overhead_ratio = 0.05
+    
+    training_overhead = usable_memory * training_overhead_ratio
+    usable_for_layers = usable_memory - embedding_memory - training_overhead
     
     if usable_for_layers <= 0:
         # Not enough memory even for embedding - return minimum
+        logger.warning(f"[MEMORY] Very limited memory: {usable_memory:.0f}MB usable, "
+                      f"{embedding_memory:.0f}MB for vocab, {training_overhead:.0f}MB overhead")
         return 1
     
     max_layers = max(1, int(usable_for_layers / memory_per_layer))
+    
+    # Log the calculation for transparency
+    role = "Driver/Validator" if needs_embedding else "Worker"
+    logger.debug(f"[MEMORY] Layer calc ({role}): {available_memory_mb:.0f}MB × {safety_factor} = {usable_memory:.0f}MB usable")
+    if needs_embedding:
+        logger.debug(f"[MEMORY]   - Embedding ({vocab_capacity:,} vocab): {embedding_memory:.0f}MB")
+    else:
+        logger.debug(f"[MEMORY]   - No embedding needed (Worker)")
+    logger.debug(f"[MEMORY]   - Training overhead ({training_overhead_ratio*100:.0f}%): {training_overhead:.0f}MB")
+    logger.debug(f"[MEMORY]   - Available for layers: {usable_for_layers:.0f}MB → {max_layers} layers")
     
     return max_layers
 
