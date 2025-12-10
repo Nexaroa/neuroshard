@@ -1859,15 +1859,23 @@ class DynamicNeuroNode:
         # Key insight: Attention scores = batch × heads × seq² × layers × 4 bytes
         # With 46 layers, 16 heads, 2048 seq, batch 8 → ~98GB without checkpointing!
         
+        # Get architecture from model or layer_pool
+        arch = None
+        if hasattr(self, 'model') and self.model and hasattr(self.model, 'architecture'):
+            arch = self.model.architecture
+        elif hasattr(self, 'layer_pool') and self.layer_pool and hasattr(self.layer_pool, 'current_architecture'):
+            arch = self.layer_pool.current_architecture
+        
         # Calculate attention memory estimate (the real OOM culprit)
         batch_estimate = 8  # Typical batch size
         seq_len = 2048
-        num_heads = self.architecture.num_heads if self.architecture else 16
+        num_heads = arch.num_heads if arch else 16
+        hidden_dim = arch.hidden_dim if arch else 512
         attn_memory_gb = (batch_estimate * num_heads * seq_len * seq_len * num_layers * 4) / (1024**3)
         
         # Also consider vocab size - large vocab means less memory for activations
         vocab_size = getattr(self, 'vocab_capacity', 32000)
-        vocab_memory_gb = (2 * vocab_size * (self.architecture.hidden_dim if self.architecture else 512) * 16) / (1024**3)
+        vocab_memory_gb = (2 * vocab_size * hidden_dim * 16) / (1024**3)
         
         # Total activation memory estimate
         total_activation_memory_gb = attn_memory_gb + vocab_memory_gb
@@ -2004,12 +2012,19 @@ class DynamicNeuroNode:
         old_checkpointing = getattr(self, '_use_gradient_checkpointing', False)
         
         # Recalculate checkpointing based on actual memory needs
+        arch = None
+        if hasattr(self, 'model') and self.model and hasattr(self.model, 'architecture'):
+            arch = self.model.architecture
+        elif hasattr(self, 'layer_pool') and self.layer_pool and hasattr(self.layer_pool, 'current_architecture'):
+            arch = self.layer_pool.current_architecture
+            
         batch_estimate = 8
         seq_len = 2048
-        num_heads = self.architecture.num_heads if self.architecture else 16
+        num_heads = arch.num_heads if arch else 16
+        hidden_dim = arch.hidden_dim if arch else 512
         attn_memory_gb = (batch_estimate * num_heads * seq_len * seq_len * num_layers * 4) / (1024**3)
         vocab_size = getattr(self, 'vocab_capacity', 32000)
-        vocab_memory_gb = (2 * vocab_size * (self.architecture.hidden_dim if self.architecture else 512) * 16) / (1024**3)
+        vocab_memory_gb = (2 * vocab_size * hidden_dim * 16) / (1024**3)
         available_gb = self.available_memory_mb / 1024
         
         need_checkpointing = (attn_memory_gb + vocab_memory_gb) > (available_gb * 0.5)
