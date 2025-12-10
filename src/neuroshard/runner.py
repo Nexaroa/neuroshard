@@ -2813,6 +2813,20 @@ def run_node(
                     if removed > 0:
                         logger.info(f"[LAYER_POOL] Cleaned up {removed} stale layer assignments")
             
+            # TOKENIZER AUTO-REFRESH: Check for vocab updates every 10 minutes
+            # Synced with MANIFEST_REFRESH_INTERVAL (600s) in GenesisDataLoader
+            # This ensures model embedding expands when tokenizer grows
+            if int(now) % 600 == 0:  # Every 10 minutes (matches data loader refresh)
+                try:
+                    if hasattr(NEURO_NODE, '_load_learned_tokenizer'):
+                        old_vocab = NEURO_NODE.tokenizer.current_vocab_size if NEURO_NODE.tokenizer else 0
+                        NEURO_NODE._load_learned_tokenizer()
+                        new_vocab = NEURO_NODE.tokenizer.current_vocab_size if NEURO_NODE.tokenizer else 0
+                        if new_vocab > old_vocab:
+                            logger.info(f"[TOKENIZER] Vocab updated: {old_vocab:,} → {new_vocab:,} tokens")
+                except Exception as e:
+                    logger.debug(f"[TOKENIZER] Refresh check failed: {e}")
+            
             # RESOURCE-AWARE SLEEP: Adjust based on system load
             # This ensures we're a good citizen when running in the background
             try:
