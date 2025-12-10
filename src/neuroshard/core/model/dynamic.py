@@ -336,23 +336,35 @@ class DynamicLayerPool:
                     highest_layer = max(dht_layers)
                     num_dht_layers = len(dht_layers)
                     
-                    # AGGRESSIVE STALE DETECTION:
+                    # SCALABLE STALE DETECTION:
                     # DHT entries persist until TTL expires, so we may see old announcements.
-                    # Be very conservative: if DHT shows way more layers than reasonable, it's stale.
-                    max_reasonable = max(32, self.current_num_layers * 2)
+                    # Use NETWORK ARCHITECTURE as ground truth - it's synced across all nodes.
+                    #
+                    # Heuristic: If DHT shows > 3x the architecture's layer count, it's stale.
+                    # This scales properly:
+                    #   - Small network (11L arch): >33 layers = stale
+                    #   - Medium network (100L arch): >300 layers = stale  
+                    #   - Large network (1000L arch): >3000 layers = stale
+                    #
+                    # The 3x factor accounts for:
+                    #   - Dynamic model growth (can exceed base architecture)
+                    #   - But not ridiculously so (stale data from crashed nodes)
                     
-                    # Case 1: DHT has WAY too many layers (stale from previous larger run)
-                    if num_dht_layers > 32 or highest_layer > 32:
+                    arch_layers = self.current_architecture.num_layers if self.current_architecture else 11
+                    max_reasonable = max(arch_layers * 3, 32)  # At least 32, or 3x architecture
+                    
+                    if highest_layer >= max_reasonable:
                         logger.warning(f"DHT shows {num_dht_layers} layers (highest={highest_layer}) - likely stale")
-                        logger.warning(f"Clearing stale DHT data (max_reasonable={max_reasonable})")
+                        logger.warning(f"Expected max ~{max_reasonable} based on {arch_layers}L architecture")
+                        logger.warning(f"Clearing stale DHT data - will discover fresh from live peers")
                         dht_layers = set()
                         dht_is_stale = True
-                    # Case 2: Reasonable layer count, accept it
-                    elif highest_layer >= self.current_num_layers and highest_layer < max_reasonable:
+                    elif highest_layer >= self.current_num_layers:
+                        # DHT shows more layers than we knew about - accept and update
                         self.current_num_layers = highest_layer + 1
-                        logger.info(f"DHT discovery: network has {self.current_num_layers} layers")
-                    # Case 3: Fewer layers than expected (normal for small network)
+                        logger.info(f"DHT discovery: network has {self.current_num_layers} layers (arch={arch_layers}L)")
                     else:
+                        # DHT shows fewer or equal layers - accept as-is
                         logger.info(f"DHT shows {num_dht_layers} layers (0-{highest_layer}), accepting")
                 else:
                     logger.info("DHT: No existing layers found - this may be first node or peers not yet discovered")
