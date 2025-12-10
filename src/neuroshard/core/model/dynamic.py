@@ -181,13 +181,21 @@ class DynamicLayerPool:
         """
         Get checkpoint path for a node (used to check if node was previously DRIVER).
         
-        Uses wallet_id (first 16 chars of node_id hash) for stable paths.
+        Uses _wallet_id if set (passed from DynamicNeuroNode), otherwise falls back
+        to node_id-based lookup.
         """
-        import hashlib
-        # Mirror the wallet_id calculation from DynamicNeuroNode
-        wallet_id = hashlib.sha256(node_id.encode()).hexdigest()[:16]
+        # First, use the ACTUAL wallet_id if we have it (set by DynamicNeuroNode)
+        # This is the correct path since checkpoints are saved with wallet_id
+        if hasattr(self, '_wallet_id') and self._wallet_id:
+            path = self.CHECKPOINT_DIR / f"dynamic_node_{self._wallet_id}.pt"
+            if path.exists():
+                return path
         
-        path = self.CHECKPOINT_DIR / f"dynamic_node_{wallet_id}.pt"
+        # Fallback: try node_id-based paths (less accurate but better than nothing)
+        import hashlib
+        wallet_id_from_node = hashlib.sha256(node_id.encode()).hexdigest()[:16]
+        
+        path = self.CHECKPOINT_DIR / f"dynamic_node_{wallet_id_from_node}.pt"
         if path.exists():
             return path
             
@@ -1985,6 +1993,9 @@ class DynamicNeuroNode:
         
         # Pass device hint for memory calculations (CPU needs more conservative limits)
         self.layer_pool._device_hint = self.device
+        
+        # Pass wallet_id so layer_pool can find our checkpoint for role decisions
+        self.layer_pool._wallet_id = self.wallet_id
         
         # 1b. SMART ARCHITECTURE RECONCILIATION
         # This handles the case where the network has evolved while we were offline
