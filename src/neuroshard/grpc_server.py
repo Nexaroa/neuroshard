@@ -395,25 +395,32 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 dtype = np.float32
             
             hidden_states = torch.from_numpy(
-                np.frombuffer(request.hidden_states, dtype=dtype)
+                np.frombuffer(request.hidden_states, dtype=dtype).copy()  # .copy() makes it writable
             ).reshape(list(request.hidden_shape))
             
-            logger.info(f"[WORKER/VALIDATOR] Loaded activations: {hidden_states.shape} {hidden_states.dtype}")
+            # CRITICAL: Move tensors to the same device as the model!
+            # EC2 (CPU) sends tensors, Jetson (CUDA) needs them on GPU
+            model_device = getattr(self.model, 'device', 'cpu')
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'device'):
+                model_device = self.model.model.device
+            hidden_states = hidden_states.to(model_device)
+            
+            logger.info(f"[WORKER/VALIDATOR] Loaded activations: {hidden_states.shape} {hidden_states.dtype} on {hidden_states.device}")
             
             # STEP 2: Process through our layers
             # Deserialize attention mask if provided
             attention_mask = None
             if request.attention_mask:
                 attention_mask = torch.from_numpy(
-                    np.frombuffer(request.attention_mask, dtype=np.float32)
-                )
+                    np.frombuffer(request.attention_mask, dtype=np.float32).copy()
+                ).to(model_device)
             
             # Training Labels (if provided)
             training_labels = None
             if request.training_labels:
                 training_labels = torch.from_numpy(
-                    np.frombuffer(request.training_labels, dtype=np.int64)
-                )
+                    np.frombuffer(request.training_labels, dtype=np.int64).copy()
+                ).to(model_device)
             
             # Forward through our layers
             if hasattr(self.model, 'forward_pipeline'):
@@ -528,8 +535,14 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             
             # Deserialize gradients
             grad_output = torch.from_numpy(
-                np.frombuffer(request.grad_output, dtype=np.float32)
+                np.frombuffer(request.grad_output, dtype=np.float32).copy()
             ).reshape(list(request.grad_shape))
+            
+            # CRITICAL: Move gradients to the same device as the model!
+            model_device = getattr(self.model, 'device', 'cpu')
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'device'):
+                model_device = self.model.model.device
+            grad_output = grad_output.to(model_device)
             
             # Run backward pipeline
             self.model.backward_pipeline(
