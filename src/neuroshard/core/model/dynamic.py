@@ -2960,14 +2960,37 @@ class DynamicNeuroNode:
             pass  # If psutil fails, continue anyway
         
         try:
-            # SINGLE-NODE OPTIMIZATION: Check if we're a full node (Driver + Worker + Validator)
-            # DYNAMIC CHECK: Use layer_pool to get current lm_head_holder
-            # This handles the case where a new Validator joined and took over the LM head
-            am_current_validator = self.model.has_lm_head
-            if hasattr(self, 'layer_pool') and self.layer_pool:
-                am_current_validator = (self.layer_pool.lm_head_holder == self.node_id)
+            # DISTRIBUTED TRAINING CHECK:
+            # Before assuming we're a "full node", check if there's a NEXT HOP in the network.
+            # If another node has layers AFTER ours, we should forward to them, not train locally.
+            #
+            # This handles the case where:
+            # - Jetson started solo (layers 0-5, embed=True, head=True)
+            # - EC2 joined later (layers 6-10, embed=False, head=True)
+            # - Jetson's local layer_pool wasn't updated
+            # - But P2P/DHT knows EC2 exists with higher layers!
+            
+            my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
+            next_layer = my_last_layer + 1
+            
+            # Check P2P for a next hop (someone with higher layers)
+            has_next_hop = False
+            if self.p2p_manager:
+                next_hop = self.p2p_manager.get_next_hop(next_layer)
+                if next_hop:
+                    has_next_hop = True
+                    logger.debug(f"Found next hop for layer {next_layer}: {next_hop}")
+            
+            # I'm only a "full node" if:
+            # 1. I have embedding (can start training)
+            # 2. I have LM head (can compute loss)
+            # 3. There's NO next hop (no one with higher layers)
+            am_current_validator = self.model.has_lm_head and not has_next_hop
             
             is_full_node = self.model.has_embedding and am_current_validator
+            
+            if has_next_hop and self.model.has_lm_head:
+                logger.info(f"[DISTRIBUTED] Found node with layer {next_layer} - will forward instead of local training")
             
             if self.model.has_embedding:
                 # I am a Driver (Layer 0)
