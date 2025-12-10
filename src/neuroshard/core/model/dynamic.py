@@ -28,6 +28,7 @@ import time
 import logging
 import hashlib
 import math
+from pathlib import Path
 import psutil  # For adaptive memory management
 from typing import Optional, Dict, List, Tuple, Any, Set
 from dataclasses import dataclass, field
@@ -328,11 +329,12 @@ class DynamicLayerPool:
                 logger.debug(f"Could not check checkpoint for layer 0: {e}")
             
             # DHT discovery (P2P must be connected BEFORE start() for this to work!)
+            dht_is_stale = False
             if self.dht:
                 dht_layers = self._discover_network_layers_from_dht()
                 if dht_layers:
                     highest_layer = max(dht_layers)
-                    # SANITY CHECK: Only expand if DHT layers are "reasonable"
+                    # SANITY CHECK: Only trust DHT if layers are "reasonable"
                     max_reasonable = max(32, self.current_num_layers * 2)
                     if highest_layer >= self.current_num_layers and highest_layer < max_reasonable:
                         self.current_num_layers = highest_layer + 1
@@ -340,6 +342,9 @@ class DynamicLayerPool:
                     elif highest_layer >= max_reasonable:
                         logger.warning(f"DHT shows {highest_layer + 1} layers but seems stale")
                         logger.warning(f"Ignoring stale DHT data - will use checkpoint layer count")
+                        # CRITICAL: Clear stale DHT data so it doesn't affect full_node detection!
+                        dht_layers = set()
+                        dht_is_stale = True
                 else:
                     logger.info("DHT: No existing layers found - this may be first node or peers not yet discovered")
             else:
