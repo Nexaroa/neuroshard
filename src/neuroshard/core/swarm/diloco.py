@@ -77,6 +77,12 @@ class DiLoCoConfig:
     # Validation
     validate_gradients: bool = True     # Enable gradient validation
     gradient_cosine_threshold: float = 0.5  # Min cosine similarity
+    
+    # Learning rate scheduling (NEW)
+    use_lr_scheduler: bool = True       # Enable cosine annealing LR
+    warmup_steps: int = 1000            # LR warmup steps (linear ramp)
+    min_lr_ratio: float = 0.1           # Min LR = min_lr_ratio * inner_lr
+    lr_decay_steps: int = 50000         # Steps for full cosine cycle
 
 
 @dataclass
@@ -276,11 +282,19 @@ class DiLoCoTrainer:
         self._sync_callback: Optional[Callable] = None
         self._on_outer_step: Optional[Callable] = None
         
+        # Learning rate scheduling
+        self._base_lr = self.config.inner_lr
+        self._current_lr = self._base_lr
+        self._min_lr = self._base_lr * self.config.min_lr_ratio
+        
         # Thread safety
         self._lock = threading.RLock()
         
         logger.info(f"DiLoCoTrainer initialized: inner_steps={self.config.inner_steps}, "
                    f"outer_lr={self.config.outer_lr}, outer_momentum={self.config.outer_momentum}")
+        if self.config.use_lr_scheduler:
+            logger.info(f"  LR scheduler: warmup={self.config.warmup_steps}, "
+                       f"decay_steps={self.config.lr_decay_steps}, min_ratio={self.config.min_lr_ratio}")
     
     def set_sync_callback(self, callback: Callable):
         """
@@ -315,6 +329,52 @@ class DiLoCoTrainer:
             if param.requires_grad:
                 self.initial_weights[name] = param.data.clone()
     
+    # ==================== LEARNING RATE SCHEDULING ====================
+    
+    def _compute_lr(self, step: int) -> float:
+        """
+        Compute learning rate with warmup and cosine annealing.
+        
+        Schedule:
+        1. Warmup phase (0 -> warmup_steps): Linear ramp from 0 to base_lr
+        2. Decay phase (warmup_steps -> decay_steps): Cosine decay to min_lr
+        3. After decay_steps: Hold at min_lr
+        
+        Args:
+            step: Current total training step
+            
+        Returns:
+            Learning rate for this step
+        """
+        import math
+        
+        warmup_steps = self.config.warmup_steps
+        decay_steps = self.config.lr_decay_steps
+        base_lr = self._base_lr
+        min_lr = self._min_lr
+        
+        if step < warmup_steps:
+            # Linear warmup
+            return base_lr * (step / warmup_steps)
+        elif step < decay_steps:
+            # Cosine annealing decay
+            progress = (step - warmup_steps) / (decay_steps - warmup_steps)
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+            return min_lr + (base_lr - min_lr) * cosine_decay
+        else:
+            # After full decay, hold at min_lr
+            return min_lr
+    
+    def _apply_lr(self, lr: float):
+        """Apply learning rate to the inner optimizer."""
+        for param_group in self.inner_optimizer.param_groups:
+            param_group['lr'] = lr
+        self._current_lr = lr
+    
+    def get_current_lr(self) -> float:
+        """Get the current learning rate."""
+        return self._current_lr
+    
     # ==================== INNER LOOP ====================
     
     def inner_step(self, loss: torch.Tensor) -> float:
@@ -322,6 +382,7 @@ class DiLoCoTrainer:
         Execute one inner optimization step.
         
         This is normal SGD/AdamW training - no communication needed.
+        Applies learning rate scheduling if enabled.
         
         Args:
             loss: Loss tensor from forward pass
@@ -344,6 +405,11 @@ class DiLoCoTrainer:
             
             # Only step optimizer after accumulation
             if self._accumulation_count >= self.config.gradient_accumulation:
+                # Apply learning rate scheduling before step
+                if self.config.use_lr_scheduler:
+                    new_lr = self._compute_lr(self.stats.total_inner_steps)
+                    self._apply_lr(new_lr)
+                
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
@@ -552,6 +618,11 @@ class DiLoCoTrainer:
                 'inner_loop_time': self.stats.inner_loop_time,
                 'outer_loop_time': self.stats.outer_loop_time,
                 'sync_time': self.stats.sync_time,
+                # Learning rate info
+                'current_lr': self._current_lr,
+                'base_lr': self._base_lr,
+                'min_lr': self._min_lr,
+                'lr_scheduler_enabled': self.config.use_lr_scheduler,
             }
     
     def state_dict(self) -> Dict[str, Any]:

@@ -682,6 +682,11 @@ class SwarmEnabledDynamicNode:
         self._current_loss = loss.item()
         self._total_training_rounds += 1
         
+        # Record loss to data loader for plateau detection
+        # This enables adaptive shard rotation when the model stops learning
+        if hasattr(self.base_node, 'genesis_loader') and self.base_node.genesis_loader:
+            self.base_node.genesis_loader.record_loss(self._current_loss)
+        
         # Note: grad_norm is 0 after inner_step because zero_grad() was called
         # To properly track gradient norm, we'd need to compute it inside inner_step
         # before zero_grad(). For now, we use pseudo-gradient norm from DiLoCo stats.

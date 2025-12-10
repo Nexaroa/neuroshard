@@ -2553,14 +2553,29 @@ def run_node(
                     
                     logger.info(f"[NODE] Memory: process={process_mem_mb:.0f}MB / {memory_limit or '?'}MB limit, "
                           f"system={system_mem.percent:.0f}% ({system_mem.used/(1024**3):.1f}GB / {system_mem.total/(1024**3):.1f}GB)")
-                    
-                    # Show component breakdown if training
+
+                    # Show Genesis data loader stats if training
                     if hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
                         loader = NEURO_NODE.genesis_loader
-                        num_loaded = len(loader.loaded_shards)
-                        num_prefetched = len(loader._prefetch_ready)
-                        logger.info(f"[NODE] Genesis cache: {num_loaded} loaded + {num_prefetched} prefetched shards")
-                    
+                        stats = loader.get_stats()
+                        num_loaded = stats.get('loaded_shards', 0)
+                        num_prefetched = stats.get('prefetch_ready', 0)
+                        shard_id = stats.get('current_shard_id', '?')
+                        shard_progress = stats.get('shard_progress_pct', 0)
+                        loss_avg = stats.get('loss_avg', 0)
+                        
+                        logger.info(f"[NODE] Genesis: shard {shard_id} ({shard_progress:.0f}% done), "
+                              f"{num_loaded} loaded + {num_prefetched} prefetched")
+                        
+                        # Show loss plateau status if loss is tracked
+                        if loss_avg > 0:
+                            loss_var = stats.get('loss_variance', 0)
+                            steps_shard = stats.get('steps_on_current_shard', 0)
+                            plateau_thresh = stats.get('plateau_threshold', 0.02)
+                            plateau_status = "yes" if loss_var < plateau_thresh and loss_avg < 0.05 else "no"
+                            logger.info(f"[NODE] Training: loss_avg={loss_avg:.4f}, variance={loss_var:.6f}, "
+                                  f"steps_on_shard={steps_shard}, plateau={plateau_status}")
+
                     last_memory_report = now
                 except Exception:
                     pass
@@ -2726,9 +2741,18 @@ def run_node(
                         if loss is not None:
                             steps_this_minute += 1
                             training_step_count += 1
+                            
+                            # Get LR from DiLoCo trainer if available
+                            lr_info = ""
+                            if hasattr(NEURO_NODE, 'swarm') and NEURO_NODE.swarm:
+                                diloco = getattr(NEURO_NODE.swarm, 'diloco_trainer', None)
+                                if diloco:
+                                    current_lr = diloco.get_current_lr()
+                                    lr_info = f", lr={current_lr:.2e}"
+                            
                             # Log every step with timing info
                             logger.info(f"[NODE] Training step #{NEURO_NODE.total_training_rounds}: "
-                                  f"loss={loss:.4f} ({step_duration:.1f}s)")
+                                  f"loss={loss:.4f}{lr_info} ({step_duration:.1f}s)")
                             STATE["training_status"] = "idle"
                             STATE["last_loss"] = loss
                             STATE["current_loss"] = loss  # For gossip proof creation

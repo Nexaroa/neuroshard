@@ -727,11 +727,19 @@ class GenesisDataLoader:
         self.shard_rotation_count = 0  # How many times we've rotated through
         self.loading_shards = set()  # Track shards currently being downloaded
         self._shard_lock = threading.Lock()  # Lock for shard loading
-        self._download_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="shard-download")
+        self._download_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="shard-download")
         
-        # ASYNC PREFETCHING: Keep next shard ready in background
+        # ASYNC PREFETCHING: Keep next shard(s) ready in background
         self._prefetch_in_progress = set()  # Shard IDs being prefetched
         self._prefetch_ready = {}  # shard_id -> tensor data (ready to use)
+        self._prefetch_ahead = 2  # Number of shards to prefetch ahead (was 1)
+        
+        # LOSS PLATEAU DETECTION: Track loss to detect when to rotate shards early
+        self._loss_history = []  # Recent loss values
+        self._loss_history_max = 50  # Number of loss values to track
+        self._loss_plateau_threshold = 0.02  # If loss variance < this, plateau detected
+        self._min_steps_per_shard = 100  # Minimum steps before considering early rotation
+        self._steps_on_current_shard = 0  # Steps taken on current shard
         
         # Initialize Data Swarm for P2P downloading
         self.swarm = None 
@@ -938,14 +946,89 @@ class GenesisDataLoader:
         """Set the DataSwarm instance."""
         self.swarm = swarm
     
+    def record_loss(self, loss: float):
+        """
+        Record a training loss for plateau detection.
+        
+        Call this from the training loop to enable adaptive shard rotation.
+        When loss plateaus, the loader will rotate to fresh data.
+        """
+        self._loss_history.append(loss)
+        if len(self._loss_history) > self._loss_history_max:
+            self._loss_history.pop(0)
+        self._steps_on_current_shard += 1
+    
+    def _should_rotate_early(self) -> bool:
+        """
+        Check if we should rotate to a new shard early due to loss plateau.
+        
+        Conditions for early rotation:
+        1. Have enough loss samples (at least 20)
+        2. Minimum steps on current shard (100) 
+        3. Loss has plateaued (low variance)
+        4. Loss is low enough that we're not still actively learning
+        """
+        if len(self._loss_history) < 20:
+            return False
+        
+        if self._steps_on_current_shard < self._min_steps_per_shard:
+            return False
+        
+        # Calculate loss statistics
+        recent_losses = self._loss_history[-20:]
+        avg_loss = sum(recent_losses) / len(recent_losses)
+        variance = sum((l - avg_loss) ** 2 for l in recent_losses) / len(recent_losses)
+        
+        # Also check if loss is decreasing (don't rotate if still improving)
+        if len(self._loss_history) >= 40:
+            older_avg = sum(self._loss_history[-40:-20]) / 20
+            improvement = older_avg - avg_loss
+            
+            # Still improving significantly - don't rotate
+            if improvement > 0.005:
+                return False
+        
+        # Plateau detected: low variance AND low absolute loss
+        if variance < self._loss_plateau_threshold and avg_loss < 0.05:
+            logger.info(f"[GENESIS] Loss plateau detected: avg={avg_loss:.4f}, variance={variance:.6f}")
+            logger.info(f"[GENESIS] Rotating to fresh data for continued learning")
+            return True
+        
+        return False
+    
+    def force_shard_rotation(self, reason: str = "manual"):
+        """
+        Force rotation to a new shard.
+        
+        Call this when you want to move to fresh data (e.g., loss plateau).
+        """
+        logger.info(f"[GENESIS] Forcing shard rotation: {reason}")
+        self._loss_history.clear()
+        self._steps_on_current_shard = 0
+        
+        # Move to next shard
+        self.current_shard_idx += 1
+        
+        if self.current_shard_idx >= len(self.assigned_shard_ids):
+            # We've gone through all assigned shards - rotate to new set
+            logger.info(f"[GENESIS] Exhausted all {len(self.assigned_shard_ids)} assigned shards. Getting new set...")
+            self.rotate_shards()
+        
+        # Reset dataset iterator to start fresh
+        self.current_dataset = None
+        self.dataset_iterator = 0
+        
+        # Start prefetching the new shard
+        self._start_prefetch_next()
+    
     def _start_prefetch_next(self):
         """Start prefetching the next shard(s) in background."""
         if not self.assigned_shard_ids:
             return
         
-        # Prefetch current and next shard
+        # Prefetch current and multiple next shards for faster data access
         shards_to_prefetch = []
-        for offset in [0, 1]:  # Current and next
+        for offset in range(self._prefetch_ahead + 1):  # Current + prefetch_ahead (default: 0, 1, 2)
             idx = (self.current_shard_idx + offset) % len(self.assigned_shard_ids)
             shard_id = self.assigned_shard_ids[idx]
             
@@ -956,6 +1039,10 @@ class GenesisDataLoader:
                     shard_id in self._prefetch_ready or
                     shard_id in self.loading_shards):
                     continue
+                
+                # Limit total prefetch in progress to avoid overwhelming the system
+                if len(self._prefetch_in_progress) >= 3:
+                    break
                 
                 shards_to_prefetch.append(shard_id)
                 self._prefetch_in_progress.add(shard_id)
@@ -1216,12 +1303,27 @@ class GenesisDataLoader:
         data_len = len(self.current_dataset)
         req_len = (batch_size * seq_len) + 1 
         
+        # Check for early rotation due to loss plateau
+        if self._should_rotate_early():
+            current_shard = self.assigned_shard_ids[self.current_shard_idx % len(self.assigned_shard_ids)]
+            logger.info(f"[GENESIS] Early rotation from shard {current_shard} due to loss plateau")
+            self.force_shard_rotation("loss_plateau")
+            # Ensure new shard is loaded
+            self.ensure_shard_loaded()
+            if self.current_dataset is None:
+                raise RuntimeError("Data not ready - loading fresh shard after plateau")
+            data_len = len(self.current_dataset)
+        
         # Check if we've exhausted current shard
         if self.dataset_iterator + req_len > data_len:
             # Log completion of current shard
             completed_shard = self.assigned_shard_ids[self.current_shard_idx % len(self.assigned_shard_ids)]
             steps_done = data_len // req_len
             logger.info(f"✓ Completed shard {completed_shard} ({steps_done} steps, {data_len:,} tokens)")
+            
+            # Reset loss tracking for new shard
+            self._loss_history.clear()
+            self._steps_on_current_shard = 0
             
             # Move to next shard in our assigned list
             self.current_shard_idx += 1
@@ -1293,6 +1395,14 @@ class GenesisDataLoader:
             if self.assigned_shard_ids:
                 current_shard_id = self.assigned_shard_ids[self.current_shard_idx % len(self.assigned_shard_ids)]
         
+        # Compute loss plateau stats
+        loss_avg = 0.0
+        loss_variance = 0.0
+        if self._loss_history:
+            loss_avg = sum(self._loss_history) / len(self._loss_history)
+            if len(self._loss_history) >= 2:
+                loss_variance = sum((l - loss_avg) ** 2 for l in self._loss_history) / len(self._loss_history)
+        
         return {
             "total_shards_available": self.total_shards,
             "max_shards_configured": self.max_shards,
@@ -1300,6 +1410,7 @@ class GenesisDataLoader:
             "assigned_shards": len(self.assigned_shard_ids),
             "loaded_shards": len(self.loaded_shards),
             "prefetch_in_progress": len(self._prefetch_in_progress),
+            "prefetch_ready": len(self._prefetch_ready),
             "current_shard_idx": self.current_shard_idx,
             "current_shard_id": current_shard_id,
             "shard_progress_pct": round(shard_progress, 1),
@@ -1307,6 +1418,12 @@ class GenesisDataLoader:
             "total_steps_in_shard": total_steps_in_shard,
             "rotation_count": self.shard_rotation_count,
             "storage_used_mb": len(self.loaded_shards) * self.SHARD_SIZE_MB,
+            # Loss plateau detection stats
+            "steps_on_current_shard": self._steps_on_current_shard,
+            "loss_history_size": len(self._loss_history),
+            "loss_avg": round(loss_avg, 6),
+            "loss_variance": round(loss_variance, 8),
+            "plateau_threshold": self._loss_plateau_threshold,
         }
 
 
