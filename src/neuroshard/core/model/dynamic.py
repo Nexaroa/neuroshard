@@ -576,6 +576,14 @@ class DynamicLayerPool:
                 
                 logger.info(f"WORKER+VALIDATOR: Extending pipeline from layer {start_from} (arch has {arch_layers} layers)")
                 
+                # SAFETY CHECK: If start_from >= arch_layers, DHT data is stale!
+                # Fall back to taking the last available layers for redundancy
+                if start_from >= arch_layers:
+                    logger.warning(f"WORKER+VALIDATOR: No layers available after {actual_last_layer} (arch={arch_layers})")
+                    logger.warning(f"DHT data may be stale - falling back to redundancy mode")
+                    # Take overlapping layers from the end (for redundancy, not extension)
+                    start_from = max(1, arch_layers - max_layers_for_node)
+                
                 # Assign layers starting from where the DRIVER left off
                 for layer_id in range(start_from, arch_layers):
                     if len(assigned_layers) >= max_layers_for_node:
@@ -588,6 +596,12 @@ class DynamicLayerPool:
                 if assigned_layers:
                     logger.info(f"Node {node_id[:8]}... assigned layers {min(assigned_layers)}-{max(assigned_layers)} "
                                f"(WORKER+VALIDATOR - extends pipeline from DRIVER)")
+                else:
+                    # CRITICAL: We MUST have at least one layer to function!
+                    logger.error(f"WORKER+VALIDATOR: No layers assigned! Taking last layer as fallback.")
+                    last_layer = arch_layers - 1
+                    self._assign_layer(last_layer, node_id, node_url, grpc_addr)
+                    assigned_layers.append(last_layer)
             else:
                 # Driver or Worker: fill from layer 1 onwards
                 layers_to_check = range(1, self.current_num_layers)
