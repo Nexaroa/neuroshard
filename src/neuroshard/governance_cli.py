@@ -8,6 +8,11 @@ Commands for participating in decentralized governance:
 - Create new proposals
 - Vote on proposals
 - Check voting results
+
+Authentication:
+- Uses wallet token (same as neuroshard-node)
+- Token can be 64-char hex or 12-word mnemonic
+- Derives ECDSA keypair for signing proposals/votes
 """
 
 import argparse
@@ -49,40 +54,137 @@ def get_governance_modules():
     }
 
 
+def get_crypto_module():
+    """Import crypto module lazily."""
+    from neuroshard.core.crypto.ecdsa import NodeCrypto, derive_keypair_from_token
+    return {
+        'NodeCrypto': NodeCrypto,
+        'derive_keypair_from_token': derive_keypair_from_token,
+    }
+
+
 NEUROSHARD_DIR = os.path.expanduser("~/.neuroshard")
+TOKEN_FILE = os.path.join(NEUROSHARD_DIR, "wallet_token")
 
 
-def get_node_id():
-    """Get the node ID from config or environment."""
-    # Check environment variable
-    if os.getenv("NEUROSHARD_NODE_ID"):
-        return os.getenv("NEUROSHARD_NODE_ID")
+def resolve_token(token_arg: str = None) -> str:
+    """
+    Resolve wallet token from various sources (in priority order):
+    1. --token argument
+    2. NEUROSHARD_TOKEN environment variable
+    3. ~/.neuroshard/wallet_token file
     
-    # Check config file
-    config_path = os.path.join(NEUROSHARD_DIR, "config.json")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            config = json.load(f)
-            if config.get("node_id"):
-                return config["node_id"]
+    Handles both 64-char hex and 12-word mnemonic formats.
     
-    return None
+    Returns the resolved token or None.
+    """
+    token = None
+    source = None
+    
+    # Priority 1: Command line argument
+    if token_arg:
+        token = token_arg
+        source = "command line"
+    
+    # Priority 2: Environment variable
+    elif os.getenv("NEUROSHARD_TOKEN"):
+        token = os.getenv("NEUROSHARD_TOKEN")
+        source = "NEUROSHARD_TOKEN env"
+    
+    # Priority 3: Token file
+    elif os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, 'r') as f:
+                token = f.read().strip()
+                source = TOKEN_FILE
+        except Exception:
+            pass
+    
+    if not token:
+        return None, None
+    
+    # Handle mnemonic (12 words)
+    words = token.strip().split()
+    if len(words) == 12:
+        try:
+            from mnemonic import Mnemonic
+            mnemo = Mnemonic("english")
+            if mnemo.check(token):
+                seed = mnemo.to_seed(token, passphrase="")
+                token = seed[:32].hex()
+                source = f"{source} (mnemonic)"
+        except ImportError:
+            print("[WARNING] 'mnemonic' package not installed, treating as raw token")
+        except Exception as e:
+            print(f"[WARNING] Mnemonic error: {e}")
+    
+    return token, source
 
 
-def get_registry():
+def get_wallet(token: str):
+    """
+    Initialize wallet from token.
+    
+    Returns (node_id, crypto) tuple where:
+    - node_id: Your unique identifier (derived from public key)
+    - crypto: NodeCrypto instance for signing
+    """
+    crypto_mod = get_crypto_module()
+    crypto = crypto_mod['NodeCrypto'](token)
+    return crypto.node_id, crypto
+
+
+def save_token(token: str):
+    """Save token to file for future use."""
+    os.makedirs(NEUROSHARD_DIR, exist_ok=True)
+    with open(TOKEN_FILE, 'w') as f:
+        f.write(token)
+    os.chmod(TOKEN_FILE, 0o600)  # Secure permissions
+    print(f"[INFO] Token saved to {TOKEN_FILE}")
+
+
+def get_registry(ledger=None):
     """Get or create the NEP registry."""
     gov = get_governance_modules()
     db_path = os.path.join(NEUROSHARD_DIR, "nep_registry.db")
     os.makedirs(NEUROSHARD_DIR, exist_ok=True)
-    return gov['NEPRegistry'](db_path=db_path)
+    return gov['NEPRegistry'](db_path=db_path, ledger=ledger)
 
 
-def get_voting_system():
+def get_voting_system(ledger=None):
     """Get or create the voting system."""
     gov = get_governance_modules()
     db_path = os.path.join(NEUROSHARD_DIR, "nep_votes.db")
     os.makedirs(NEUROSHARD_DIR, exist_ok=True)
-    return gov['VotingSystem'](db_path=db_path)
+    return gov['VotingSystem'](db_path=db_path, ledger=ledger)
+
+
+def require_wallet(args) -> tuple:
+    """
+    Ensure wallet is available for commands that need it.
+    
+    Returns (node_id, crypto) or exits with error.
+    """
+    token, source = resolve_token(getattr(args, 'token', None))
+    
+    if not token:
+        print("\n❌ Wallet token required for this command!")
+        print()
+        print("Provide your token using one of:")
+        print("  1. --token YOUR_TOKEN")
+        print("  2. export NEUROSHARD_TOKEN=YOUR_TOKEN")
+        print(f"  3. echo YOUR_TOKEN > {TOKEN_FILE}")
+        print()
+        print("Get your token at: https://neuroshard.com/wallet")
+        sys.exit(1)
+    
+    try:
+        node_id, crypto = get_wallet(token)
+        print(f"[WALLET] Authenticated as {node_id[:16]}... (from {source})")
+        return node_id, crypto
+    except Exception as e:
+        print(f"\n❌ Failed to initialize wallet: {e}")
+        sys.exit(1)
 
 
 def format_timestamp(ts):
@@ -215,12 +317,11 @@ def cmd_show(args):
 def cmd_propose(args):
     """Create a new proposal."""
     gov = get_governance_modules()
-    registry = get_registry()
     
-    node_id = args.node_id or get_node_id()
-    if not node_id:
-        print("Error: Node ID required. Set NEUROSHARD_NODE_ID or use --node-id")
-        return 1
+    # Require wallet authentication
+    node_id, crypto = require_wallet(args)
+    
+    registry = get_registry()
     
     # Parse type
     try:
@@ -263,16 +364,17 @@ def cmd_propose(args):
     print(f"{'='*60}")
     print(f"  Title:    {title}")
     print(f"  Type:     {nep_type.value}")
-    print(f"  Author:   {node_id[:20]}...")
+    print(f"  Author:   {node_id[:16]}...")
     print(f"  Abstract: {abstract[:100]}...")
     print()
     print(f"  ⚠️  COSTS:")
-    print(f"     - 10 NEURO proposal fee (burned)")
+    print(f"     - 10 NEURO proposal fee (held in escrow)")
     print(f"     - Requires 100 NEURO staked")
     print()
-    print(f"  💰 REWARDS (if approved):")
-    print(f"     - 50 NEURO proposer reward")
-    print(f"     - Proposal fee refunded")
+    print(f"  💰 REWARDS (stake-proportional):")
+    print(f"     - If approved: 0.1% of total stake voted + fee refund")
+    print(f"     - If rejected w/ quorum: 0.01% of total stake voted")
+    print(f"     - Example: 100K stake votes → ~110 NEURO if approved")
     print()
     
     if not args.yes:
@@ -281,17 +383,20 @@ def cmd_propose(args):
             print("Cancelled.")
             return 0
     
+    # Sign the proposal with ECDSA
+    signature = crypto.sign(nep.content_hash)
+    
     # Submit to registry
-    # For now, use a placeholder signature
     success, message, nep_id = registry.submit_proposal(
         nep=nep,
         node_id=node_id,
-        signature=f"sig_{node_id[:16]}_{int(time.time())}",  # Placeholder
+        signature=signature,
     )
     
     if success:
         print(f"\n✅ {message}")
         print(f"   Your proposal ID: {nep_id}")
+        print(f"   Your wallet: {node_id}")
         print(f"   Track status: neuroshard-governance show {nep_id}")
     else:
         print(f"\n❌ Failed: {message}")
@@ -303,13 +408,12 @@ def cmd_propose(args):
 def cmd_vote(args):
     """Vote on a proposal."""
     gov = get_governance_modules()
+    
+    # Require wallet authentication
+    node_id, crypto = require_wallet(args)
+    
     registry = get_registry()
     voting = get_voting_system()
-    
-    node_id = args.node_id or get_node_id()
-    if not node_id:
-        print("Error: Node ID required. Set NEUROSHARD_NODE_ID or use --node-id")
-        return 1
     
     # Check proposal exists and is in voting
     nep = registry.get_proposal(args.nep_id)
@@ -341,9 +445,12 @@ def cmd_vote(args):
     print(f"  Impact: {nep.economic_impact.describe()}")
     print(f"  Ends:   {format_timestamp(nep.voting_end)}")
     print()
+    print(f"  Your wallet: {node_id[:16]}...")
     print(f"  Your vote: {args.choice.upper()}")
     if args.reason:
         print(f"  Reason: {args.reason}")
+    print()
+    print(f"  💰 You will earn: 0.01% of your staked NEURO for voting")
     print()
     
     if not args.yes:
@@ -352,18 +459,23 @@ def cmd_vote(args):
             print("Cancelled.")
             return 0
     
+    # Sign the vote with ECDSA
+    vote_payload = f"{args.nep_id}:{node_id}:{choice.value}:{int(time.time())}"
+    signature = crypto.sign(vote_payload)
+    
     # Cast vote
     success, message = voting.cast_vote(
         nep_id=args.nep_id,
         voter_node_id=node_id,
         choice=choice,
-        signature=f"vote_sig_{node_id[:16]}_{int(time.time())}",  # Placeholder
+        signature=signature,
         reason=args.reason or "",
         nep_registry=registry,
     )
     
     if success:
         print(f"\n✅ {message}")
+        print(f"   Your vote has been recorded and signed.")
     else:
         print(f"\n❌ Failed: {message}")
         return 1
@@ -449,8 +561,26 @@ def main():
         description="NeuroShard Governance CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # List all proposals
+WALLET SETUP:
+  Commands that modify state (propose, vote) require your wallet token.
+  This is the same token used for neuroshard-node.
+
+  Option 1: Pass directly
+    neuroshard-governance --token YOUR_TOKEN propose ...
+
+  Option 2: Environment variable
+    export NEUROSHARD_TOKEN=YOUR_TOKEN
+    neuroshard-governance propose ...
+
+  Option 3: Save to file (recommended)
+    neuroshard-governance --token YOUR_TOKEN wallet --save
+    # Future commands auto-use ~/.neuroshard/wallet_token
+
+EXAMPLES:
+  # Check your wallet
+  neuroshard-governance --token YOUR_TOKEN wallet
+
+  # List all proposals (no auth needed)
   neuroshard-governance list
 
   # List proposals in voting
@@ -459,14 +589,16 @@ Examples:
   # View a proposal
   neuroshard-governance show NEP-001
 
-  # Create a proposal
+  # Create a proposal (requires wallet)
   neuroshard-governance propose --title "Add MTP Training" --type train
 
-  # Vote on a proposal
+  # Vote on a proposal (requires wallet)
   neuroshard-governance vote NEP-001 yes --reason "Improves efficiency"
 
   # Check voting results
   neuroshard-governance results NEP-001
+
+Get your wallet token at: https://neuroshard.com/wallet
         """
     )
     
@@ -475,20 +607,27 @@ Examples:
         version=f"NeuroShard Governance CLI {__version__}"
     )
     
+    # Global token option (for commands that need authentication)
+    parser.add_argument(
+        "--token", type=str, default=None,
+        help="Wallet token (64-char hex or 12-word mnemonic). "
+             "Can also be set via NEUROSHARD_TOKEN env or ~/.neuroshard/wallet_token"
+    )
+    
     subparsers = parser.add_subparsers(dest="command", help="Commands")
     
-    # List command
+    # List command (no auth required)
     list_parser = subparsers.add_parser("list", help="List proposals")
     list_parser.add_argument("--status", type=str, help="Filter by status")
     list_parser.add_argument("--limit", type=int, default=50, help="Max results")
     
-    # Show command
+    # Show command (no auth required)
     show_parser = subparsers.add_parser("show", help="Show proposal details")
     show_parser.add_argument("nep_id", type=str, help="Proposal ID (e.g., NEP-001)")
     show_parser.add_argument("--full", action="store_true", help="Show full specification")
     
-    # Propose command
-    propose_parser = subparsers.add_parser("propose", help="Create a proposal")
+    # Propose command (requires wallet)
+    propose_parser = subparsers.add_parser("propose", help="Create a proposal (requires wallet)")
     propose_parser.add_argument("--title", type=str, required=True, help="Proposal title")
     propose_parser.add_argument("--type", type=str, required=True, 
                                 help="Type: arch, econ, train, net, gov, emergency")
@@ -497,20 +636,23 @@ Examples:
     propose_parser.add_argument("--specification", type=str, help="Technical details")
     propose_parser.add_argument("--file", type=str, help="JSON file with proposal content")
     propose_parser.add_argument("--earnings-impact", type=float, help="Net earnings change %")
-    propose_parser.add_argument("--node-id", type=str, help="Your node ID")
     propose_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
     
-    # Vote command
-    vote_parser = subparsers.add_parser("vote", help="Vote on a proposal")
+    # Vote command (requires wallet)
+    vote_parser = subparsers.add_parser("vote", help="Vote on a proposal (requires wallet)")
     vote_parser.add_argument("nep_id", type=str, help="Proposal ID")
     vote_parser.add_argument("choice", type=str, help="Vote: yes, no, abstain")
     vote_parser.add_argument("--reason", type=str, help="Reason for your vote")
-    vote_parser.add_argument("--node-id", type=str, help="Your node ID")
     vote_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
     
-    # Results command
+    # Results command (no auth required)
     results_parser = subparsers.add_parser("results", help="Show voting results")
     results_parser.add_argument("nep_id", type=str, help="Proposal ID")
+    
+    # Wallet command (utility)
+    wallet_parser = subparsers.add_parser("wallet", help="Show wallet info")
+    wallet_parser.add_argument("--save", action="store_true", 
+                               help="Save token to ~/.neuroshard/wallet_token")
     
     args = parser.parse_args()
     
@@ -525,6 +667,7 @@ Examples:
         'propose': cmd_propose,
         'vote': cmd_vote,
         'results': cmd_results,
+        'wallet': cmd_wallet,
     }
     
     handler = commands.get(args.command)
@@ -532,6 +675,53 @@ Examples:
         return handler(args)
     else:
         parser.print_help()
+        return 1
+
+
+def cmd_wallet(args):
+    """Show wallet info and optionally save token."""
+    token, source = resolve_token(args.token)
+    
+    if not token:
+        print("\n❌ No wallet token found!")
+        print()
+        print("Provide your token using one of:")
+        print("  1. --token YOUR_TOKEN")
+        print("  2. export NEUROSHARD_TOKEN=YOUR_TOKEN")
+        print(f"  3. echo YOUR_TOKEN > {TOKEN_FILE}")
+        print()
+        print("Get your token at: https://neuroshard.com/wallet")
+        return 1
+    
+    try:
+        node_id, crypto = get_wallet(token)
+        
+        print(f"\n{'='*60}")
+        print(f"  WALLET INFO")
+        print(f"{'='*60}")
+        print(f"  Node ID:    {node_id}")
+        print(f"  Public Key: {crypto.get_public_key_hex()[:32]}...")
+        print(f"  Source:     {source}")
+        print()
+        
+        # Test signing
+        test_msg = "test_message"
+        sig = crypto.sign(test_msg)
+        verified = crypto.verify(test_msg, sig)
+        print(f"  Signature test: {'✅ OK' if verified else '❌ FAILED'}")
+        print()
+        
+        if args.save:
+            save_token(token)
+            print(f"  ✅ Token saved to {TOKEN_FILE}")
+            print(f"     Future commands will use this automatically.")
+        else:
+            print(f"  💡 Run with --save to remember this wallet")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"\n❌ Failed to initialize wallet: {e}")
         return 1
 
 
