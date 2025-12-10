@@ -563,23 +563,31 @@ class DynamicLayerPool:
             last_layer = actual_last_layer if role_hint == "WORKER+VALIDATOR" else max(0, self.current_num_layers - 1)
             
             if role_hint == "WORKER+VALIDATOR":
-                # CRITICAL: Assign the ACTUAL last layer FIRST (for LM head) to ensure we can compute loss
-                # This creates REDUNDANCY: both original full node and new node hold the last layer
-                if len(assigned_layers) < max_layers_for_node:
-                    if last_layer not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[last_layer]):
-                        self._assign_layer(last_layer, node_id, node_url, grpc_addr)
-                        assigned_layers.append(last_layer)
-                        logger.info(f"Node {node_id[:8]}... assigned layer {last_layer} (Validator role - overlaps with full node)")
+                # TRUE DISTRIBUTED TRAINING: Take layers AFTER the existing node's layers!
+                # This creates a pipeline: DRIVER[0-5] → WORKER+VALIDATOR[6-10]
+                # NOT overlapping layers - that would be redundancy, not distribution!
+                #
+                # The new node EXTENDS the pipeline by taking the NEXT layers.
+                # It gets the LM head (validator role) since it holds the highest layers.
                 
-                # Then fill middle layers from the END (closer to Validator)
-                # This creates OVERLAPPING coverage for fault tolerance:
-                # FullNode[0-5] + NewNode[5,4,3,2,1] → Both can train independently!
-                for layer_id in range(last_layer - 1, 0, -1):  # Reverse order, skip layer 0
+                # Find the first unassigned layer after the existing layers
+                start_from = actual_last_layer + 1  # Start AFTER existing layers
+                arch_layers = self.current_architecture.num_layers if self.current_architecture else 11
+                
+                logger.info(f"WORKER+VALIDATOR: Extending pipeline from layer {start_from} (arch has {arch_layers} layers)")
+                
+                # Assign layers starting from where the DRIVER left off
+                for layer_id in range(start_from, arch_layers):
                     if len(assigned_layers) >= max_layers_for_node:
                         break
-                    if layer_id not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[layer_id]):
+                    if not any(a.node_id == node_id for a in self.layer_assignments.get(layer_id, [])):
                         self._assign_layer(layer_id, node_id, node_url, grpc_addr)
                         assigned_layers.append(layer_id)
+                
+                # If we got layers, log it
+                if assigned_layers:
+                    logger.info(f"Node {node_id[:8]}... assigned layers {min(assigned_layers)}-{max(assigned_layers)} "
+                               f"(WORKER+VALIDATOR - extends pipeline from DRIVER)")
             else:
                 # Driver or Worker: fill from layer 1 onwards
                 layers_to_check = range(1, self.current_num_layers)
@@ -606,8 +614,13 @@ class DynamicLayerPool:
             # 5. DHT layer discovery already done above (at role assignment)
             # dht_layers variable is already populated
             
-            # 6. If we still have capacity, grow the model
-            if remaining_capacity > 0:
+            # 6. If we still have capacity, MAYBE grow the model
+            # CRITICAL: Only DRIVERS should grow the model!
+            # WORKER+VALIDATOR nodes joining an existing network should NOT grow -
+            # they're just providing redundancy for existing layers.
+            can_grow = role_hint == "DRIVER" or role_hint == "WORKER"  # Not WORKER+VALIDATOR!
+            
+            if remaining_capacity > 0 and can_grow:
                 # CAP MODEL GROWTH for solo/early network as safety net
                 # Even with gradient checkpointing, too many layers cause OOM due to:
                 # - Optimizer states (2x model size for Adam)
@@ -630,6 +643,8 @@ class DynamicLayerPool:
                 # Add new layers to grow the model
                 new_layers = self._grow_model(remaining_capacity, node_id, node_url, grpc_addr)
                 assigned_layers.extend(new_layers)
+            elif remaining_capacity > 0 and role_hint == "WORKER+VALIDATOR":
+                logger.info(f"WORKER+VALIDATOR: Not growing model (providing redundancy for existing {len(assigned_layers)} layers)")
             
             # Handle embedding and LM head tracking
             # Any node with Layer 0 has embedding
