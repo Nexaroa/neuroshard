@@ -281,35 +281,39 @@ class DynamicLayerPool:
             # 2. One full node exists → New node becomes WORKER+VALIDATOR (pipeline!)
             # 3. Multiple partial nodes → Fill based on MIN_REPLICAS
             
-            # CRITICAL FIX: Discover network state from DHT BEFORE making role decisions!
+            # FULLY DECENTRALIZED: Discover network state from DHT ONLY (no tracker fallback!)
             # Each node has its own LOCAL layer_pool, so we need DHT for network-wide view.
             # BUT: DHT may have STALE data from previous runs - don't blindly trust it!
             dht_layers = set()
+            
+            # DHT discovery (P2P must be connected BEFORE start() for this to work!)
             if self.dht:
                 dht_layers = self._discover_network_layers_from_dht()
                 if dht_layers:
                     highest_layer = max(dht_layers)
                     # SANITY CHECK: Only expand if DHT layers are "reasonable"
-                    # If DHT shows 32 layers but our checkpoint has 6, something is stale
-                    # Allow up to 2x checkpoint layers as "reasonable" growth
                     max_reasonable = max(32, self.current_num_layers * 2)
                     if highest_layer >= self.current_num_layers and highest_layer < max_reasonable:
                         self.current_num_layers = highest_layer + 1
                         logger.info(f"DHT discovery: network has {self.current_num_layers} layers")
                     elif highest_layer >= max_reasonable:
-                        logger.warning(f"DHT shows {highest_layer + 1} layers but seems stale (checkpoint has {self.current_num_layers})")
+                        logger.warning(f"DHT shows {highest_layer + 1} layers but seems stale")
                         logger.warning(f"Ignoring stale DHT data - will use checkpoint layer count")
+                else:
+                    logger.info("DHT: No existing layers found - this may be first node or peers not yet discovered")
+            else:
+                logger.warning("DHT not available - layer assignment will be solo mode")
             
             driver_count = len(self.layer_assignments.get(0, []))
             validator_layer = max(0, self.current_num_layers - 1) if self.current_num_layers > 0 else 0
             validator_count = len(self.layer_assignments.get(validator_layer, []))
             
-            # CRITICAL: Check if a FULL NODE exists (via DHT, not local state!)
+            # CRITICAL: Check if a FULL NODE exists (FULLY DECENTRALIZED - DHT only!)
             # A full node has BOTH layer 0 (embedding) AND last layer (LM head)
             has_full_node = False
             full_node_id = None
             
-            # First check local assignments
+            # Check local assignments first
             if self.current_num_layers > 0:
                 layer_0_holders = {a.node_id for a in self.layer_assignments.get(0, [])}
                 last_layer_holders = {a.node_id for a in self.layer_assignments.get(validator_layer, [])}
@@ -319,13 +323,11 @@ class DynamicLayerPool:
                     full_node_id = next(iter(full_node_ids))
                     logger.info(f"Full node detected (local): {full_node_id[:8]}... (has layers 0-{validator_layer})")
             
-            # THEN check DHT - if both layer 0 AND last layer exist in DHT, a full node likely exists
+            # Also check DHT - if both layer 0 AND last layer exist, a full node likely exists
             if not has_full_node and dht_layers:
                 if 0 in dht_layers and validator_layer in dht_layers:
-                    # Both embedding and LM head layers exist in network
-                    # This means at least one node has them (possibly same node = full node)
                     has_full_node = True
-                    full_node_id = "unknown_from_dht"  # We don't know the exact node_id
+                    full_node_id = "unknown_from_dht"
                     logger.info(f"Full node detected (DHT): network has layers 0-{validator_layer}")
             
             # ROLE ASSIGNMENT PRIORITY (redesigned for proper distributed training):
@@ -4046,24 +4048,29 @@ def create_dynamic_node(
     max_storage_mb: float = 100.0,
     max_cpu_threads: Optional[int] = None,
     device: str = "auto",
+    p2p_manager: Optional[Any] = None,  # NEW: Pass P2P for DHT discovery during layer assignment
 ) -> DynamicNeuroNode:
     """
     Create and start a dynamic node.
-    
+
     MULTI-NODE SUPPORT:
     If the same token is used on multiple machines or ports, each gets a unique
     node_id (based on machine + port) while sharing the same wallet_id (based on token).
-    
+
     This means:
     - Each physical node has a unique network identity
     - Earnings accumulate to the same NEURO wallet
     - No conflicts in DHT/layer assignments
+    
+    FULLY DECENTRALIZED:
+    If p2p_manager is provided, DHT is used for network discovery during layer
+    assignment. No tracker fallbacks - pure P2P!
     """
     from neuroshard.utils.hardware import get_instance_id
-    
+
     # Generate instance-specific node_id
     instance_id = get_instance_id(port)
-    
+
     # Combine token with instance for unique network identity
     # wallet_id (from token alone) is used for NEURO earnings
     # node_id (from token + instance) is used for network identity
@@ -4091,6 +4098,12 @@ def create_dynamic_node(
     # Store instance info for debugging
     node.instance_id = instance_id
     node.wallet_id = wallet_id
+    
+    # CRITICAL: Connect P2P BEFORE start() so DHT is available for layer discovery!
+    # This enables fully decentralized network discovery without tracker fallbacks.
+    if p2p_manager:
+        node.p2p_manager = p2p_manager
+        logger.info("P2P connected BEFORE start - DHT available for network discovery")
     
     node.start()
     

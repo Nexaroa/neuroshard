@@ -44,6 +44,7 @@ try:
         SwarmEnabledDynamicNode,
         SwarmNodeConfig,
         create_swarm_node,
+        create_swarm_node_with_p2p,
     )
     SWARM_AVAILABLE = True
 except ImportError:
@@ -2256,17 +2257,50 @@ def run_node(
     if node_token:
         logger.info(f"Authenticated with Token: {node_token[:8]}...")
     
-    # 1. Create SwarmEnabledNode (this IS the standard architecture)
+    # FULLY DECENTRALIZED INITIALIZATION ORDER:
+    # 1. Setup networking FIRST (so DHT is available for layer discovery)
+    # 2. Initialize P2P BEFORE creating the node
+    # 3. Create node WITH P2P connected (uses DHT for network discovery)
+    # This ensures layer assignment can use DHT to detect existing nodes!
+    
     token_for_id = node_token or str(uuid.uuid4())
+    
+    # 1. Setup networking FIRST
+    from neuroshard.core.network.nat import NATTraverser
+    nat = NATTraverser()
+    
+    ip_addr = announce_ip or nat.discover_public_ip() or get_public_ip() or get_local_ip()
+    
+    # UPnP mapping
+    nat.attempt_upnp_mapping(port, "TCP", "NeuroShard HTTP")
+    nat.attempt_upnp_mapping(port + 1000, "TCP", "NeuroShard gRPC")
+    
+    final_announce_port = announce_port or port
+    logger.info(f"Announcing as: {ip_addr}:{final_announce_port}")
+    
+    my_url = f"http://{ip_addr}:{final_announce_port}"
+    
+    # 2. Initialize P2P BEFORE creating the node
+    # Use temporary shard_range "0-0" - will be updated after layer assignment
+    # This allows DHT to be available for network discovery during layer assignment!
+    P2P = P2PManager(my_url, "0-0", tracker, node_token=node_token)
+    P2P.state_ref = STATE
+    
+    # Give DHT time to bootstrap and discover peers
+    logger.info("DHT bootstrapping... (discovering existing nodes)")
+    import time
+    time.sleep(2)  # Allow DHT to sync with network
     
     logger.info(f"Initializing NeuroShard Node (training={enable_training}, DiLoCo steps={diloco_inner_steps})...")
     
-    # Create swarm config
+    # 3. Create swarm config
     swarm_config = SwarmNodeConfig(
         diloco_inner_steps=diloco_inner_steps,
     )
     
-    NEURO_NODE = create_swarm_node(
+    # 4. Create node WITH P2P already available
+    # This allows layer assignment to use DHT for network discovery!
+    NEURO_NODE = create_swarm_node_with_p2p(
         node_token=token_for_id,
         port=port,
         tracker_url=tracker,
@@ -2276,6 +2310,7 @@ def run_node(
         max_storage_mb=max_storage_mb,
         max_cpu_threads=max_cpu_threads,
         device=device,
+        p2p_manager=P2P,  # Pass P2P so DHT is available during layer assignment!
     )
     
     STATE["diloco_inner_steps"] = diloco_inner_steps
@@ -2301,23 +2336,7 @@ def run_node(
     except Exception:
         pass
     
-    # 2. Setup networking
-    from neuroshard.core.network.nat import NATTraverser
-    nat = NATTraverser()
-    
-    ip_addr = announce_ip or nat.discover_public_ip() or get_public_ip() or get_local_ip()
-    
-    # UPnP mapping
-    nat.attempt_upnp_mapping(port, "TCP", "NeuroShard HTTP")
-    nat.attempt_upnp_mapping(port + 1000, "TCP", "NeuroShard gRPC")
-    
-    final_announce_port = announce_port or port
-    logger.info(f"Announcing as: {ip_addr}:{final_announce_port}")
-    
-    my_url = f"http://{ip_addr}:{final_announce_port}"
-    
-    # Shard range in "start-end" format for P2PManager to announce all layers
-    # This enables distributed training pipeline routing!
+    # 5. Update P2P shard_range with actual assigned layers
     layer_ids = NEURO_NODE.my_layer_ids
     if layer_ids:
         start_layer = min(layer_ids)
@@ -2325,6 +2344,9 @@ def run_node(
         shard_range = f"{start_layer}-{end_layer}"
     else:
         shard_range = "0-0"
+    P2P.shard_range = shard_range
+    P2P.start_layer = start_layer if layer_ids else 0
+    P2P.end_layer = end_layer if layer_ids else 0
     STATE["shard_range"] = shard_range
     logger.info(f"P2P shard_range: {shard_range} (layers {layer_ids})")
     
@@ -2334,12 +2356,6 @@ def run_node(
     STATE["has_lm_head"] = NEURO_NODE.model.has_lm_head
     STATE["current_loss"] = NEURO_NODE.current_loss if NEURO_NODE.current_loss != float('inf') else None
     
-    # 3. Initialize P2P
-    P2P = P2PManager(my_url, shard_range, tracker, node_token=node_token)
-    P2P.state_ref = STATE
-    
-    # 4. Connect P2P to NeuroNode
-    NEURO_NODE.connect_p2p(P2P)
     logger.info(f"Connected to P2P network for distributed training")
     
     # 4a. Set up ROLE VERIFICATION to prevent fake Validator/Driver claims

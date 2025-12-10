@@ -1250,6 +1250,7 @@ def create_swarm_node(
         SwarmEnabledDynamicNode ready for use
     """
     # Create base DynamicNeuroNode
+    # Pass P2P manager so DHT is available during layer assignment!
     base_node = create_dynamic_node(
         node_token=node_token,
         port=port,
@@ -1259,6 +1260,7 @@ def create_swarm_node(
         max_storage_mb=max_storage_mb,
         max_cpu_threads=max_cpu_threads,
         device=device,
+        p2p_manager=p2p_manager,  # NEW: Pass P2P for DHT discovery
     )
     
     # Wrap with swarm capabilities
@@ -1278,3 +1280,7 @@ def create_swarm_node(
             logger.info("[FACTORY] Connected SwarmNode to Ledger Verifier (PoNW security active)")
             
     return swarm_node
+
+
+# Alias for backwards compatibility and clarity
+create_swarm_node_with_p2p = create_swarm_node
