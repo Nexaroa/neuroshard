@@ -1855,20 +1855,37 @@ class DynamicNeuroNode:
         # This will be recalculated when model grows via recalculate_training_config()
         num_layers = len(self.my_layer_ids)
         
-        # Smart gradient checkpointing decision based on device and memory
-        if self.device == "cuda" and self.available_memory_mb > 16000:
-            # High-memory CUDA (Jetson Orin, RTX 3090+): only checkpoint if > 150 layers
-            self._use_gradient_checkpointing = num_layers > 150
-        elif self.device == "cuda":
-            # Normal CUDA: checkpoint if > 80 layers or low memory
-            self._use_gradient_checkpointing = num_layers > 80 or self.available_memory_mb < 8000
+        # Smart gradient checkpointing decision based on device, memory, and model size
+        # Key insight: Attention scores = batch × heads × seq² × layers × 4 bytes
+        # With 46 layers, 16 heads, 2048 seq, batch 8 → ~98GB without checkpointing!
+        
+        # Calculate attention memory estimate (the real OOM culprit)
+        batch_estimate = 8  # Typical batch size
+        seq_len = 2048
+        num_heads = self.architecture.num_heads if self.architecture else 16
+        attn_memory_gb = (batch_estimate * num_heads * seq_len * seq_len * num_layers * 4) / (1024**3)
+        
+        # Also consider vocab size - large vocab means less memory for activations
+        vocab_size = getattr(self, 'vocab_capacity', 32000)
+        vocab_memory_gb = (2 * vocab_size * (self.architecture.hidden_dim if self.architecture else 512) * 16) / (1024**3)
+        
+        # Total activation memory estimate
+        total_activation_memory_gb = attn_memory_gb + vocab_memory_gb
+        available_gb = self.available_memory_mb / 1024
+        
+        # Enable checkpointing if activation memory would exceed 50% of available
+        need_checkpointing = total_activation_memory_gb > (available_gb * 0.5)
+        
+        # Also use layer count as fallback
+        if self.device == "cuda":
+            self._use_gradient_checkpointing = need_checkpointing or num_layers > 24
         else:
             # CPU/MPS: more conservative
-            self._use_gradient_checkpointing = (
-                self.available_memory_mb < 8000 or
-                (self.device == "mps" and num_layers > 20) or
-                num_layers > 50
-            )
+            self._use_gradient_checkpointing = need_checkpointing or num_layers > 16
+        
+        logger.info(f"[NODE] Gradient checkpointing: {self._use_gradient_checkpointing} "
+                   f"(attn_mem={attn_memory_gb:.1f}GB, vocab_mem={vocab_memory_gb:.1f}GB, "
+                   f"available={available_gb:.1f}GB, layers={num_layers})")
         
         # Calculate memory-aware training batch size
         self._training_batch_size = self._calculate_training_batch_size()
@@ -1986,20 +2003,21 @@ class DynamicNeuroNode:
         num_layers = len(self.my_layer_ids)
         old_checkpointing = getattr(self, '_use_gradient_checkpointing', False)
         
-        # More nuanced checkpointing decision
-        if self.device == "cuda" and self.available_memory_mb > 16000:
-            # High-memory CUDA: only checkpoint if > 150 layers
-            self._use_gradient_checkpointing = num_layers > 150
-        elif self.device == "cuda":
-            # Normal CUDA: checkpoint if > 80 layers
-            self._use_gradient_checkpointing = num_layers > 80 or self.available_memory_mb < 8000
+        # Recalculate checkpointing based on actual memory needs
+        batch_estimate = 8
+        seq_len = 2048
+        num_heads = self.architecture.num_heads if self.architecture else 16
+        attn_memory_gb = (batch_estimate * num_heads * seq_len * seq_len * num_layers * 4) / (1024**3)
+        vocab_size = getattr(self, 'vocab_capacity', 32000)
+        vocab_memory_gb = (2 * vocab_size * (self.architecture.hidden_dim if self.architecture else 512) * 16) / (1024**3)
+        available_gb = self.available_memory_mb / 1024
+        
+        need_checkpointing = (attn_memory_gb + vocab_memory_gb) > (available_gb * 0.5)
+        
+        if self.device == "cuda":
+            self._use_gradient_checkpointing = need_checkpointing or num_layers > 24
         else:
-            # CPU/MPS: original logic
-            self._use_gradient_checkpointing = (
-                self.available_memory_mb < 8000 or
-                (self.device == "mps" and num_layers > 20) or
-                num_layers > 50
-            )
+            self._use_gradient_checkpointing = need_checkpointing or num_layers > 16
         
         if old_batch != self._training_batch_size or old_checkpointing != self._use_gradient_checkpointing:
             logger.info(f"[NODE] Training config updated: batch_size={old_batch}→{self._training_batch_size}, "
