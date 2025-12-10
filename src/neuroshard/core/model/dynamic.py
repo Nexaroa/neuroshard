@@ -597,12 +597,15 @@ class DynamicLayerPool:
             return discovered_layers
         
         try:
+            import hashlib
             # Query for layers 0-1000 (reasonable max)
             # DHT lookup is fast - O(log N) hops
             for layer_id in range(min(1000, self.current_num_layers + 100)):
-                key = f"layer_{layer_id}"
+                key_string = f"layer_{layer_id}"
+                # Hash the key string to get integer key (same as announce())
+                key_int = int(hashlib.sha1(key_string.encode()).hexdigest(), 16)
                 try:
-                    value = self.dht.lookup_value(key)
+                    value = self.dht.lookup_value(key_int)
                     if value:
                         discovered_layers.add(layer_id)
                 except Exception:
