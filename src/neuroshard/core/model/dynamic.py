@@ -170,7 +170,32 @@ class DynamicLayerPool:
         # Threading
         self.lock = threading.Lock()
         
+        # Checkpoint directory (shared with DynamicNeuroNode)
+        self.CHECKPOINT_DIR = Path.home() / ".neuroshard" / "checkpoints"
+        self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        
         logger.info("DynamicLayerPool initialized with dynamic width + depth scaling")
+    
+    def _get_checkpoint_path(self, node_id: str) -> Optional[Path]:
+        """
+        Get checkpoint path for a node (used to check if node was previously DRIVER).
+        
+        Uses wallet_id (first 16 chars of node_id hash) for stable paths.
+        """
+        import hashlib
+        # Mirror the wallet_id calculation from DynamicNeuroNode
+        wallet_id = hashlib.sha256(node_id.encode()).hexdigest()[:16]
+        
+        path = self.CHECKPOINT_DIR / f"dynamic_node_{wallet_id}.pt"
+        if path.exists():
+            return path
+            
+        # Also check legacy path
+        legacy_path = self.CHECKPOINT_DIR / f"dynamic_node_{node_id[:16]}.pt"
+        if legacy_path.exists():
+            return legacy_path
+            
+        return None
     
     def _auto_recalculate_architecture(self):
         """
@@ -286,6 +311,22 @@ class DynamicLayerPool:
             # BUT: DHT may have STALE data from previous runs - don't blindly trust it!
             dht_layers = set()
             
+            # CHECKPOINT-AWARE ROLE ASSIGNMENT:
+            # If this node has a checkpoint with layer 0 (embedding), it WAS a DRIVER.
+            # Don't let stale DHT data override this - the checkpoint is MORE authoritative
+            # for this node's own role than potentially stale network state.
+            checkpoint_has_layer_0 = False
+            try:
+                checkpoint_path = self._get_checkpoint_path(node_id)
+                if checkpoint_path and checkpoint_path.exists():
+                    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                    saved_layer_ids = checkpoint.get("layer_ids", [])
+                    checkpoint_has_layer_0 = 0 in saved_layer_ids
+                    if checkpoint_has_layer_0:
+                        logger.info(f"Checkpoint has layer 0 - this node was previously a DRIVER")
+            except Exception as e:
+                logger.debug(f"Could not check checkpoint for layer 0: {e}")
+            
             # DHT discovery (P2P must be connected BEFORE start() for this to work!)
             if self.dht:
                 dht_layers = self._discover_network_layers_from_dht()
@@ -356,6 +397,13 @@ class DynamicLayerPool:
                     role_hint = "DRIVER"  # Keep as driver (already full)
                     needs_embedding = True
                     logger.info(f"This is the full node - keeping as DRIVER")
+                elif checkpoint_has_layer_0:
+                    # CRITICAL: This node's checkpoint has layer 0, meaning it WAS a DRIVER!
+                    # Don't let stale DHT data demote it - checkpoint is authoritative for own role.
+                    # This handles the case where both nodes restart and see stale DHT from each other.
+                    role_hint = "DRIVER"
+                    needs_embedding = True
+                    logger.info(f"Checkpoint has layer 0 - reclaiming DRIVER role (ignoring stale DHT)")
                 else:
                     # New node joining a network with a full node
                     # Become WORKER+VALIDATOR: get last layer + work backwards
