@@ -2286,10 +2286,43 @@ def run_node(
     P2P = P2PManager(my_url, "0-0", tracker, node_token=node_token)
     P2P.state_ref = STATE
     
-    # Give DHT time to bootstrap and discover peers
+    # CRITICAL: Synchronously fetch peers and populate routing table BEFORE node creation!
+    # The background thread might not have run yet, so we do it explicitly here.
     logger.info("DHT bootstrapping... (discovering existing nodes)")
     import time
-    time.sleep(2)  # Allow DHT to sync with network
+    
+    try:
+        import requests
+        from urllib.parse import urlparse
+        from neuroshard.core.network.dht import Node
+        
+        # Fetch ALL peers from tracker
+        resp = requests.get(f"{tracker}/peers", params={"limit": 100}, timeout=5)
+        if resp.status_code == 200:
+            peers = resp.json()
+            peer_count = 0
+            for p in peers:
+                if p.get("url") != my_url:
+                    P2P.known_peers[p["url"]] = p
+                    # Add to DHT routing table so layer lookups can find them!
+                    if P2P.routing_table:
+                        try:
+                            p_parsed = urlparse(p["url"])
+                            p_ip = p_parsed.hostname
+                            p_port = p_parsed.port or 80
+                            import hashlib
+                            p_id = int(hashlib.sha1(f"{p['url']}".encode()).hexdigest(), 16)
+                            P2P.routing_table.add_contact(Node(p_id, p_ip, p_port))
+                            peer_count += 1
+                        except:
+                            pass
+            if peer_count > 0:
+                logger.info(f"DHT: Added {peer_count} peers to routing table")
+    except Exception as e:
+        logger.debug(f"Peer discovery failed: {e}")
+    
+    # Additional wait to let DHT stabilize
+    time.sleep(1)
     
     logger.info(f"Initializing NeuroShard Node (training={enable_training}, DiLoCo steps={diloco_inner_steps})...")
     
