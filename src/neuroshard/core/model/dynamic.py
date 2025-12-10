@@ -283,15 +283,22 @@ class DynamicLayerPool:
             
             # CRITICAL FIX: Discover network state from DHT BEFORE making role decisions!
             # Each node has its own LOCAL layer_pool, so we need DHT for network-wide view.
+            # BUT: DHT may have STALE data from previous runs - don't blindly trust it!
             dht_layers = set()
             if self.dht:
                 dht_layers = self._discover_network_layers_from_dht()
                 if dht_layers:
-                    # Update our view of network size
                     highest_layer = max(dht_layers)
-                    if highest_layer >= self.current_num_layers:
+                    # SANITY CHECK: Only expand if DHT layers are "reasonable"
+                    # If DHT shows 32 layers but our checkpoint has 6, something is stale
+                    # Allow up to 2x checkpoint layers as "reasonable" growth
+                    max_reasonable = max(32, self.current_num_layers * 2)
+                    if highest_layer >= self.current_num_layers and highest_layer < max_reasonable:
                         self.current_num_layers = highest_layer + 1
                         logger.info(f"DHT discovery: network has {self.current_num_layers} layers")
+                    elif highest_layer >= max_reasonable:
+                        logger.warning(f"DHT shows {highest_layer + 1} layers but seems stale (checkpoint has {self.current_num_layers})")
+                        logger.warning(f"Ignoring stale DHT data - will use checkpoint layer count")
             
             driver_count = len(self.layer_assignments.get(0, []))
             validator_layer = max(0, self.current_num_layers - 1) if self.current_num_layers > 0 else 0
@@ -527,10 +534,17 @@ class DynamicLayerPool:
                 self.embedding_holder = node_id 
                 logger.info(f"Node {node_id[:8]}... became a Driver (Layer 0)")
             
-            # Any node with Last Layer has head
-            if (self.current_num_layers - 1) in assigned_layers:
-                self.lm_head_holder = node_id
-                logger.info(f"Node {node_id[:8]}... became a Validator (Last Layer)")
+            # Any node with highest assigned layer becomes Validator (LM head holder)
+            # CRITICAL FIX: Use max(assigned_layers), NOT current_num_layers - 1
+            # This handles the case where checkpoint has fewer layers than stale DHT data
+            if assigned_layers:
+                actual_last_layer = max(assigned_layers)
+                # Check if this node holds the highest layer in the network
+                # OR if there's no other holder for this layer yet
+                if not self.lm_head_holder or actual_last_layer >= (self.current_num_layers - 1):
+                    self.lm_head_holder = node_id
+                    self.current_num_layers = actual_last_layer + 1  # Update to match reality
+                    logger.info(f"Node {node_id[:8]}... became a Validator (Layer {actual_last_layer})")
             
             # EARLY NETWORK NOTICE: When there are <10 nodes, each must hold many/all layers
             # This is TEMPORARY - as more nodes join, layers will be distributed
