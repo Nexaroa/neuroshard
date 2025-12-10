@@ -959,6 +959,12 @@ class DynamicNeuroLLM:
         self.my_layers: Dict[int, torch.nn.Module] = {}
         self.my_layer_ids: List[int] = []
         
+        # Callback for when layers change (set by DynamicNeuroNode to sync state)
+        self._on_layers_changed: Optional[callable] = None
+        
+        # Reference to P2P manager for DHT updates during layer removal
+        self._p2p_manager = None
+        
         # Do I hold embedding/head?
         self.has_embedding = False
         self.has_lm_head = False
@@ -1165,7 +1171,7 @@ class DynamicNeuroLLM:
         
         return added
     
-    def remove_layers(self, layer_ids_to_remove: List[int]) -> List[int]:
+    def remove_layers(self, layer_ids_to_remove: List[int], layer_pool=None, p2p_manager=None) -> List[int]:
         """
         Dynamically remove layers from a running model.
         
@@ -1175,8 +1181,13 @@ class DynamicNeuroLLM:
         - Network is redistributing layers
         - Memory pressure detected
         
+        IMPORTANT: This also updates layer_pool and DHT announcements so other
+        nodes know we no longer hold these layers!
+        
         Args:
             layer_ids_to_remove: Layer IDs to remove
+            layer_pool: DynamicLayerPool to update assignments (optional)
+            p2p_manager: P2PManager to update DHT announcements (optional)
             
         Returns:
             List of layer IDs that were successfully removed
@@ -1206,6 +1217,37 @@ class DynamicNeuroLLM:
         if removed:
             self.my_layer_ids = sorted(self.my_layers.keys())
             
+            # UPDATE LAYER POOL: Remove this node from removed layers' assignments
+            if layer_pool:
+                try:
+                    with layer_pool.lock:
+                        for layer_id in removed:
+                            if layer_id in layer_pool.layer_assignments:
+                                # Remove our node from this layer's holders
+                                layer_pool.layer_assignments[layer_id] = [
+                                    a for a in layer_pool.layer_assignments[layer_id]
+                                    if a.node_id != self.node_id
+                                ]
+                                logger.info(f"[LAYER] Updated layer_pool: removed self from layer {layer_id}")
+                except Exception as e:
+                    logger.warning(f"[LAYER] Could not update layer_pool: {e}")
+            
+            # UPDATE DHT: Change announced layer range
+            if p2p_manager and self.my_layer_ids:
+                try:
+                    new_start = min(self.my_layer_ids)
+                    new_end = max(self.my_layer_ids)
+                    p2p_manager.start_layer = new_start
+                    p2p_manager.end_layer = new_end
+                    p2p_manager.shard_range = f"{new_start}-{new_end}"
+                    logger.info(f"[LAYER] Updated P2P shard_range: {new_start}-{new_end}")
+                    
+                    # Re-announce immediately so network knows
+                    if hasattr(p2p_manager, '_announce_once'):
+                        p2p_manager._announce_once(verbose=True)
+                except Exception as e:
+                    logger.warning(f"[LAYER] Could not update P2P shard_range: {e}")
+            
             # Force garbage collection to free memory
             import gc
             gc.collect()
@@ -1214,6 +1256,13 @@ class DynamicNeuroLLM:
             
             logger.info(f"[LAYER] ✅ Removed {len(removed)} layers: {removed}")
             logger.info(f"[LAYER] Now holding {len(self.my_layer_ids)} layers")
+            
+            # NOTIFY: Call callback so node can sync its state
+            if self._on_layers_changed:
+                try:
+                    self._on_layers_changed(self.my_layer_ids)
+                except Exception as e:
+                    logger.warning(f"[LAYER] Callback failed: {e}")
         
         return removed
     
@@ -1282,7 +1331,13 @@ class DynamicNeuroLLM:
                     layers_to_remove = sorted(self.my_layers.keys(), reverse=True)[:layers_to_free]
                     logger.warning(f"[VOCAB] Attempting to free memory by removing {layers_to_free} layers: {layers_to_remove}")
                     
-                    removed = self.remove_layers(layers_to_remove)
+                    # Pass layer_pool so network state is updated
+                    # p2p_manager will be notified via layer_pool.on_layers_changed callback
+                    removed = self.remove_layers(
+                        layers_to_remove, 
+                        layer_pool=self.layer_pool,
+                        p2p_manager=getattr(self, '_p2p_manager', None)
+                    )
                     if removed:
                         # Recalculate free memory after layer removal
                         if torch.cuda.is_available() and self.device != "cpu":
@@ -1872,6 +1927,21 @@ class DynamicNeuroNode:
         )
         self.model.initialize_layers(self.my_layer_ids)
         
+        # 3b. Set up callback for dynamic layer changes
+        # When model removes layers (e.g., for vocab expansion), sync node state
+        def on_layers_changed(new_layer_ids: List[int]):
+            self.my_layer_ids = new_layer_ids
+            # Update P2P shard_range if available
+            if self.p2p_manager and new_layer_ids:
+                new_start = min(new_layer_ids)
+                new_end = max(new_layer_ids)
+                self.p2p_manager.start_layer = new_start
+                self.p2p_manager.end_layer = new_end
+                self.p2p_manager.shard_range = f"{new_start}-{new_end}"
+                logger.info(f"[NODE] Synced layer_ids after change: {new_layer_ids}")
+        
+        self.model._on_layers_changed = on_layers_changed
+        
         # 4. Initialize tokenizer with learned BPE merges from CDN
         from neuroshard.core.model.tokenizer import get_neuro_tokenizer, NeuroTokenizer
         self.tokenizer = get_neuro_tokenizer()
@@ -2172,20 +2242,25 @@ class DynamicNeuroNode:
     def connect_p2p(self, p2p_manager):
         """Connect to P2P network."""
         self.p2p_manager = p2p_manager
-        
+
         # Initialize Data Swarm
         from neuroshard.core.network.p2p_data import DataSwarm
-        
+
         # Ensure cache dir exists in a writable location
         data_cache_dir = self.CHECKPOINT_DIR / "data_cache"
         data_cache_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.swarm = DataSwarm(p2p_manager, cache_dir=str(data_cache_dir))
-        
+
         # Update layer pool with DHT
         if self.layer_pool and hasattr(p2p_manager, 'dht'):
             self.layer_pool.dht = p2p_manager.dht
         
+        # IMPORTANT: Give model access to p2p_manager for dynamic layer updates
+        # When vocab expansion removes layers, the model needs to update DHT
+        if self.model:
+            self.model._p2p_manager = p2p_manager
+
         logger.info("Connected to P2P network and Data Swarm")
     
     # ==================== INFERENCE ====================
