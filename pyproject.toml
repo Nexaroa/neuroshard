@@ -92,6 +92,8 @@ Issues = "https://github.com/Nexaroa/neuroshard/issues"
 neuroshard-node = "neuroshard.cli:main"
 # Alias for convenience
 neuroshard = "neuroshard.cli:main"
+# Governance CLI
+neuroshard-governance = "neuroshard.governance_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

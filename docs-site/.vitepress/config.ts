@@ -23,12 +23,14 @@ themeConfig: {
         { text: 'Guide', link: '/guide/introduction' },
         { text: 'Architecture', link: '/architecture/overview' },
         { text: 'Economics', link: '/economics/overview' },
+        { text: 'Governance', link: '/governance/overview' },
         { text: 'API Reference', link: '/api/overview' },
         {
           text: 'Resources',
           items: [
             { text: 'Whitepaper', link: 'https://neuroshard.com/whitepaper' },
             { text: 'Ledger Explorer', link: 'https://neuroshard.com/ledger' },
+            { text: 'Governance Portal', link: 'https://neuroshard.com/governance' },
             { text: 'Download Node', link: 'https://neuroshard.com/download' },
             { text: 'Main Website', link: 'https://neuroshard.com' },
           ]
@@ -117,6 +119,25 @@ themeConfig: {
               { text: 'Token Overview', link: '/economics/overview' },
               { text: 'Staking Guide', link: '/economics/staking' },
               { text: 'Reward System', link: '/economics/rewards' },
+            ]
+          }
+        ],
+        '/governance/': [
+          {
+            text: 'Governance',
+            collapsed: false,
+            items: [
+              { text: 'Overview', link: '/governance/overview' },
+              { text: 'Creating Proposals', link: '/governance/proposals' },
+              { text: 'Voting Guide', link: '/governance/voting' },
+            ]
+          },
+          {
+            text: 'Protocol',
+            collapsed: false,
+            items: [
+              { text: 'Versioning', link: '/governance/versioning' },
+              { text: 'Active NEPs', link: '/governance/active' },
             ]
           }
         ],
