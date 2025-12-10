@@ -2571,10 +2571,19 @@ def run_node(
                         if loss_avg > 0:
                             loss_var = stats.get('loss_variance', 0)
                             steps_shard = stats.get('steps_on_current_shard', 0)
-                            plateau_thresh = stats.get('plateau_threshold', 0.02)
-                            plateau_status = "yes" if loss_var < plateau_thresh and loss_avg < 0.05 else "no"
+                            min_steps = 100  # Minimum steps before plateau can trigger rotation
+                            
+                            # Plateau = low variance + low loss + enough steps
+                            is_plateau = loss_var < 0.02 and loss_avg < 0.05 and steps_shard >= min_steps
+                            if is_plateau:
+                                plateau_status = "will_rotate"
+                            elif loss_var < 0.02 and loss_avg < 0.05:
+                                plateau_status = f"plateau (need {min_steps - steps_shard} more steps)"
+                            else:
+                                plateau_status = "learning"
+                            
                             logger.info(f"[NODE] Training: loss_avg={loss_avg:.4f}, variance={loss_var:.6f}, "
-                                  f"steps_on_shard={steps_shard}, plateau={plateau_status}")
+                                  f"steps_on_shard={steps_shard}, status={plateau_status}")
 
                     last_memory_report = now
                 except Exception:

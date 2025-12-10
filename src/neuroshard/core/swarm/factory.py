@@ -314,13 +314,14 @@ class SwarmEnabledDynamicNode:
         logger.info(f"[SWARM]   - Checkpointing: interval={config.checkpoint_interval}s")
         logger.info(f"[SWARM]   - Heartbeat: interval={config.heartbeat_interval}s")
         
+        # Make swarm accessible from base_node BEFORE restoring pending state
+        # (DiLoCo restore needs access to self.swarm)
+        base_node.swarm = self.swarm
+        
         # Restore pending state from checkpoint (DiLoCo, optimizer)
-        # This must happen AFTER swarm components are initialized
+        # This must happen AFTER swarm components are initialized AND base_node.swarm is set
         if hasattr(base_node, '_restore_pending_state'):
             base_node._restore_pending_state()
-        
-        # Also make swarm accessible from base_node for checkpoint saving
-        base_node.swarm = self.swarm
     
     # ==================== PROPERTIES ====================
     # Expose training state for runner/dashboard access
