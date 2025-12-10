@@ -1568,9 +1568,14 @@ class DynamicNeuroNode:
                         self.tokenizer.merge_to_tokens = learned_tokenizer.merge_to_tokens
                         self.tokenizer.next_merge_id = learned_tokenizer.next_merge_id
                         
-                        logger.info(f"[TOKENIZER] Loaded BPE tokenizer: {self.tokenizer.next_merge_id} tokens, {len(self.tokenizer.merges)} merges")
+                        logger.info(f"[TOKENIZER] Loaded BPE tokenizer: {self.tokenizer.current_vocab_size} tokens, {len(self.tokenizer.merges)} merges")
+                        
+                        # CRITICAL: Check if model needs vocabulary expansion after loading new tokenizer
+                        if self.model is not None:
+                            self.model.tokenizer = self.tokenizer
+                            self.model.check_and_expand_vocab_if_needed()
                     else:
-                        logger.debug(f"[TOKENIZER] Already up to date: {self.tokenizer.next_merge_id} tokens")
+                        logger.debug(f"[TOKENIZER] Already up to date: {self.tokenizer.current_vocab_size} tokens")
                     return
             except requests.RequestException as e:
                 logger.debug(f"[TOKENIZER] CDN fetch failed: {e}")
@@ -1585,14 +1590,14 @@ class DynamicNeuroNode:
                         self.tokenizer.merges = learned_tokenizer.merges
                         self.tokenizer.merge_to_tokens = learned_tokenizer.merge_to_tokens
                         self.tokenizer.next_merge_id = learned_tokenizer.next_merge_id
-                        logger.info(f"[TOKENIZER] Loaded cached BPE tokenizer: {self.tokenizer.next_merge_id} tokens")
+                        logger.info(f"[TOKENIZER] Loaded cached BPE tokenizer: {self.tokenizer.current_vocab_size} tokens")
+                        
+                        # CRITICAL: Check if model needs vocabulary expansion
+                        if self.model is not None:
+                            self.model.tokenizer = self.tokenizer
+                            self.model.check_and_expand_vocab_if_needed()
                 except Exception as e:
                     logger.warning(f"[TOKENIZER] Failed to load cached tokenizer: {e}")
-            
-            # Check if model needs vocabulary expansion
-            if self.model is not None:
-                self.model.tokenizer = self.tokenizer  # Ensure model has reference
-                self.model.check_and_expand_vocab_if_needed()
                     
         except Exception as e:
             logger.warning(f"[TOKENIZER] Error loading learned tokenizer: {e}")
