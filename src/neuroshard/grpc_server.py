@@ -696,7 +696,10 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             )
             
             # Queue in inbound buffer (non-blocking)
-            inbound = self.model.swarm.inbound_buffer
+            # Note: swarm_components contains SwarmComponents (router, buffers, etc.)
+            # Not to be confused with swarm (DataSwarm for P2P downloads)
+            inbound = getattr(self.model, 'swarm_components', None)
+            inbound = inbound.inbound_buffer if inbound else None
             if inbound:
                 success = inbound.put_nowait(packet)
                 if success:
@@ -775,7 +778,9 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
         """
         try:
             # Update router with peer info
-            router = self.model.swarm.swarm_router
+            # Note: swarm_components contains SwarmComponents (router, buffers, etc.)
+            router = getattr(self.model, 'swarm_components', None)
+            router = router.swarm_router if router else None
             if router:
                 from neuroshard.core.swarm.heartbeat import CapacityBitmask
                 

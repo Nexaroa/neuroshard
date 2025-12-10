@@ -2401,8 +2401,9 @@ def run_node(
         
         # 2. HEARTBEAT/PEER_STATS VERIFICATION (from swarm router)
         # Heartbeats contain node_id AND layer_range - this is the best source for remote nodes!
-        if hasattr(NEURO_NODE, 'swarm') and NEURO_NODE.swarm and hasattr(NEURO_NODE.swarm, 'swarm_router'):
-            router = NEURO_NODE.swarm.swarm_router
+        # Note: swarm_components contains SwarmComponents (router, buffers, etc.)
+        if hasattr(NEURO_NODE, 'swarm_components') and NEURO_NODE.swarm_components and hasattr(NEURO_NODE.swarm_components, 'swarm_router'):
+            router = NEURO_NODE.swarm_components.swarm_router
             if hasattr(router, 'peer_stats') and node_id in router.peer_stats:
                 peer = router.peer_stats[node_id]
                 layer_range = peer.layer_range  # (start, end) tuple

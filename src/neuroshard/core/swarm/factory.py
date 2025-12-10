@@ -305,8 +305,9 @@ class SwarmEnabledDynamicNode:
         self._total_training_rounds = base_node.total_training_rounds
         self._current_loss = base_node.current_loss if base_node.current_loss != float('inf') else float('inf')
         
-        # Initialize swarm components
-        self.swarm = SwarmComponents()
+        # Initialize swarm components (router, heartbeat, compute, etc.)
+        # NOTE: Named swarm_components to avoid conflict with base_node.swarm (DataSwarm)
+        self.swarm_components = SwarmComponents()
         self._init_swarm_components()
         
         logger.info(f"[SWARM] SwarmEnabledNode initialized for {self.node_id[:16]}...")
@@ -314,9 +315,10 @@ class SwarmEnabledDynamicNode:
         logger.info(f"[SWARM]   - Checkpointing: interval={config.checkpoint_interval}s")
         logger.info(f"[SWARM]   - Heartbeat: interval={config.heartbeat_interval}s")
         
-        # Make swarm accessible from base_node BEFORE restoring pending state
-        # (DiLoCo restore needs access to self.swarm)
-        base_node.swarm = self.swarm
+        # Make swarm_components accessible from base_node BEFORE restoring pending state
+        # (DiLoCo restore needs access to swarm_components)
+        # NOTE: Don't overwrite base_node.swarm - that's the DataSwarm for P2P downloads!
+        base_node.swarm_components = self.swarm_components
         
         # Restore pending state from checkpoint (DiLoCo, optimizer)
         # This must happen AFTER swarm components are initialized AND base_node.swarm is set
@@ -356,8 +358,8 @@ class SwarmEnabledDynamicNode:
     @property
     def current_training_round(self) -> int:
         """Current DiLoCo outer round (for gradient sync coordination)."""
-        if self.swarm.diloco_trainer:
-            return self.swarm.diloco_trainer.stats.outer_step_count
+        if self.swarm_components.diloco_trainer:
+            return self.swarm_components.diloco_trainer.stats.outer_step_count
         return 0
     
     def _init_swarm_components(self):
@@ -368,10 +370,10 @@ class SwarmEnabledDynamicNode:
         from neuroshard.core.swarm.compute import ComputeEngine
         
         # Create buffers
-        self.swarm.inbound_buffer = ActivationBuffer(
+        self.swarm_components.inbound_buffer = ActivationBuffer(
             max_size=self.config.inbound_buffer_size
         )
-        self.swarm.outbound_buffer = OutboundBuffer(
+        self.swarm_components.outbound_buffer = OutboundBuffer(
             max_size=self.config.outbound_buffer_size,
             soft_overflow_threshold=self.config.soft_overflow_threshold,
             hard_overflow_threshold=self.config.hard_overflow_threshold,
@@ -379,26 +381,26 @@ class SwarmEnabledDynamicNode:
         
         # Create router
         dht = self.p2p_manager.dht if self.p2p_manager else None
-        self.swarm.swarm_router = SwarmRouter(dht_protocol=dht)
-        self.swarm.swarm_router.K_CANDIDATES = self.config.k_candidates
-        self.swarm.swarm_router.ACK_TIMEOUT_MS = self.config.ack_timeout_ms
+        self.swarm_components.swarm_router = SwarmRouter(dht_protocol=dht)
+        self.swarm_components.swarm_router.K_CANDIDATES = self.config.k_candidates
+        self.swarm_components.swarm_router.ACK_TIMEOUT_MS = self.config.ack_timeout_ms
         
         # Create heartbeat service
-        self.swarm.heartbeat_service = SwarmHeartbeatService(
+        self.swarm_components.heartbeat_service = SwarmHeartbeatService(
             node_id=self.node_id,
             udp_port=self.config.heartbeat_port,
         )
-        self.swarm.heartbeat_service.HEARTBEAT_INTERVAL = self.config.heartbeat_interval
-        self.swarm.heartbeat_service.set_capacity_callback(self._get_capacity_bitmask)
-        self.swarm.heartbeat_service.set_peer_update_callback(
-            self.swarm.swarm_router.update_peer_from_heartbeat
+        self.swarm_components.heartbeat_service.HEARTBEAT_INTERVAL = self.config.heartbeat_interval
+        self.swarm_components.heartbeat_service.set_capacity_callback(self._get_capacity_bitmask)
+        self.swarm_components.heartbeat_service.set_peer_update_callback(
+            self.swarm_components.swarm_router.update_peer_from_heartbeat
         )
         
         # Create compute engine
-        self.swarm.compute_engine = ComputeEngine(
+        self.swarm_components.compute_engine = ComputeEngine(
             model=self.model,
-            inbound=self.swarm.inbound_buffer,
-            outbound=self.swarm.outbound_buffer,
+            inbound=self.swarm_components.inbound_buffer,
+            outbound=self.swarm_components.outbound_buffer,
             diloco_trainer=None,  # Set after DiLoCo init
             num_micro_batches=self.config.num_micro_batches,
         )
@@ -421,7 +423,7 @@ class SwarmEnabledDynamicNode:
         )
         
         # Create outer optimizer
-        self.swarm.outer_optimizer = OuterOptimizer(
+        self.swarm_components.outer_optimizer = OuterOptimizer(
             lr=self.config.diloco_outer_lr,
             momentum=self.config.diloco_outer_momentum,
         )
@@ -433,21 +435,21 @@ class SwarmEnabledDynamicNode:
             outer_momentum=self.config.diloco_outer_momentum,
         )
         
-        self.swarm.diloco_trainer = DiLoCoTrainer(
+        self.swarm_components.diloco_trainer = DiLoCoTrainer(
             model=self.model,
             config=diloco_config,
             inner_optimizer=self.base_node.optimizer,
         )
         
         # Connect to compute engine
-        self.swarm.compute_engine.diloco = self.swarm.diloco_trainer
+        self.swarm_components.compute_engine.diloco = self.swarm_components.diloco_trainer
         
         # Create gradient validator
         validation_config = ValidationConfig(
             min_cosine_similarity=self.config.cosine_threshold,
             max_magnitude_ratio=self.config.magnitude_ratio_threshold,
         )
-        self.swarm.gradient_validator = GradientValidator(config=validation_config)
+        self.swarm_components.gradient_validator = GradientValidator(config=validation_config)
         
         # Create robust aggregator
         strategy_map = {
@@ -464,7 +466,7 @@ class SwarmEnabledDynamicNode:
             trim_fraction=self.config.trimmed_mean_beta,
         )
         
-        self.swarm.robust_aggregator = RobustAggregator(
+        self.swarm_components.robust_aggregator = RobustAggregator(
             aggregation_config=agg_config,
             validation_config=validation_config,
         )
@@ -479,11 +481,11 @@ class SwarmEnabledDynamicNode:
             max_hot_snapshots=self.config.max_checkpoints,
         )
         
-        self.swarm.speculative_checkpointer = SpeculativeCheckpointer(
+        self.swarm_components.speculative_checkpointer = SpeculativeCheckpointer(
             model=self.model,
             optimizer=self.base_node.optimizer,
             config=checkpoint_config,
-            diloco_trainer=self.swarm.diloco_trainer,
+            diloco_trainer=self.swarm_components.diloco_trainer,
             p2p_manager=self.p2p_manager,
         )
     
@@ -540,8 +542,8 @@ class SwarmEnabledDynamicNode:
             layer_range = (min(self.my_layer_ids), max(self.my_layer_ids) + 1)
         
         # Get buffer status
-        queue_depth = len(self.swarm.inbound_buffer) if self.swarm.inbound_buffer else 0
-        is_backpressured = self.swarm.inbound_buffer.is_backpressured if self.swarm.inbound_buffer else False
+        queue_depth = len(self.swarm_components.inbound_buffer) if self.swarm_components.inbound_buffer else 0
+        is_backpressured = self.swarm_components.inbound_buffer.is_backpressured if self.swarm_components.inbound_buffer else False
         
         return CapacityBitmask(
             node_id=self.node_id,
@@ -561,21 +563,21 @@ class SwarmEnabledDynamicNode:
     
     def start(self):
         """Start all swarm components."""
-        self.swarm.start_sync()
+        self.swarm_components.start_sync()
         logger.info("[SWARM] Node started")
     
     def stop(self):
         """Stop all swarm components."""
-        self.swarm.stop_sync()
+        self.swarm_components.stop_sync()
         logger.info("[SWARM] Node stopped")
     
     async def start_async(self):
         """Start async swarm components."""
-        await self.swarm.start_async()
+        await self.swarm_components.start_async()
     
     async def stop_async(self):
         """Stop async swarm components."""
-        await self.swarm.stop_async()
+        await self.swarm_components.stop_async()
     
     # ==================== BUFFER ACCESS ====================
     
@@ -585,13 +587,13 @@ class SwarmEnabledDynamicNode:
         
         Called by gRPC handler when SwarmForward is received.
         """
-        return self.swarm.inbound_buffer.put_nowait(packet)
+        return self.swarm_components.inbound_buffer.put_nowait(packet)
     
     def get_buffer_status(self) -> Dict[str, Any]:
         """Get status of inbound and outbound buffers."""
         return {
-            'inbound': self.swarm.inbound_buffer.get_stats(),
-            'outbound': self.swarm.outbound_buffer.get_stats(),
+            'inbound': self.swarm_components.inbound_buffer.get_stats(),
+            'outbound': self.swarm_components.outbound_buffer.get_stats(),
         }
     
     # ==================== ROUTING ====================
@@ -608,7 +610,7 @@ class SwarmEnabledDynamicNode:
         num_layers = self.layer_pool.current_num_layers if self.layer_pool else 12
         
         for layer_id in range(num_layers):
-            candidates = self.swarm.swarm_router.get_candidates(layer_id)
+            candidates = self.swarm_components.swarm_router.get_candidates(layer_id)
             if candidates:
                 route[layer_id] = candidates
         
@@ -668,7 +670,7 @@ class SwarmEnabledDynamicNode:
             return self.base_node.train_step()
         
         # LOCAL TRAINING: Full node with embedding + LM head
-        diloco = self.swarm.diloco_trainer
+        diloco = self.swarm_components.diloco_trainer
         
         # Get training data
         batch = self.base_node._get_training_batch()
@@ -770,7 +772,7 @@ class SwarmEnabledDynamicNode:
         from neuroshard.core.network.connection_pool import get_channel
         from urllib.parse import urlparse
         
-        diloco = self.swarm.diloco_trainer
+        diloco = self.swarm_components.diloco_trainer
         
         # Step 1: Compute local pseudo-gradient
         pseudo_grad = diloco.compute_pseudo_gradient()
@@ -885,11 +887,11 @@ class SwarmEnabledDynamicNode:
         # Step 4: Aggregate using robust aggregator
         aggregated_grads = pseudo_grad  # Default to local if no peers
         
-        if len(all_contributions) > 1 and self.swarm.robust_aggregator:
+        if len(all_contributions) > 1 and self.swarm_components.robust_aggregator:
             logger.info(f"[SWARM] Aggregating {len(all_contributions)} contributions")
             try:
                 # Clear previous contributions and add new ones
-                self.swarm.robust_aggregator.clear()
+                self.swarm_components.robust_aggregator.clear()
                 
                 # Add peer contributions (validate against our local gradient)
                 rejected_peers = []
@@ -897,7 +899,7 @@ class SwarmEnabledDynamicNode:
                     if contrib["node_id"] == self.node_id:
                         continue  # Skip self - add as local_grads
                     
-                    accepted, reason = self.swarm.robust_aggregator.add_contribution(
+                    accepted, reason = self.swarm_components.robust_aggregator.add_contribution(
                         peer_id=contrib["node_id"],
                         gradients=contrib["gradients"],
                         reference_grads=pseudo_grad,  # Validate against our gradient
@@ -908,7 +910,7 @@ class SwarmEnabledDynamicNode:
                         rejected_peers.append((contrib["node_id"][:16], reason))
                 
                 # Aggregate with our local gradients included
-                aggregated_grads = self.swarm.robust_aggregator.aggregate(
+                aggregated_grads = self.swarm_components.robust_aggregator.aggregate(
                     local_grads=pseudo_grad
                 )
                 
@@ -980,8 +982,8 @@ class SwarmEnabledDynamicNode:
             
             # === SECURITY CHECK 2: Round ID Freshness ===
             # Only accept gradients from recent rounds (within 2 rounds)
-            if self.swarm.diloco_trainer:
-                our_round = self.swarm.diloco_trainer.stats.outer_step_count
+            if self.swarm_components.diloco_trainer:
+                our_round = self.swarm_components.diloco_trainer.stats.outer_step_count
                 peer_round = getattr(contribution, 'round_id', 0)
                 if abs(our_round - peer_round) > 2:
                     logger.warning(
@@ -1076,14 +1078,14 @@ class SwarmEnabledDynamicNode:
     
     def get_swarm_status(self) -> Dict[str, Any]:
         """Get detailed swarm status."""
-        return self.swarm.get_stats()
+        return self.swarm_components.get_stats()
     
     def get_diloco_progress(self) -> Dict[str, Any]:
         """Get DiLoCo training progress."""
-        if not self.swarm.diloco_trainer:
+        if not self.swarm_components.diloco_trainer:
             return {"enabled": False}
         
-        diloco = self.swarm.diloco_trainer
+        diloco = self.swarm_components.diloco_trainer
         return {
             "enabled": True,
             "inner_step_count": diloco.stats.inner_step_count,
