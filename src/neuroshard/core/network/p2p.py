@@ -520,13 +520,14 @@ class P2PManager:
             logger.debug(f"Stake gossip to {target_url} failed: {e}")
 
     def _announce_loop(self):
-        # Immediate announce
-        self._announce_once()
+        # Immediate announce on startup (verbose for first time)
+        self._announce_once(verbose=True)
         while self.running:
-            # Interruptible sleep - wakes up immediately on stop()
-            if self._stop_event.wait(timeout=10):
+            # Re-announce every 60 seconds (DHT entries have ~5min TTL)
+            # This is frequent enough for peer discovery but not spammy
+            if self._stop_event.wait(timeout=60):
                 break
-            self._announce_once()
+            self._announce_once(verbose=False)  # Silent re-announce
 
     def broadcast_transaction(self, recipient_id: str, amount: float, signature: str, tx_hash: str):
         """Broadcast a transaction to the P2P network."""
@@ -767,14 +768,26 @@ class P2PManager:
         # 2. This is correct security behavior (like Bitcoin confirmations)
         # 3. Solo-earned NEURO is LOCAL only - needs witnesses to be NETWORK-confirmed
 
-    def _announce_once(self):
+    def _announce_once(self, verbose: bool = True):
         # 1. DHT Announce (Primary)
+        # Announces all layers so peers can find us for pipeline routing
         if self.dht:
             try:
+                num_layers = self.end_layer - self.start_layer + 1
+                success_count = 0
+                
                 # Announce ALL layers we hold so peers can find us for any layer
                 # This is critical for distributed training pipeline routing!
                 for layer_id in range(self.start_layer, self.end_layer + 1):
-                    self.dht.announce(f"layer_{layer_id}")
+                    try:
+                        self.dht.announce(f"layer_{layer_id}")
+                        success_count += 1
+                    except:
+                        pass
+                
+                # Log summary (only on first announce or if verbose)
+                if verbose and num_layers > 0:
+                    logger.info(f"DHT Announce: {success_count}/{num_layers} layers announced (layers {self.start_layer}-{self.end_layer})")
                 
                 # Also announce checkpoint info for distributed training sync
                 if hasattr(self, 'neuro_node') and self.neuro_node:
