@@ -771,10 +771,10 @@ class P2PManager:
         # 1. DHT Announce (Primary)
         if self.dht:
             try:
-                # Announce shard range availability
-                # Key strategy: announce under "layer_X" where X is our start layer
-                # This allows peers looking for layer X to find us.
-                self.dht.announce(f"layer_{self.start_layer}")
+                # Announce ALL layers we hold so peers can find us for any layer
+                # This is critical for distributed training pipeline routing!
+                for layer_id in range(self.start_layer, self.end_layer + 1):
+                    self.dht.announce(f"layer_{layer_id}")
                 
                 # Also announce checkpoint info for distributed training sync
                 if hasattr(self, 'neuro_node') and self.neuro_node:
@@ -874,11 +874,13 @@ class P2PManager:
                         candidates.append(val)
 
         # Strategy 2: Local Cache (Fallback)
+        # Check if target layer is WITHIN the peer's range (not just at start)
         for url, info in self.known_peers.items():
             try:
                 r = info.get("shard_range", "0-0")
                 start, end = map(int, r.split("-"))
-                if start == current_end_layer:
+                # Peer can handle layer if it's within their range
+                if start <= current_end_layer <= end:
                     candidates.append(url)
             except: continue
             
@@ -898,7 +900,8 @@ class P2PManager:
             try:
                 r = info.get("shard_range", "0-0")
                 start, end = map(int, r.split("-"))
-                if start == current_end_layer and url != primary_hop:
+                # Peer can handle layer if it's within their range
+                if start <= current_end_layer <= end and url != primary_hop:
                     candidates.append(url)
             except: continue
             
