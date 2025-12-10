@@ -296,10 +296,31 @@ def estimate_memory_per_layer(arch: ModelArchitecture) -> float:
     return (layer_params * 16) / (1024 * 1024)
 
 
+def estimate_embedding_memory_mb(hidden_dim: int, vocab_capacity: int) -> float:
+    """
+    Estimate memory for embedding and LM head based on vocab capacity.
+    
+    Args:
+        hidden_dim: Model hidden dimension
+        vocab_capacity: Current vocabulary capacity (NOT tokenizer vocab_size)
+    
+    Returns:
+        Memory in MB for embedding + lm_head (weights + gradients + optimizer states)
+    """
+    # Embedding: vocab_capacity × hidden_dim params
+    # LM head: vocab_capacity × hidden_dim params (not tied)
+    # Total: 2 × vocab_capacity × hidden_dim
+    embed_params = 2 * vocab_capacity * hidden_dim
+    
+    # Memory: params × 16 bytes (weights 4B + grads 4B + Adam m 4B + Adam v 4B)
+    return (embed_params * 16) / (1024 * 1024)
+
+
 def calculate_layer_assignment(
     available_memory_mb: float,
     arch: ModelArchitecture,
-    safety_factor: float = 0.6
+    safety_factor: float = 0.6,
+    vocab_capacity: int = 32000
 ) -> int:
     """
     Calculate how many layers a node can hold.
@@ -308,6 +329,7 @@ def calculate_layer_assignment(
         available_memory_mb: Node's available memory
         arch: Current network architecture
         safety_factor: Use only 60% of memory for safety
+        vocab_capacity: Current vocab capacity for embedding/LM head (dynamic!)
     
     Returns:
         Number of layers this node can hold
@@ -315,9 +337,17 @@ def calculate_layer_assignment(
     usable_memory = available_memory_mb * safety_factor
     memory_per_layer = estimate_memory_per_layer(arch)
     
-    # Reserve memory for embedding/LM head if needed (10% overhead)
-    overhead = usable_memory * 0.1
-    usable_for_layers = usable_memory - overhead
+    # DYNAMIC: Calculate actual embedding/LM head memory based on vocab capacity
+    # This is critical for dynamic vocabulary - as vocab grows, less memory for layers!
+    embedding_memory = estimate_embedding_memory_mb(arch.hidden_dim, vocab_capacity)
+    
+    # Reserve memory for embedding, LM head, plus 5% buffer for activations
+    activation_buffer = usable_memory * 0.05
+    usable_for_layers = usable_memory - embedding_memory - activation_buffer
+    
+    if usable_for_layers <= 0:
+        # Not enough memory even for embedding - return minimum
+        return 1
     
     max_layers = max(1, int(usable_for_layers / memory_per_layer))
     

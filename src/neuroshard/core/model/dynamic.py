@@ -152,6 +152,10 @@ class DynamicLayerPool:
         # Node capacities
         self.node_capacities: Dict[str, float] = {}  # node_id -> available_mb
         
+        # DYNAMIC VOCAB: Track current vocabulary capacity for memory calculation
+        # This is updated when vocab expands and affects layer assignment
+        self.vocab_capacity: int = INITIAL_VOCAB_SIZE
+        
         # DYNAMIC ARCHITECTURE (auto-updates as network grows)
         self.current_architecture: Optional[ModelArchitecture] = None
         self.architecture_version: int = 0
@@ -266,9 +270,11 @@ class DynamicLayerPool:
             max_layers_for_node = calculate_layer_assignment(
                 available_memory_mb,
                 self.current_architecture,
-                safety_factor=safety_factor
+                safety_factor=safety_factor,
+                vocab_capacity=self.vocab_capacity
             )
-            logger.info(f"Layer calculation: {available_memory_mb:.0f}MB × {safety_factor} safety = {max_layers_for_node} layers (device={device_type})")
+            logger.info(f"Layer calculation: {available_memory_mb:.0f}MB × {safety_factor} safety = {max_layers_for_node} layers "
+                       f"(device={device_type}, vocab={self.vocab_capacity:,})")
             
             # SCALABILITY: Apply MAX_LAYERS_PER_NODE cap in large networks
             # This prevents single nodes from hogging all layers and ensures
@@ -914,6 +920,136 @@ class DynamicNeuroLLM:
             return True
         except Exception as e:
             logger.error(f"Failed to disable LM head: {e}")
+            return False
+    
+    def add_layers(self, new_layer_ids: List[int]) -> List[int]:
+        """
+        Dynamically add new layers to a running model.
+        
+        This allows the model to grow during training without restart!
+        Called when:
+        - Network needs more layers
+        - Node has available memory
+        - Vocab expansion freed up memory
+        
+        Args:
+            new_layer_ids: Layer IDs to add
+            
+        Returns:
+            List of layer IDs that were successfully added
+        """
+        from neuroshard.core.model.llm import NeuroLLMConfig, NeuroDecoderLayer
+        
+        # Filter out layers we already have
+        layers_to_add = [lid for lid in new_layer_ids if lid not in self.my_layers]
+        if not layers_to_add:
+            return []
+        
+        # Check memory before adding
+        memory_per_layer = estimate_memory_per_layer(self.architecture)
+        required_mb = memory_per_layer * len(layers_to_add)
+        
+        try:
+            if torch.cuda.is_available() and self.device != "cpu":
+                free_mb = (torch.cuda.get_device_properties(0).total_memory - 
+                          torch.cuda.memory_allocated()) / (1024 * 1024)
+            else:
+                import psutil
+                free_mb = psutil.virtual_memory().available / (1024 * 1024)
+            
+            if free_mb < required_mb * 1.5:  # 1.5x safety margin
+                logger.warning(f"[LAYER] Insufficient memory to add {len(layers_to_add)} layers: "
+                              f"need {required_mb:.0f}MB, have {free_mb:.0f}MB")
+                # Add as many as we can fit
+                can_fit = int(free_mb / (memory_per_layer * 1.5))
+                layers_to_add = layers_to_add[:can_fit]
+                if not layers_to_add:
+                    return []
+        except Exception as e:
+            logger.warning(f"[LAYER] Memory check failed: {e}, proceeding cautiously")
+        
+        # Create config from architecture
+        config = NeuroLLMConfig(
+            hidden_dim=self.architecture.hidden_dim,
+            intermediate_dim=self.architecture.intermediate_dim,
+            num_layers=self.architecture.num_layers,
+            num_heads=self.architecture.num_heads,
+            num_kv_heads=self.architecture.num_kv_heads,
+            vocab_size=self.architecture.vocab_size,
+            max_seq_len=self.architecture.max_seq_len,
+            dropout=self.architecture.dropout,
+            rope_theta=self.architecture.rope_theta,
+        )
+        
+        added = []
+        for layer_id in layers_to_add:
+            try:
+                layer = NeuroDecoderLayer(config, layer_id)
+                layer.to(self.device)
+                self.my_layers[layer_id] = layer
+                added.append(layer_id)
+            except Exception as e:
+                logger.error(f"[LAYER] Failed to add layer {layer_id}: {e}")
+                break  # Stop on first failure
+        
+        if added:
+            self.my_layer_ids = sorted(self.my_layers.keys())
+            logger.info(f"[LAYER] ✅ Added {len(added)} layers: {added}")
+            logger.info(f"[LAYER] Now holding {len(self.my_layer_ids)} layers: {self.my_layer_ids[:5]}...{self.my_layer_ids[-5:]}")
+        
+        return added
+    
+    def remove_layers(self, layer_ids_to_remove: List[int]) -> List[int]:
+        """
+        Dynamically remove layers from a running model.
+        
+        This allows the model to shrink during training without restart!
+        Called when:
+        - Vocab growth needs more memory
+        - Network is redistributing layers
+        - Memory pressure detected
+        
+        Args:
+            layer_ids_to_remove: Layer IDs to remove
+            
+        Returns:
+            List of layer IDs that were successfully removed
+        """
+        # Can't remove layers we don't have
+        layers_to_remove = [lid for lid in layer_ids_to_remove if lid in self.my_layers]
+        if not layers_to_remove:
+            return []
+        
+        # Don't remove all layers - keep at least 1
+        if len(layers_to_remove) >= len(self.my_layers):
+            layers_to_remove = layers_to_remove[:-1]  # Keep last one
+            if not layers_to_remove:
+                logger.warning("[LAYER] Cannot remove all layers")
+                return []
+        
+        removed = []
+        for layer_id in layers_to_remove:
+            try:
+                # Delete the layer
+                layer = self.my_layers.pop(layer_id)
+                del layer
+                removed.append(layer_id)
+            except Exception as e:
+                logger.error(f"[LAYER] Failed to remove layer {layer_id}: {e}")
+        
+        if removed:
+            self.my_layer_ids = sorted(self.my_layers.keys())
+            
+            # Force garbage collection to free memory
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            logger.info(f"[LAYER] ✅ Removed {len(removed)} layers: {removed}")
+            logger.info(f"[LAYER] Now holding {len(self.my_layer_ids)} layers")
+        
+        return removed
     
     def expand_vocabulary(self, new_vocab_size: int) -> bool:
         """
@@ -945,6 +1081,68 @@ class DynamicNeuroLLM:
         new_capacity = ((new_vocab_size + VOCAB_GROWTH_CHUNK - 1) // VOCAB_GROWTH_CHUNK) * VOCAB_GROWTH_CHUNK
         if MAX_VOCAB_SIZE is not None:
             new_capacity = min(new_capacity, MAX_VOCAB_SIZE)
+        
+        # MEMORY CHECK: Estimate memory needed for expansion
+        # Embedding + LM head expansion: 2 * (new - old) * hidden_dim * 4 bytes (float32)
+        hidden_dim = self.architecture.hidden_dim
+        expansion_params = 2 * (new_capacity - self.vocab_capacity) * hidden_dim
+        expansion_memory_mb = (expansion_params * 4) / (1024 * 1024)  # Just weights, no optimizer yet
+        
+        # Check available memory (GPU or CPU)
+        try:
+            if torch.cuda.is_available() and self.device != "cpu":
+                # Check GPU memory
+                free_memory_mb = (torch.cuda.get_device_properties(0).total_memory - 
+                                 torch.cuda.memory_allocated()) / (1024 * 1024)
+            else:
+                # Check system RAM
+                import psutil
+                free_memory_mb = psutil.virtual_memory().available / (1024 * 1024)
+            
+            # Need at least 2x expansion memory (weights + temporary copy during expansion)
+            required_mb = expansion_memory_mb * 2
+            
+            if free_memory_mb < required_mb:
+                logger.warning(f"[VOCAB] Insufficient memory for expansion: need {required_mb:.0f}MB, "
+                              f"have {free_memory_mb:.0f}MB free")
+                
+                # TRY: Remove some layers to make room for vocab expansion
+                # Vocab is more important than extra layers (all nodes need same vocab)
+                memory_per_layer = estimate_memory_per_layer(self.architecture)
+                layers_to_free = int((required_mb - free_memory_mb) / memory_per_layer) + 1
+                
+                if len(self.my_layers) > layers_to_free + 1:  # Keep at least 1 layer
+                    # Remove highest-numbered layers (least important for Driver/Validator)
+                    layers_to_remove = sorted(self.my_layers.keys(), reverse=True)[:layers_to_free]
+                    logger.warning(f"[VOCAB] Attempting to free memory by removing {layers_to_free} layers: {layers_to_remove}")
+                    
+                    removed = self.remove_layers(layers_to_remove)
+                    if removed:
+                        # Recalculate free memory after layer removal
+                        if torch.cuda.is_available() and self.device != "cpu":
+                            free_memory_mb = (torch.cuda.get_device_properties(0).total_memory - 
+                                             torch.cuda.memory_allocated()) / (1024 * 1024)
+                        else:
+                            import psutil
+                            free_memory_mb = psutil.virtual_memory().available / (1024 * 1024)
+                        
+                        if free_memory_mb >= required_mb:
+                            logger.info(f"[VOCAB] ✅ Freed enough memory by removing {len(removed)} layers")
+                            # Continue with expansion below
+                        else:
+                            logger.warning(f"[VOCAB] Still insufficient memory after layer removal")
+                            return False
+                    else:
+                        logger.warning(f"[VOCAB] Could not remove layers, capping expansion")
+                        return False
+                else:
+                    logger.warning(f"[VOCAB] Not enough layers to remove, capping expansion")
+                    return False
+                
+            logger.info(f"[VOCAB] Memory check passed: {expansion_memory_mb:.0f}MB needed, "
+                       f"{free_memory_mb:.0f}MB available")
+        except Exception as e:
+            logger.warning(f"[VOCAB] Could not check memory: {e}, proceeding with expansion")
         
         logger.info(f"[VOCAB] Expanding vocabulary: {self.vocab_capacity} → {new_capacity}")
         
@@ -1470,6 +1668,11 @@ class DynamicNeuroNode:
         # This handles the case where the network has evolved while we were offline
         self._reconcile_architecture()
         
+        # 1c. PRE-FETCH TOKENIZER VOCAB SIZE for accurate memory calculation
+        # This is critical for dynamic vocab - we need to know vocab size BEFORE
+        # assigning layers, otherwise we'll assign too many and OOM when vocab expands
+        self._prefetch_vocab_capacity()
+        
         # 2. Get staked amount from ledger (for Validator eligibility)
         staked_amount = 0.0
         if self.p2p_manager and self.p2p_manager.ledger:
@@ -1574,6 +1777,9 @@ class DynamicNeuroNode:
                         if self.model is not None:
                             self.model.tokenizer = self.tokenizer
                             self.model.check_and_expand_vocab_if_needed()
+                            # Update layer pool's vocab_capacity for future layer calculations
+                            if hasattr(self, 'layer_pool') and self.layer_pool:
+                                self.layer_pool.vocab_capacity = self.model.vocab_capacity
                     else:
                         logger.debug(f"[TOKENIZER] Already up to date: {self.tokenizer.current_vocab_size} tokens")
                     return
@@ -1596,6 +1802,9 @@ class DynamicNeuroNode:
                         if self.model is not None:
                             self.model.tokenizer = self.tokenizer
                             self.model.check_and_expand_vocab_if_needed()
+                            # Update layer pool's vocab_capacity for future layer calculations
+                            if hasattr(self, 'layer_pool') and self.layer_pool:
+                                self.layer_pool.vocab_capacity = self.model.vocab_capacity
                 except Exception as e:
                     logger.warning(f"[TOKENIZER] Failed to load cached tokenizer: {e}")
                     
@@ -2697,6 +2906,71 @@ class DynamicNeuroNode:
         
         return proof_data
     
+    def _prefetch_vocab_capacity(self):
+        """
+        Pre-fetch tokenizer vocab size to know how much memory embeddings will need.
+        
+        This MUST be called before register_node() to ensure accurate layer assignment.
+        Without this, we'd assign layers assuming 32K vocab, then OOM when vocab expands to 288K+.
+        """
+        import requests
+        import os
+        
+        GENESIS_CDN_URL = "https://dwquwt9gkkeil.cloudfront.net"
+        cache_dir = os.path.join(os.path.expanduser("~"), ".neuroshard", "data_cache")
+        tokenizer_cache_path = os.path.join(cache_dir, "tokenizer.json")
+        
+        vocab_size = INITIAL_VOCAB_SIZE  # Default fallback
+        
+        try:
+            # Try to fetch vocab size from CDN
+            tokenizer_url = f"{GENESIS_CDN_URL}/tokenizer.json"
+            resp = requests.get(tokenizer_url, timeout=10)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                vocab_size = data.get("next_merge_id", INITIAL_VOCAB_SIZE)
+                
+                # Cache locally for faster startup next time
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(tokenizer_cache_path, 'w') as f:
+                    f.write(resp.text)
+                
+                logger.info(f"[VOCAB] Pre-fetched tokenizer: {vocab_size:,} tokens (for memory calculation)")
+            else:
+                # Try cached version
+                if os.path.exists(tokenizer_cache_path):
+                    import json
+                    with open(tokenizer_cache_path, 'r') as f:
+                        data = json.load(f)
+                    vocab_size = data.get("next_merge_id", INITIAL_VOCAB_SIZE)
+                    logger.info(f"[VOCAB] Using cached tokenizer: {vocab_size:,} tokens")
+        except Exception as e:
+            # Try cached version as fallback
+            try:
+                if os.path.exists(tokenizer_cache_path):
+                    import json
+                    with open(tokenizer_cache_path, 'r') as f:
+                        data = json.load(f)
+                    vocab_size = data.get("next_merge_id", INITIAL_VOCAB_SIZE)
+                    logger.info(f"[VOCAB] Using cached tokenizer: {vocab_size:,} tokens (CDN unavailable)")
+            except Exception:
+                pass
+            logger.debug(f"[VOCAB] Could not prefetch vocab size: {e}, using default {INITIAL_VOCAB_SIZE}")
+        
+        # HEADROOM: Reserve extra capacity for vocab growth during this session
+        # Without headroom, we'd need to reduce layers mid-training (not supported)
+        # With 2x chunk headroom, we can absorb ~64K new tokens before issues
+        VOCAB_HEADROOM_CHUNKS = 2  # Reserve 2 × 32K = 64K tokens headroom
+        
+        vocab_capacity = ((vocab_size + VOCAB_GROWTH_CHUNK - 1) // VOCAB_GROWTH_CHUNK) * VOCAB_GROWTH_CHUNK
+        vocab_capacity += VOCAB_HEADROOM_CHUNKS * VOCAB_GROWTH_CHUNK
+        
+        # Update layer pool's vocab_capacity for accurate layer assignment
+        self.layer_pool.vocab_capacity = vocab_capacity
+        logger.info(f"[VOCAB] Layer pool vocab_capacity set to {vocab_capacity:,} "
+                   f"(current: {vocab_size:,}, headroom: {VOCAB_HEADROOM_CHUNKS * VOCAB_GROWTH_CHUNK:,} for growth)")
+    
     def _reconcile_architecture(self):
         """
         Smart architecture reconciliation for rejoining the network.
@@ -2788,7 +3062,12 @@ class DynamicNeuroNode:
                 self.layer_pool.current_num_layers = actual_saved_layers
             else:
                 # Memory too small for saved checkpoint - calculate what we CAN fit
-                max_layers = calculate_layer_assignment(self.available_memory_mb, saved_arch, safety_factor=0.6)
+                # Use current vocab_capacity for accurate memory estimation
+                vocab_cap = getattr(self.layer_pool, 'vocab_capacity', INITIAL_VOCAB_SIZE)
+                max_layers = calculate_layer_assignment(
+                    self.available_memory_mb, saved_arch, 
+                    safety_factor=0.6, vocab_capacity=vocab_cap
+                )
                 logger.warning(f"⚠️ Saved checkpoint has {actual_saved_layers} layers ({saved_memory:.0f}MB) "
                               f"but you only have {self.available_memory_mb:.0f}MB")
                 logger.warning(f"   → Will use {max_layers} layers (reduced from checkpoint)")
@@ -3037,6 +3316,79 @@ class DynamicNeuroNode:
         
         return None
     
+    def _load_embedding_with_vocab_expansion(self, embedding: nn.Embedding, state_dict: dict, name: str):
+        """
+        Load embedding weights, handling vocab size expansion gracefully.
+        
+        When vocabulary grows (tokenizer learns new merges), the checkpoint has fewer
+        tokens than the current model. This method:
+        1. Loads weights for existing tokens (preserves all training)
+        2. Keeps randomly initialized weights for new tokens
+        """
+        checkpoint_weight = state_dict.get("weight")
+        if checkpoint_weight is None:
+            logger.warning(f"[CHECKPOINT] No weight found in {name} state_dict")
+            return
+        
+        checkpoint_vocab_size = checkpoint_weight.shape[0]
+        current_vocab_size = embedding.weight.shape[0]
+        
+        if checkpoint_vocab_size == current_vocab_size:
+            # Same size - normal load
+            embedding.load_state_dict(state_dict)
+            logger.info(f"[CHECKPOINT] Loaded {name}: {current_vocab_size} tokens")
+        elif checkpoint_vocab_size < current_vocab_size:
+            # Vocab expanded - partial load (PRESERVE TRAINING!)
+            with torch.no_grad():
+                embedding.weight[:checkpoint_vocab_size] = checkpoint_weight
+            logger.info(f"[CHECKPOINT] Loaded {name} with vocab expansion: "
+                       f"{checkpoint_vocab_size} → {current_vocab_size} tokens "
+                       f"(preserved {checkpoint_vocab_size} trained embeddings)")
+        else:
+            # Vocab shrunk (unusual) - load what fits
+            with torch.no_grad():
+                embedding.weight[:] = checkpoint_weight[:current_vocab_size]
+            logger.warning(f"[CHECKPOINT] Loaded {name} with vocab truncation: "
+                          f"{checkpoint_vocab_size} → {current_vocab_size} tokens")
+    
+    def _load_lm_head_with_vocab_expansion(self, lm_head: nn.Linear, state_dict: dict, name: str):
+        """
+        Load LM head weights, handling vocab size expansion gracefully.
+        
+        Similar to embedding expansion - preserves trained weights for existing tokens.
+        """
+        checkpoint_weight = state_dict.get("weight")
+        checkpoint_bias = state_dict.get("bias")
+        
+        if checkpoint_weight is None:
+            logger.warning(f"[CHECKPOINT] No weight found in {name} state_dict")
+            return
+        
+        checkpoint_vocab_size = checkpoint_weight.shape[0]
+        current_vocab_size = lm_head.weight.shape[0]
+        
+        if checkpoint_vocab_size == current_vocab_size:
+            # Same size - normal load
+            lm_head.load_state_dict(state_dict)
+            logger.info(f"[CHECKPOINT] Loaded {name}: {current_vocab_size} outputs")
+        elif checkpoint_vocab_size < current_vocab_size:
+            # Vocab expanded - partial load (PRESERVE TRAINING!)
+            with torch.no_grad():
+                lm_head.weight[:checkpoint_vocab_size] = checkpoint_weight
+                if checkpoint_bias is not None and lm_head.bias is not None:
+                    lm_head.bias[:checkpoint_vocab_size] = checkpoint_bias
+            logger.info(f"[CHECKPOINT] Loaded {name} with vocab expansion: "
+                       f"{checkpoint_vocab_size} → {current_vocab_size} outputs "
+                       f"(preserved {checkpoint_vocab_size} trained weights)")
+        else:
+            # Vocab shrunk (unusual) - load what fits
+            with torch.no_grad():
+                lm_head.weight[:] = checkpoint_weight[:current_vocab_size]
+                if checkpoint_bias is not None and lm_head.bias is not None:
+                    lm_head.bias[:] = checkpoint_bias[:current_vocab_size]
+            logger.warning(f"[CHECKPOINT] Loaded {name} with vocab truncation: "
+                          f"{checkpoint_vocab_size} → {current_vocab_size} outputs")
+    
     def _load_checkpoint(self):
         """Load checkpoint from disk if it exists (resume training)."""
         # Use wallet_id for stable checkpoint path (survives node_id changes)
@@ -3110,13 +3462,21 @@ class DynamicNeuroNode:
                 if layer_id in self.model.my_layers:
                     self.model.my_layers[layer_id].load_state_dict(state_dict)
             
-            # Load embedding if present
+            # Load embedding if present (handle vocab size changes gracefully)
             if self.model.embedding and "embedding" in checkpoint:
-                self.model.embedding.load_state_dict(checkpoint["embedding"])
+                self._load_embedding_with_vocab_expansion(
+                    self.model.embedding, 
+                    checkpoint["embedding"],
+                    "embedding"
+                )
             
-            # Load LM head if present
+            # Load LM head if present (handle vocab size changes gracefully)
             if self.model.lm_head and "lm_head" in checkpoint:
-                self.model.lm_head.load_state_dict(checkpoint["lm_head"])
+                self._load_lm_head_with_vocab_expansion(
+                    self.model.lm_head,
+                    checkpoint["lm_head"],
+                    "lm_head"
+                )
             
             # Load final norm if present
             if self.model.final_norm and "final_norm" in checkpoint:
