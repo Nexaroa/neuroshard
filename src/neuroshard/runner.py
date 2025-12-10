@@ -2778,8 +2778,9 @@ def run_node(
                             
                             # Get LR from DiLoCo trainer if available
                             lr_info = ""
-                            if hasattr(NEURO_NODE, 'swarm') and NEURO_NODE.swarm:
-                                diloco = getattr(NEURO_NODE.swarm, 'diloco_trainer', None)
+                            # Note: swarm_components contains SwarmComponents (DiLoCo, etc.)
+                            if hasattr(NEURO_NODE, 'swarm_components') and NEURO_NODE.swarm_components:
+                                diloco = getattr(NEURO_NODE.swarm_components, 'diloco_trainer', None)
                                 if diloco:
                                     current_lr = diloco.get_current_lr()
                                     lr_info = f", lr={current_lr:.2e}"
