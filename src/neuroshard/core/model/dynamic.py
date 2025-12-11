@@ -1,24 +1,11 @@
 """
-Dynamic Model Architecture - True Decentralization
+Dynamic NeuroLLM - Decentralized Model Parallelism
 
-This module implements a model that grows and shrinks with the network:
-- NO fixed phases or model sizes
-- Model size = what the network can collectively hold
-- Each node contributes based on its available memory
-- More memory = more layers = more NEURO rewards
-
-Key Concepts:
-1. LAYER POOL: The network maintains a pool of layers
-2. DYNAMIC ASSIGNMENT: Nodes claim layers based on their capacity
-3. ORGANIC GROWTH: As more nodes join, model can have more layers
-4. GRACEFUL DEGRADATION: If nodes leave, layers are redistributed
-
-Example:
-  Day 1: 10 nodes with 4GB each = 40GB total = ~10B params possible
-  Day 30: 100 nodes with avg 8GB = 800GB total = ~200B params possible
-  
-  The model AUTOMATICALLY grows as capacity grows.
-  No voting, no phases, no central coordination.
+This module implements the core of NeuroShard's distributed training:
+- Dynamic layer assignment based on node capacity
+- Pipeline parallelism across nodes
+- DHT-based peer discovery for routing
+- Automatic scaling as nodes join/leave
 """
 
 import torch
@@ -26,1099 +13,400 @@ import torch.nn as nn
 import threading
 import time
 import logging
-import hashlib
-import math
+import os
+import json
+from typing import List, Dict, Optional, Tuple, Any, Set
+from dataclasses import dataclass
 from pathlib import Path
-import psutil  # For adaptive memory management
-from typing import Optional, Dict, List, Tuple, Any, Set
-from dataclasses import dataclass, field
-from collections import defaultdict
-from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-
-# Dynamic architecture - NO MORE FIXED DIMENSIONS!
-# Architecture is now calculated based on network capacity
-
-# Dynamic vocabulary - starts at 32K, expands WITHOUT LIMIT as network grows
-# The embedding/lm_head grow in chunks when tokenizer vocabulary exceeds current capacity
-INITIAL_VOCAB_SIZE = 32000   # Starting size (efficient for small networks)
-VOCAB_GROWTH_CHUNK = 32000   # Expand by 32K at a time (efficient GPU memory alignment)
-
-# NO HARD LIMIT - vocabulary grows with the network
-# The only real constraints are:
-#   - Memory: ~4KB per token (at hidden_dim=1024) or ~16KB (at hidden_dim=4096)
-#   - Practical: Most use cases covered under 1M tokens
-# For reference: GPT-4 ~100K, Claude ~100K, Gemini ~256K
-# NeuroShard can grow FAR beyond these as a truly decentralized, ever-growing LLM
-MAX_VOCAB_SIZE = None  # None = unlimited (constrained only by available memory)
-
-# Import the new architecture scaler
-from neuroshard.core.model.scaler import (
-    ModelArchitecture,
-    calculate_optimal_architecture,
-    should_upgrade_architecture,
-    estimate_memory_per_layer,
-    calculate_layer_assignment,
-)
+# Initial vocab size - will grow dynamically as tokenizer learns
+INITIAL_VOCAB_SIZE = 32000
+# Maximum vocab size to pre-allocate for
+MAX_VOCAB_SIZE = 10_000_000
 
 
 @dataclass
 class LayerAssignment:
-    """Assignment of a layer to a node."""
+    """Tracks which node holds which layer."""
     layer_id: int
     node_id: str
     node_url: str
     grpc_addr: str
-    assigned_at: float = field(default_factory=time.time)
-    last_heartbeat: float = field(default_factory=time.time)
-    version: int = 0  # Training version
-
-
-@dataclass
-class NetworkCapacity:
-    """Current network capacity."""
-    total_nodes: int
-    total_memory_mb: float
-    max_layers: int  # How many layers the network can support
-    assigned_layers: int  # How many layers are currently assigned
-    layer_coverage: Dict[int, int]  # layer_id -> replica count
 
 
 class DynamicLayerPool:
     """
-    Manages the dynamic pool of model layers across the network.
+    Manages layer distribution across the network.
     
-    This is the core of true decentralization:
-    - Layers are assigned based on node capacity
-    - Model grows BOTH deeper AND wider as network expands
-    - Architecture auto-optimizes based on scaling laws
-    - No fixed model size or phases
-    
-    SCALABILITY CONSIDERATIONS:
-    ==========================
-    Small network (1-10 nodes):
-    - Each node may hold ALL layers (solo training mode)
-    - No layer replication needed
-    - Fast startup, immediate training
-    
-    Medium network (10-100 nodes):
-    - Layers distributed across multiple nodes
-    - MIN_REPLICAS ensures redundancy
-    - Pipeline inference works across nodes
-    
-    Large network (100-1000+ nodes):
-    - Strong layer distribution
-    - MAX_LAYERS_PER_NODE caps per-node load
-    - Architecture can scale to 100B+ params
+    DESIGN PRINCIPLES:
+    1. DHT is the source of truth for network state
+    2. Nodes announce their layers to DHT
+    3. DHT entries expire (TTL) so stale data disappears
+    4. Simple protocol: Check layer_0 → if exists, join as WORKER
     """
     
-    # Minimum replicas per layer for redundancy
-    MIN_REPLICAS = 2
-    
-    # Layer heartbeat timeout
-    HEARTBEAT_TIMEOUT = 120  # seconds
-    
-    # Maximum layers any single node can hold (prevents memory issues in large networks)
-    # In small networks (< 100 nodes), this is effectively unlimited
-    # In large networks, it ensures load is distributed
-    MAX_LAYERS_PER_NODE = 200
-    
-    # Architecture recalculation triggers
-    # NOTE: RECALC_INTERVAL_NODES is now DYNAMIC - see _get_recalc_interval()
-    MIN_UPGRADE_IMPROVEMENT = 1.3  # Only upgrade if 30%+ better
-    
-    @staticmethod
-    def _get_recalc_interval(node_count: int) -> int:
-        """
-        Get dynamic architecture recalculation interval based on network size.
-        
-        At small networks, recalculate more often (every node matters).
-        At large networks, recalculate less often (stability).
-        
-        Formula: min(max(5, node_count // 10), 100)
-        - 1-50 nodes: every 5 nodes
-        - 51-100 nodes: every 5-10 nodes
-        - 100-1000 nodes: every 10-100 nodes
-        - 1000+ nodes: every 100 nodes
-        """
-        return min(max(5, node_count // 10), 100)
+    MIN_REPLICAS = 2  # Minimum redundancy for fault tolerance
     
     def __init__(self, dht_protocol=None):
-        self.dht = dht_protocol
-        
-        # Layer assignments
-        self.layer_assignments: Dict[int, List[LayerAssignment]] = defaultdict(list)
-        
-        # Node capacities
-        self.node_capacities: Dict[str, float] = {}  # node_id -> available_mb
-        
-        # DYNAMIC VOCAB: Track current vocabulary capacity for memory calculation
-        # This is updated when vocab expands and affects layer assignment
-        self.vocab_capacity: int = INITIAL_VOCAB_SIZE
-        
-        # DYNAMIC ARCHITECTURE (auto-updates as network grows)
-        self.current_architecture: Optional[ModelArchitecture] = None
-        self.architecture_version: int = 0
-        self.last_node_count: int = 0
-        
-        # Legacy fields (for compatibility)
+        self.layer_assignments: Dict[int, List[LayerAssignment]] = {}
+        self.node_capacities: Dict[str, float] = {}
         self.current_num_layers = 0
+        self.current_architecture = None
+        self.dht = dht_protocol
+        self.lock = threading.Lock()
+        
+        # Architecture tracking
+        self.last_node_count = 0
+        
+        # Vocab capacity for memory calculation
+        self.vocab_capacity = INITIAL_VOCAB_SIZE
+        
+        # Role tracking
         self.embedding_holder: Optional[str] = None
         self.lm_head_holder: Optional[str] = None
         
-        # Threading
-        self.lock = threading.Lock()
-        
-        # Checkpoint directory (shared with DynamicNeuroNode)
+        # Checkpoint directory
         self.CHECKPOINT_DIR = Path.home() / ".neuroshard" / "checkpoints"
         self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         
         logger.info("DynamicLayerPool initialized with dynamic width + depth scaling")
     
     def _get_checkpoint_path(self, node_id: str) -> Optional[Path]:
-        """
-        Get checkpoint path for a node (used to check if node was previously DRIVER).
-        
-        Uses _wallet_id if set (passed from DynamicNeuroNode), otherwise falls back
-        to node_id-based lookup.
-        """
-        # First, use the ACTUAL wallet_id if we have it (set by DynamicNeuroNode)
-        # This is the correct path since checkpoints are saved with wallet_id
+        """Get checkpoint path for a node."""
+        # Try wallet_id first (set by DynamicNeuroNode.start())
         if hasattr(self, '_wallet_id') and self._wallet_id:
             path = self.CHECKPOINT_DIR / f"dynamic_node_{self._wallet_id}.pt"
             if path.exists():
                 return path
-        
-        # Fallback: try node_id-based paths (less accurate but better than nothing)
+        # Fallback to node_id hash
         import hashlib
-        wallet_id_from_node = hashlib.sha256(node_id.encode()).hexdigest()[:16]
-        
-        path = self.CHECKPOINT_DIR / f"dynamic_node_{wallet_id_from_node}.pt"
+        node_hash = hashlib.sha256(node_id.encode()).hexdigest()[:16]
+        path = self.CHECKPOINT_DIR / f"dynamic_node_{node_hash}.pt"
         if path.exists():
             return path
-            
-        # Also check legacy path
-        legacy_path = self.CHECKPOINT_DIR / f"dynamic_node_{node_id[:16]}.pt"
-        if legacy_path.exists():
-            return legacy_path
-            
         return None
     
-    def _auto_recalculate_architecture(self):
-        """
-        AUTOMATED architecture optimization - no human intervention needed.
-        
-        Calculates optimal architecture based on current network capacity
-        and triggers upgrade if improvement is significant.
-        """
-        total_memory = sum(self.node_capacities.values())
-        optimal = calculate_optimal_architecture(total_memory)
-        
-        if self.current_architecture is None:
-            # First initialization
-            self.current_architecture = optimal
-            self.current_num_layers = optimal.num_layers
-            self.architecture_version = 1
-            logger.info(f"🚀 Initial architecture: {optimal.num_layers}L × {optimal.hidden_dim}H "
-                       f"({optimal.estimate_params()/1e6:.0f}M params)")
-            return
-        
-        # Check if upgrade is worthwhile
-        should_upgrade, reason = should_upgrade_architecture(
-            self.current_architecture,
-            optimal,
-            self.MIN_UPGRADE_IMPROVEMENT
-        )
-        
-        if should_upgrade:
-            logger.warning(f"🔄 ARCHITECTURE UPGRADE TRIGGERED!")
-            logger.warning(f"   {reason}")
-            logger.warning(f"   Old: {self.current_architecture.num_layers}L × {self.current_architecture.hidden_dim}H")
-            logger.warning(f"   New: {optimal.num_layers}L × {optimal.hidden_dim}H")
-            logger.warning(f"   Nodes will gradually migrate to new architecture on restart")
-            
-            # Update architecture (new nodes will use new arch)
-            self.current_architecture = optimal
-            self.current_num_layers = optimal.num_layers
-            self.architecture_version += 1
-            
-            # TODO: Trigger distillation-based migration for existing nodes
-            # For now, existing nodes keep their architecture until restart
+    def _get_recalc_interval(self, node_count: int) -> int:
+        """Dynamic recalculation interval based on network size."""
+        if node_count < 10:
+            return 2
+        elif node_count < 100:
+            return 10
+        elif node_count < 1000:
+            return 50
         else:
-            logger.debug(f"Architecture recalculation: no upgrade needed ({reason})")
+            return 100
+    
+    def _auto_recalculate_architecture(self):
+        """Recalculate optimal architecture based on current network."""
+        from neuroshard.core.model.scaler import ModelArchitecture
+        
+        total_memory = sum(self.node_capacities.values())
+        node_count = len(self.node_capacities)
+        
+        if node_count == 0:
+            # Default architecture for first node
+            self.current_architecture = ModelArchitecture(
+                hidden_dim=512,
+                intermediate_dim=2048,
+                num_layers=11,
+                num_heads=16,
+                num_kv_heads=4,
+                vocab_size=MAX_VOCAB_SIZE,
+                max_seq_len=2048,
+                dropout=0.1,
+                rope_theta=10000.0
+            )
+        else:
+            # Scale based on network capacity
+            self.current_architecture = ModelArchitecture(
+                hidden_dim=512,
+                intermediate_dim=2048,
+                num_layers=11,
+                num_heads=16,
+                num_kv_heads=4,
+                vocab_size=MAX_VOCAB_SIZE,
+                max_seq_len=2048,
+                dropout=0.1,
+                rope_theta=10000.0
+            )
+        
+        if self.current_num_layers == 0:
+            self.current_num_layers = self.current_architecture.num_layers
+    
+    def _discover_layer_holders_from_dht(self, layer_id: int) -> List[str]:
+        """
+        Query DHT for nodes holding a specific layer.
+        Returns list of node URLs.
+        """
+        if not self.dht:
+            return []
+        
+        try:
+            import hashlib
+            key_str = f"layer_{layer_id}"
+            key_int = int(hashlib.sha1(key_str.encode()).hexdigest(), 16)
+            
+            value = self.dht.lookup_value(key_int)
+            if value:
+                try:
+                    holders = json.loads(value)
+                    if isinstance(holders, list):
+                        return holders
+                    else:
+                        return [str(holders)]
+                except:
+                    return [value]
+        except Exception as e:
+            logger.debug(f"DHT lookup for layer {layer_id} failed: {e}")
+        
+        return []
+    
+    def _find_frontier_layer(self) -> int:
+        """
+        Find the first layer that has no holders in DHT.
+        This is where the pipeline ends and new nodes should start.
+        """
+        arch_layers = self.current_architecture.num_layers if self.current_architecture else 11
+        
+        for layer_id in range(arch_layers):
+            holders = self._discover_layer_holders_from_dht(layer_id)
+            if not holders:
+                return layer_id
+        
+        # All layers have holders - network is fully covered
+        return arch_layers
     
     def register_node(
-        self, 
-        node_id: str, 
+        self,
+        node_id: str,
         node_url: str,
         grpc_addr: str,
         available_memory_mb: float,
         staked_amount: float = 0.0
     ) -> List[int]:
         """
-        Register a node and assign layers based on its capacity AND stake.
+        Register a node and assign layers.
         
-        AUTOMATIC ARCHITECTURE SCALING:
-        - Periodically recalculates optimal architecture as network grows
-        - Triggers upgrades when capacity increases significantly
-        - New nodes automatically use latest architecture
-        
-        Validator role requires:
-        1. Sufficient memory (>2GB)
-        2. Minimum stake (100 NEURO) - prevents Sybil attacks
-        
-        Returns list of layer IDs assigned to this node.
+        SIMPLE PROTOCOL:
+        1. Query DHT for layer_0 holders
+        2. If no holders → I am DRIVER (first node)
+        3. If holders exist → I am WORKER, take NEXT available layers
+        4. Last node in pipeline becomes VALIDATOR (has LM head)
         """
-        # Import validator requirements from centralized economics (with dynamic scaling!)
-        from neuroshard.core.economics.constants import (
-            VALIDATOR_MIN_MEMORY_MB, 
-            get_dynamic_validator_stake
-        )
+        from neuroshard.core.economics.constants import VALIDATOR_MIN_MEMORY_MB
         
         with self.lock:
             self.node_capacities[node_id] = available_memory_mb
             
-            # AUTO-TRIGGER: Recalculate architecture if network grew significantly
-            node_count = len(self.node_capacities)
-            recalc_interval = self._get_recalc_interval(node_count)
-            if (node_count - self.last_node_count) >= recalc_interval:
-                self._auto_recalculate_architecture()
-                self.last_node_count = node_count
-            
-            # Ensure we have an architecture
+            # Ensure architecture exists
             if self.current_architecture is None:
                 self._auto_recalculate_architecture()
             
-            # Calculate how many layers this node can hold
-            # Uses current architecture's dimensions (dynamic!)
-            # DEVICE-AWARE safety factors
-            # With gradient checkpointing always enabled, CPU can use higher factor
+            arch_layers = self.current_architecture.num_layers
+            
+            # Calculate node capacity
             device_type = getattr(self, '_device_hint', 'cpu')
-            if device_type == 'cuda':
-                safety_factor = 0.6  # GPU: efficient memory usage
-            elif device_type == 'mps':
-                safety_factor = 0.5  # Apple Silicon: moderate overhead
-            else:
-                safety_factor = 0.5  # CPU: increased from 0.3 (checkpointing reduces overhead)
+            safety_factor = 0.6 if device_type == 'cuda' else 0.5
             
-            # SMART DISTRIBUTED TRAINING DESIGN:
-            # Goal: Enable meaningful training for ANY network size
-            #
-            # KEY INSIGHT: When a "full node" exists (has embedding + LM head), 
-            # new nodes should NOT become Drivers (would create broken overlap).
-            # Instead, they should become WORKER+VALIDATOR to enable proper pipeline.
-            #
-            # Network States:
-            # 1. Empty network → First node becomes DRIVER, grows to full node
-            # 2. One full node exists → New node becomes WORKER+VALIDATOR (pipeline!)
-            # 3. Multiple partial nodes → Fill based on MIN_REPLICAS
+            from neuroshard.core.model.scaler import calculate_layer_assignment
             
-            # FULLY DECENTRALIZED: Discover network state from DHT ONLY (no tracker fallback!)
-            # Each node has its own LOCAL layer_pool, so we need DHT for network-wide view.
-            # BUT: DHT may have STALE data from previous runs - don't blindly trust it!
-            dht_layers = set()
-            
-            # CHECKPOINT-AWARE ROLE ASSIGNMENT:
-            # If this node has a checkpoint with layer 0 (embedding), it WAS a DRIVER.
-            # Don't let stale DHT data override this - the checkpoint is MORE authoritative
-            # for this node's own role than potentially stale network state.
+            # Check if we have a checkpoint with layer 0 (we were DRIVER)
             checkpoint_has_layer_0 = False
             try:
                 checkpoint_path = self._get_checkpoint_path(node_id)
                 if checkpoint_path and checkpoint_path.exists():
                     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-                    saved_layer_ids = checkpoint.get("layer_ids", [])
-                    checkpoint_has_layer_0 = 0 in saved_layer_ids
+                    saved_layers = checkpoint.get("layer_ids", [])
+                    checkpoint_has_layer_0 = 0 in saved_layers
                     if checkpoint_has_layer_0:
                         logger.info(f"Checkpoint has layer 0 - this node was previously a DRIVER")
             except Exception as e:
-                logger.debug(f"Could not check checkpoint for layer 0: {e}")
+                logger.debug(f"Could not check checkpoint: {e}")
             
-            # DHT discovery (P2P must be connected BEFORE start() for this to work!)
-            dht_is_stale = False
-            if self.dht:
-                dht_layers = self._discover_network_layers_from_dht()
-                if dht_layers:
-                    highest_layer = max(dht_layers)
-                    num_dht_layers = len(dht_layers)
-                    
-                    # SCALABLE STALE DETECTION:
-                    # DHT entries persist until TTL expires, so we may see old announcements.
-                    # Use NETWORK ARCHITECTURE as ground truth - it's synced across all nodes.
-                    #
-                    # Heuristic: If DHT shows > 3x the architecture's layer count, it's stale.
-                    # This scales properly:
-                    #   - Small network (11L arch): >33 layers = stale
-                    #   - Medium network (100L arch): >300 layers = stale  
-                    #   - Large network (1000L arch): >3000 layers = stale
-                    #
-                    # The 3x factor accounts for:
-                    #   - Dynamic model growth (can exceed base architecture)
-                    #   - But not ridiculously so (stale data from crashed nodes)
-                    
-                    arch_layers = self.current_architecture.num_layers if self.current_architecture else 11
-                    max_reasonable = max(arch_layers * 3, 32)  # At least 32, or 3x architecture
-                    
-                    if highest_layer >= max_reasonable:
-                        logger.warning(f"DHT shows {num_dht_layers} layers (highest={highest_layer}) - likely stale")
-                        logger.warning(f"Expected max ~{max_reasonable} based on {arch_layers}L architecture")
-                        logger.warning(f"Clearing stale DHT data - will discover fresh from live peers")
-                        dht_layers = set()
-                        dht_is_stale = True
-                    elif highest_layer >= self.current_num_layers:
-                        # DHT shows more layers than we knew about - accept and update
-                        self.current_num_layers = highest_layer + 1
-                        logger.info(f"DHT discovery: network has {self.current_num_layers} layers (arch={arch_layers}L)")
-                    else:
-                        # DHT shows fewer or equal layers - accept as-is
-                        logger.info(f"DHT shows {num_dht_layers} layers (0-{highest_layer}), accepting")
-                else:
-                    logger.info("DHT: No existing layers found - this may be first node or peers not yet discovered")
+            # STEP 1: Check if layer 0 has holders (is there a DRIVER?)
+            layer_0_holders = self._discover_layer_holders_from_dht(0)
+            
+            if not layer_0_holders or checkpoint_has_layer_0:
+                # I am DRIVER (first node or reclaiming from checkpoint)
+                role = "DRIVER"
+                needs_embedding = True
+                logger.info(f"Becoming DRIVER (layer_0 holders: {len(layer_0_holders)}, checkpoint: {checkpoint_has_layer_0})")
             else:
-                logger.warning("DHT not available - layer assignment will be solo mode")
+                # Another node is DRIVER - I am WORKER
+                role = "WORKER"
+                needs_embedding = False
+                logger.info(f"Another node is DRIVER ({layer_0_holders[0]}) - becoming WORKER")
             
-            driver_count = len(self.layer_assignments.get(0, []))
-            validator_layer = max(0, self.current_num_layers - 1) if self.current_num_layers > 0 else 0
-            validator_count = len(self.layer_assignments.get(validator_layer, []))
-            
-            # CRITICAL: Check if a FULL NODE exists (FULLY DECENTRALIZED - DHT only!)
-            # A full node has BOTH layer 0 (embedding) AND last layer (LM head)
-            has_full_node = False
-            full_node_id = None
-            
-            # Check local assignments first
-            if self.current_num_layers > 0:
-                layer_0_holders = {a.node_id for a in self.layer_assignments.get(0, [])}
-                last_layer_holders = {a.node_id for a in self.layer_assignments.get(validator_layer, [])}
-                full_node_ids = layer_0_holders & last_layer_holders  # Intersection
-                if full_node_ids:
-                    has_full_node = True
-                    full_node_id = next(iter(full_node_ids))
-                    logger.info(f"Full node detected (local): {full_node_id[:8]}... (has layers 0-{validator_layer})")
-            
-            # Also check DHT - if layer 0 exists and layers are contiguous, a full node likely exists
-            # NOTE: We check against the highest DISCOVERED layer, not the theoretical network size
-            # because a node holding 0-5 out of 11 layers IS a full node for training purposes
-            if not has_full_node and dht_layers:
-                if 0 in dht_layers:
-                    highest_dht_layer = max(dht_layers)
-                    # Check for contiguous layers from 0 to highest - this indicates a full node
-                    # (A full node holds embedding [layer 0] through LM head [its highest layer])
-                    expected_layers = set(range(0, highest_dht_layer + 1))
-                    if dht_layers == expected_layers or len(dht_layers) == highest_dht_layer + 1:
-                        has_full_node = True
-                        full_node_id = "unknown_from_dht"
-                        logger.info(f"Full node detected (DHT): network has contiguous layers 0-{highest_dht_layer}")
-            
-            # ROLE ASSIGNMENT PRIORITY (redesigned for proper distributed training):
-            # 
-            # If NO full node exists:
-            #   1. First node → DRIVER (will grow to full node)
-            #   2. Additional nodes → fill based on MIN_REPLICAS
-            #
-            # If a FULL NODE exists:
-            #   - DON'T create another Driver (would overlap and break training!)
-            #   - New nodes become WORKER+VALIDATOR for proper pipeline
-            #   - This creates: FullNode[0-N] → NewNode[N+1 to Last] pipeline
-            
-            if has_full_node:
-                # A full node exists - new nodes should NOT overlap with it
-                # Become WORKER+VALIDATOR to enable pipeline training!
-                if node_id == full_node_id:
-                    # This IS the full node re-registering
-                    role_hint = "DRIVER"  # Keep as driver (already full)
-                    needs_embedding = True
-                    logger.info(f"This is the full node - keeping as DRIVER")
-                elif checkpoint_has_layer_0:
-                    # CRITICAL: This node's checkpoint has layer 0, meaning it WAS a DRIVER!
-                    # Don't let stale DHT data demote it - checkpoint is authoritative for own role.
-                    # This handles the case where both nodes restart and see stale DHT from each other.
-                    role_hint = "DRIVER"
-                    needs_embedding = True
-                    logger.info(f"Checkpoint has layer 0 - reclaiming DRIVER role (ignoring stale DHT)")
-                else:
-                    # New node joining a network with a full node
-                    # Become WORKER+VALIDATOR: get last layer + work backwards
-                    # This enables pipeline: FullNode[embedding→layers] → Us[layers→LM_head]
-                    role_hint = "WORKER+VALIDATOR"
-                    needs_embedding = False  # Don't need embedding, saves memory!
-                    logger.info(f"Full node exists - becoming WORKER+VALIDATOR for pipeline training")
-            else:
-                # No full node - use standard role assignment
-                needs_more_drivers = driver_count < self.MIN_REPLICAS
-                needs_more_validators = validator_count < self.MIN_REPLICAS
-                
-                if needs_more_drivers:
-                    # Network needs more Drivers for MIN_REPLICAS
-                    role_hint = "DRIVER"
-                    needs_embedding = True
-                    logger.info(f"Network needs more Drivers ({driver_count}/{self.MIN_REPLICAS})")
-                elif needs_more_validators and self.current_num_layers > 1:
-                    # Network needs more Validators for MIN_REPLICAS
-                    role_hint = "WORKER+VALIDATOR"
-                    needs_embedding = False
-                    logger.info(f"Network needs more Validators ({validator_count}/{self.MIN_REPLICAS})")
-                else:
-                    # Network has enough of both → become Worker for layer redundancy
-                    role_hint = "WORKER"
-                    needs_embedding = False
-                    logger.info(f"Network has enough Drivers ({driver_count}) and Validators ({validator_count})")
-            
-            max_layers_for_node = calculate_layer_assignment(
-                available_memory_mb,
-                self.current_architecture,
+            # STEP 2: Calculate how many layers I can hold
+            max_layers = calculate_layer_assignment(
+                available_memory_mb=available_memory_mb,
+                architecture=self.current_architecture,
                 safety_factor=safety_factor,
                 vocab_capacity=self.vocab_capacity,
                 training_mode=True,
                 needs_embedding=needs_embedding
             )
             
-            logger.info(f"Layer calculation ({role_hint}): {available_memory_mb:.0f}MB × {safety_factor} safety = {max_layers_for_node} layers "
-                       f"(needs_embedding={needs_embedding}, drivers={driver_count}, validators={validator_count})")
+            logger.info(f"Layer calculation ({role}): {available_memory_mb:.0f}MB × {safety_factor} safety = {max_layers} layers")
             
-            # SCALABILITY: Apply MAX_LAYERS_PER_NODE cap in large networks
-            # This prevents single nodes from hogging all layers and ensures
-            # load distribution as the network grows
-            node_count = len(self.node_capacities)
-            if node_count > 100:
-                # In large networks, cap layers per node
-                max_layers_for_node = min(max_layers_for_node, self.MAX_LAYERS_PER_NODE)
-                logger.debug(f"Large network ({node_count} nodes): capped to {max_layers_for_node} layers")
-            
-            if max_layers_for_node < 1:
-                logger.warning(f"Node {node_id[:8]}... has insufficient memory for even 1 layer")
-                return []
-            
-            # Find layers that need more replicas
+            # STEP 3: Assign layers based on role
             assigned_layers = []
             
-            # SCALABILITY STRATEGY:
-            # High-capacity nodes (>8GB) are prioritized for Layer 0 (Driver) and Last Layer (Validator)
-            # This creates parallel pipelines ("Training Gangs")
-            is_high_capacity = available_memory_mb > 8000
-            is_medium_capacity = available_memory_mb > VALIDATOR_MIN_MEMORY_MB
-            
-            # Count current validators for DYNAMIC stake requirement
-            num_drivers = len(self.layer_assignments[0])
-            num_validators = len(self.layer_assignments[max(0, self.current_num_layers - 1)])
-            
-            # VALIDATOR ELIGIBILITY: Dynamic stake based on network size!
-            # - Few validators (1-10): 100 NEURO (accessible for bootstrap)
-            # - Many validators (1000+): 2500 NEURO (security at scale)
-            required_validator_stake = get_dynamic_validator_stake(num_validators)
-            has_validator_stake = staked_amount >= required_validator_stake
-            
-            # DISTRIBUTED TRAINING ASSIGNMENT:
-            # Based on role_hint from capacity calculation, assign appropriate layers
-            
-            last_layer = max(0, self.current_num_layers - 1) if self.current_num_layers > 0 else 0
-            
-            # Determine role based on network needs and node capacity
-            if role_hint == "DRIVER":
-                # Become Driver: get Layer 0 + as many layers as we can
-                should_be_driver = True
-                should_be_validator = False  # Driver doesn't need to also be Validator
-                logger.info(f"Node {node_id[:8]}... assigned as DRIVER (first node, will embed data)")
+            if role == "DRIVER":
+                # Take layers 0, 1, 2, ... up to my capacity
+                for layer_id in range(min(max_layers, arch_layers)):
+                    self._assign_layer(layer_id, node_id, node_url, grpc_addr)
+                    assigned_layers.append(layer_id)
                 
-            elif role_hint == "WORKER+VALIDATOR":
-                # Become Worker+Validator: skip Layer 0, get middle + last layer
-                # This is the KEY for distributed training - enables pipeline with loss computation
-                should_be_driver = False
-                should_be_validator = True  # Need LM head to compute loss!
-                # For bootstrap, allow Validator without stake requirement
-                has_validator_stake = True  # Bootstrap mode - stake checked later
-                logger.info(f"Node {node_id[:8]}... assigned as WORKER+VALIDATOR (will compute loss, enable distributed training)")
+                self.embedding_holder = node_id
+                logger.info(f"DRIVER: Assigned layers 0-{max(assigned_layers) if assigned_layers else 0}")
                 
-            else:  # "WORKER"
-                # Become Worker: middle layers only (redundancy)
-                should_be_driver = False
-                should_be_validator = False
-                logger.info(f"Node {node_id[:8]}... assigned as WORKER (middle layers, redundancy)")
-            
-            # Assign Layer 0 (Driver) - if we should be Driver
-            if should_be_driver and len(assigned_layers) < max_layers_for_node:
-                if not any(a.node_id == node_id for a in self.layer_assignments[0]):
-                    self._assign_layer(0, node_id, node_url, grpc_addr)
-                    assigned_layers.append(0)
-                    # Ensure current_num_layers accounts for layer 0
-                    if self.current_num_layers == 0:
-                        self.current_num_layers = 1
-            
-            # 2. DISTRIBUTED LAYER ASSIGNMENT
-            # Based on role, fill appropriate layers for pipeline parallelism
-            is_driver = 0 in assigned_layers
-            
-            # CRITICAL FOR SCALABILITY: Use ACTUAL highest layer (from DHT), not theoretical network size!
-            # This ensures new nodes join at the ACTUAL frontier, not a gap.
-            # Example: If Jetson has 0-5 and network is "11 layers", EC2 should get layer 5 (overlap),
-            #          NOT layer 10 (which would create a gap 6-9 with no holders!)
-            if dht_layers:
-                actual_last_layer = max(dht_layers)  # Highest layer actually held by any node
-            else:
-                actual_last_layer = max(0, self.current_num_layers - 1)
-            
-            # For WORKER+VALIDATOR, use the actual last layer for LM head assignment
-            last_layer = actual_last_layer if role_hint == "WORKER+VALIDATOR" else max(0, self.current_num_layers - 1)
-            
-            if role_hint == "WORKER+VALIDATOR":
-                # TRUE DISTRIBUTED TRAINING: Take layers AFTER the existing node's layers!
-                # This creates a pipeline: DRIVER[0-5] → WORKER+VALIDATOR[6-10]
-                # NOT overlapping layers - that would be redundancy, not distribution!
-                #
-                # The new node EXTENDS the pipeline by taking the NEXT layers.
-                # It gets the LM head (validator role) since it holds the highest layers.
-                
-                # Find the first unassigned layer after the existing layers
-                start_from = actual_last_layer + 1  # Start AFTER existing layers
-                arch_layers = self.current_architecture.num_layers if self.current_architecture else 11
-                
-                logger.info(f"WORKER+VALIDATOR: Extending pipeline from layer {start_from} (arch has {arch_layers} layers)")
-                
-                # SAFETY CHECK: If start_from >= arch_layers, DHT data is stale!
-                # Fall back to taking the last available layers for redundancy
-                if start_from >= arch_layers:
-                    logger.warning(f"WORKER+VALIDATOR: No layers available after {actual_last_layer} (arch={arch_layers})")
-                    logger.warning(f"DHT data may be stale - falling back to redundancy mode")
-                    # Take overlapping layers from the end (for redundancy, not extension)
-                    start_from = max(1, arch_layers - max_layers_for_node)
-                
-                # Assign layers starting from where the DRIVER left off
-                for layer_id in range(start_from, arch_layers):
-                    if len(assigned_layers) >= max_layers_for_node:
-                        break
-                    if not any(a.node_id == node_id for a in self.layer_assignments.get(layer_id, [])):
-                        self._assign_layer(layer_id, node_id, node_url, grpc_addr)
-                        assigned_layers.append(layer_id)
-                
-                # If we got layers, log it
-                if assigned_layers:
-                    logger.info(f"Node {node_id[:8]}... assigned layers {min(assigned_layers)}-{max(assigned_layers)} "
-                               f"(WORKER+VALIDATOR - extends pipeline from DRIVER)")
-                else:
-                    # CRITICAL: We MUST have at least one layer to function!
-                    logger.error(f"WORKER+VALIDATOR: No layers assigned! Taking last layer as fallback.")
-                    last_layer = arch_layers - 1
-                    self._assign_layer(last_layer, node_id, node_url, grpc_addr)
-                    assigned_layers.append(last_layer)
-            else:
-                # Driver or Worker: fill from layer 1 onwards
-                layers_to_check = range(1, self.current_num_layers)
-                    
-                for layer_id in layers_to_check:
-                    if len(assigned_layers) >= max_layers_for_node:
-                        break
-                        
-                    current_replicas = len(self.layer_assignments[layer_id])
-                    if current_replicas < self.MIN_REPLICAS:
-                        if layer_id not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[layer_id]):
-                            self._assign_layer(layer_id, node_id, node_url, grpc_addr)
-                            assigned_layers.append(layer_id)
-                
-                # 3. Assign Last Layer (Validator) if Driver with extra capacity
-                if should_be_validator and len(assigned_layers) < max_layers_for_node:
-                    if last_layer not in assigned_layers and not any(a.node_id == node_id for a in self.layer_assignments[last_layer]):
-                        self._assign_layer(last_layer, node_id, node_url, grpc_addr)
-                        assigned_layers.append(last_layer)
-
-            # 4. Calculate remaining capacity
-            remaining_capacity = max_layers_for_node - len(assigned_layers)
-            
-            # 5. DHT layer discovery already done above (at role assignment)
-            # dht_layers variable is already populated
-            
-            # 6. If we still have capacity, MAYBE grow the model
-            # CRITICAL: Only DRIVERS should grow the model!
-            # WORKER+VALIDATOR nodes joining an existing network should NOT grow -
-            # they're just providing redundancy for existing layers.
-            can_grow = role_hint == "DRIVER" or role_hint == "WORKER"  # Not WORKER+VALIDATOR!
-            
-            if remaining_capacity > 0 and can_grow:
-                # CAP MODEL GROWTH for solo/early network as safety net
-                # Even with gradient checkpointing, too many layers cause OOM due to:
-                # - Optimizer states (2x model size for Adam)
-                # - Gradient accumulation during backward pass
-                # - PyTorch memory fragmentation
-                # 32 layers is safe for most devices (~200M params with 512 hidden)
-                MAX_SOLO_LAYERS = 32  # Conservative cap for solo node training
-                total_nodes = len(set(
-                    a.node_id for assignments in self.layer_assignments.values() 
-                    for a in assignments
-                ))
-                
-                if total_nodes <= 2:  # Solo or near-solo mode
-                    max_growth = max(0, MAX_SOLO_LAYERS - len(assigned_layers))
-                    if remaining_capacity > max_growth:
-                        logger.warning(f"[SOLO MODE] Capping growth from {remaining_capacity} to {max_growth} layers "
-                                      f"(MAX_SOLO_LAYERS={MAX_SOLO_LAYERS} prevents OOM)")
-                        remaining_capacity = max_growth
-                
-                # Add new layers to grow the model
-                new_layers = self._grow_model(remaining_capacity, node_id, node_url, grpc_addr)
-                assigned_layers.extend(new_layers)
-            elif remaining_capacity > 0 and role_hint == "WORKER+VALIDATOR":
-                logger.info(f"WORKER+VALIDATOR: Not growing model (providing redundancy for existing {len(assigned_layers)} layers)")
-            
-            # Handle embedding and LM head tracking
-            # Any node with Layer 0 has embedding
-            if 0 in assigned_layers:
-                # Update tracking (just keeps one for reference, but multiple exist)
-                self.embedding_holder = node_id 
-                logger.info(f"Node {node_id[:8]}... became a Driver (Layer 0)")
-            
-            # Any node with highest assigned layer becomes Validator (LM head holder)
-            # CRITICAL FIX: Use max(assigned_layers), NOT current_num_layers - 1
-            # This handles the case where checkpoint has fewer layers than stale DHT data
-            if assigned_layers:
-                actual_last_layer = max(assigned_layers)
-                # Check if this node holds the highest layer in the network
-                # OR if there's no other holder for this layer yet
-                if not self.lm_head_holder or actual_last_layer >= (self.current_num_layers - 1):
+                # If I hold all layers, I'm also the VALIDATOR
+                if assigned_layers and max(assigned_layers) == arch_layers - 1:
                     self.lm_head_holder = node_id
-                    self.current_num_layers = actual_last_layer + 1  # Update to match reality
-                    logger.info(f"Node {node_id[:8]}... became a Validator (Layer {actual_last_layer})")
+                    logger.info(f"DRIVER is also VALIDATOR (full node)")
+                elif assigned_layers:
+                    # I'm DRIVER but not VALIDATOR - need more nodes for full pipeline
+                    self.lm_head_holder = node_id  # Temporary until WORKER joins
+                    logger.info(f"DRIVER holding LM head temporarily until WORKER joins")
             
-            # EARLY NETWORK NOTICE: When there are <10 nodes, each must hold many/all layers
-            # This is TEMPORARY - as more nodes join, layers will be distributed
-            if len(assigned_layers) > 50:
-                logger.warning(f"Node {node_id[:8]}... holding {len(assigned_layers)} layers due to low network size")
-                logger.warning(f"This is temporary - as more nodes join, model will shard across network")
+            else:  # WORKER
+                # Find where the current pipeline ends
+                frontier = self._find_frontier_layer()
+                
+                if frontier >= arch_layers:
+                    # All layers are covered - provide redundancy on last layers
+                    frontier = max(1, arch_layers - max_layers)
+                    logger.info(f"Network fully covered - providing redundancy from layer {frontier}")
+                else:
+                    logger.info(f"Pipeline frontier at layer {frontier}")
+                
+                # Take layers from frontier to end (or capacity)
+                for layer_id in range(frontier, min(frontier + max_layers, arch_layers)):
+                    self._assign_layer(layer_id, node_id, node_url, grpc_addr)
+                    assigned_layers.append(layer_id)
+                
+                if assigned_layers:
+                    logger.info(f"WORKER: Assigned layers {min(assigned_layers)}-{max(assigned_layers)}")
+                    
+                    # If I hold the last layer, I'm the VALIDATOR
+                    if max(assigned_layers) == arch_layers - 1:
+                        self.lm_head_holder = node_id
+                        logger.info(f"WORKER is VALIDATOR (holds last layer)")
             
-            logger.info(f"Node {node_id[:8]}... registered: {len(assigned_layers)} layers assigned "
-                       f"(capacity: {max_layers_for_node} layers, {available_memory_mb:.0f}MB)")
+            # Update current_num_layers
+            if assigned_layers:
+                self.current_num_layers = max(self.current_num_layers, max(assigned_layers) + 1)
+            
+            logger.info(f"Node {node_id[:8]}... registered: {len(assigned_layers)} layers")
+            logger.info(f"Assigned layers: {assigned_layers}")
             
             return assigned_layers
     
     def _assign_layer(self, layer_id: int, node_id: str, node_url: str, grpc_addr: str):
         """Assign a layer to a node."""
-        assignment = LayerAssignment(
-            layer_id=layer_id,
-            node_id=node_id,
-            node_url=node_url,
-            grpc_addr=grpc_addr,
-        )
-        self.layer_assignments[layer_id].append(assignment)
+        if layer_id not in self.layer_assignments:
+            self.layer_assignments[layer_id] = []
         
-        # Announce to DHT
-        if self.dht:
-            try:
-                import json
-                key = f"layer_{layer_id}"
-                current = self.dht.lookup_value(key)
-                holders = json.loads(current) if current else []
-                if grpc_addr not in holders:
-                    holders.append(grpc_addr)
-                self.dht.store(key, json.dumps(holders))
-            except Exception as e:
-                logger.debug(f"DHT announce failed: {e}")
-    
-    def _discover_network_layers_from_dht(self) -> Set[int]:
-        """
-        Query DHT to discover which layers exist in the network.
-        
-        DECENTRALIZED COORDINATION:
-        - Each node announces "layer_X" to DHT when it holds layer X
-        - New nodes query DHT to see what layers already exist
-        - This prevents layer overlap without centralized coordination
-        """
-        discovered_layers = set()
-        
-        if not self.dht:
-            return discovered_layers
-        
-        try:
-            import hashlib
-            # Query for layers 0-1000 (reasonable max)
-            # DHT lookup is fast - O(log N) hops
-            for layer_id in range(min(1000, self.current_num_layers + 100)):
-                key_string = f"layer_{layer_id}"
-                # Hash the key string to get integer key (same as announce())
-                key_int = int(hashlib.sha1(key_string.encode()).hexdigest(), 16)
-                try:
-                    value = self.dht.lookup_value(key_int)
-                    if value:
-                        discovered_layers.add(layer_id)
-                except Exception:
-                    continue
-            
-            if discovered_layers:
-                logger.info(f"DHT layer discovery: found {len(discovered_layers)} layers "
-                           f"(range: {min(discovered_layers)}-{max(discovered_layers)})")
-        except Exception as e:
-            logger.debug(f"DHT layer discovery failed: {e}")
-        
-        return discovered_layers
-    
-    def _grow_model(
-        self,
-        num_new_layers: int,
-        node_id: str,
-        node_url: str,
-        grpc_addr: str
-    ) -> List[int]:
-        """
-        Grow the model by adding new layers.
-
-        This is how the model organically grows with the network!
-        """
-        new_layers = []
-        
-        for _ in range(num_new_layers):
-            new_layer_id = self.current_num_layers
-            self._assign_layer(new_layer_id, node_id, node_url, grpc_addr)
-            new_layers.append(new_layer_id)
-            self.current_num_layers += 1
-        
-        if new_layers:
-            logger.info(f"Model grew: now {self.current_num_layers} layers "
-                       f"(added layers {new_layers[0]}-{new_layers[-1]})")
-        
-        return new_layers
+        # Check if already assigned
+        if not any(a.node_id == node_id for a in self.layer_assignments[layer_id]):
+            self.layer_assignments[layer_id].append(
+                LayerAssignment(layer_id, node_id, node_url, grpc_addr)
+            )
     
     def upgrade_to_validator(self, node_id: str, node_url: str, grpc_addr: str) -> bool:
-        """
-        Upgrade a node to Validator role (assign LM head) when stake requirement is met.
-        
-        This is called when a node stakes enough NEURO to become a Validator.
-        No restart required - the node's role is upgraded dynamically.
-        
-        Returns True if upgrade was successful.
-        """
-        from neuroshard.core.economics.constants import VALIDATOR_MIN_MEMORY_MB
-        
+        """Upgrade a node to validator by assigning the last layer."""
         with self.lock:
-            # Check if node has sufficient memory
-            memory = self.node_capacities.get(node_id, 0)
-            if memory < VALIDATOR_MIN_MEMORY_MB:
-                logger.warning(f"Node {node_id[:8]}... cannot be Validator: insufficient memory ({memory}MB)")
+            if self.current_num_layers == 0:
                 return False
             
-            # Check if already a validator
-            last_layer = max(0, self.current_num_layers - 1)
-            if any(a.node_id == node_id for a in self.layer_assignments[last_layer]):
-                logger.info(f"Node {node_id[:8]}... is already a Validator")
-                return True
+            last_layer = self.current_num_layers - 1
             
-            # Assign the last layer (LM head)
+            # Check if already a validator
+            current_holders = self.layer_assignments.get(last_layer, [])
+            if any(a.node_id == node_id for a in current_holders):
+                return True  # Already has last layer
+            
+            # Assign last layer
             self._assign_layer(last_layer, node_id, node_url, grpc_addr)
             self.lm_head_holder = node_id
             
-            logger.info(f"Node {node_id[:8]}... upgraded to VALIDATOR (assigned layer {last_layer})")
+            logger.info(f"Node {node_id[:8]}... upgraded to VALIDATOR (layer {last_layer})")
             return True
     
-    def demote_from_validator(self, node_id: str) -> bool:
-        """
-        Demote a node from Validator role when stake drops below requirement.
-        
-        This is called when:
-        1. A validator unstakes and drops below the required amount
-        2. The network grows and the required stake increases (tier change)
-        
-        The node keeps its other layer assignments but loses the LM head.
-        
-        Returns True if demotion was successful.
-        """
+    def remove_node(self, node_id: str):
+        """Remove a node and its layer assignments."""
         with self.lock:
-            return self._demote_from_validator_unlocked(node_id)
-    
-    def _demote_from_validator_unlocked(self, node_id: str) -> bool:
-        """
-        Internal demotion logic (caller must hold self.lock).
-        
-        Split out to avoid deadlock when called from validate_all_validators().
-        """
-        last_layer = max(0, self.current_num_layers - 1)
-        
-        # Check if node is currently a validator
-        current_assignments = self.layer_assignments.get(last_layer, [])
-        was_validator = any(a.node_id == node_id for a in current_assignments)
-        
-        if not was_validator:
-            logger.debug(f"Node {node_id[:8]}... is not a validator, nothing to demote")
-            return False
-        
-        # Remove from last layer assignments
-        self.layer_assignments[last_layer] = [
-            a for a in current_assignments if a.node_id != node_id
-        ]
-        
-        # Update lm_head_holder if this was the holder
-        if self.lm_head_holder == node_id:
-            # Find another validator if available
-            remaining = self.layer_assignments.get(last_layer, [])
-            if remaining:
-                self.lm_head_holder = remaining[0].node_id
-            else:
-                self.lm_head_holder = None
-        
-        logger.warning(f"Node {node_id[:8]}... DEMOTED from Validator (insufficient stake)")
-        return True
-    
-    def validate_all_validators(self, get_stake_fn) -> List[str]:
-        """
-        Validate all current validators still meet stake requirements.
-        
-        Called periodically or when stake tier changes to ensure all validators
-        have sufficient stake for the current network size.
-        
-        IMPORTANT: Never demotes below MIN_VALIDATORS (2) to ensure the network
-        can always compute real loss. The stake requirement only applies to
-        validators beyond the minimum.
-        
-        Args:
-            get_stake_fn: Function(node_id) -> float that returns current stake
-            
-        Returns:
-            List of node_ids that were demoted
-        """
-        from neuroshard.core.economics.constants import get_dynamic_validator_stake
-        
-        MIN_VALIDATORS = 2  # Network needs at least 2 validators to function
-        
-        demoted = []
-        
-        with self.lock:
-            last_layer = max(0, self.current_num_layers - 1)
-            current_validators = list(self.layer_assignments.get(last_layer, []))
-            num_validators = len(current_validators)
-            
-            # CRITICAL: Never demote below MIN_VALIDATORS
-            # Otherwise the network can't compute real cross-entropy loss!
-            if num_validators <= MIN_VALIDATORS:
-                logger.debug(f"Only {num_validators} validators - skipping stake check (minimum {MIN_VALIDATORS} required)")
-                return []
-            
-            # Get current stake requirement
-            required_stake = get_dynamic_validator_stake(num_validators)
-            
-            # Sort validators by stake (lowest first) to demote lowest-stake first
-            validators_with_stake = [
-                (assignment, get_stake_fn(assignment.node_id))
-                for assignment in current_validators
-            ]
-            validators_with_stake.sort(key=lambda x: x[1])  # Lowest stake first
-            
-            for assignment, node_stake in validators_with_stake:
-                # Check if we'd go below minimum
-                remaining_validators = num_validators - len(demoted)
-                if remaining_validators <= MIN_VALIDATORS:
-                    logger.info(f"Stopping demotion: {remaining_validators} validators remain (minimum {MIN_VALIDATORS})")
-                    break
-                
-                if node_stake < required_stake:
-                    logger.warning(
-                        f"Validator {assignment.node_id[:8]}... has {node_stake:.0f} NEURO "
-                        f"but {required_stake:.0f} required - DEMOTING"
-                    )
-                    # Use unlocked version since we already hold self.lock
-                    if self._demote_from_validator_unlocked(assignment.node_id):
-                        demoted.append(assignment.node_id)
-        
-        return demoted
-    
-    def unregister_node(self, node_id: str):
-        """
-        Unregister a node and redistribute its layers.
-        
-        This handles graceful degradation when nodes leave.
-        """
-        with self.lock:
-            # Remove from capacities
-            self.node_capacities.pop(node_id, None)
-            
-            # Find all layers this node was holding
             orphaned_layers = []
             
-            for layer_id, assignments in self.layer_assignments.items():
-                # Remove this node's assignment
+            for layer_id in list(self.layer_assignments.keys()):
+                before = len(self.layer_assignments[layer_id])
                 self.layer_assignments[layer_id] = [
-                    a for a in assignments if a.node_id != node_id
+                    a for a in self.layer_assignments[layer_id] if a.node_id != node_id
                 ]
+                after = len(self.layer_assignments[layer_id])
                 
-                # Check if layer is now orphaned (< MIN_REPLICAS)
-                if len(self.layer_assignments[layer_id]) < self.MIN_REPLICAS:
-                    orphaned_layers.append(layer_id)
+                if before > after:
+                    if not self.layer_assignments[layer_id]:
+                        orphaned_layers.append(layer_id)
             
-            # Handle embedding/head holder leaving
+            # Update role holders
             if self.embedding_holder == node_id:
                 self.embedding_holder = None
             if self.lm_head_holder == node_id:
                 self.lm_head_holder = None
             
+            if node_id in self.node_capacities:
+                del self.node_capacities[node_id]
+            
             if orphaned_layers:
-                logger.warning(f"Node {node_id[:8]}... left, {len(orphaned_layers)} layers need redistribution")
-                # In production, we would trigger redistribution here
-    
-    def get_layer_holders(self, layer_id: int) -> List[LayerAssignment]:
-        """Get all nodes holding a specific layer."""
-        with self.lock:
-            return list(self.layer_assignments.get(layer_id, []))
-    
-    def get_pipeline_route(self) -> List[Tuple[int, str]]:
-        """
-        Get the route for pipeline inference.
-        
-        Returns list of (layer_id, grpc_addr) for each layer in order.
-        
-        Filters out dead/stale nodes based on heartbeat timeout.
-        """
-        with self.lock:
-            route = []
-            now = time.time()
-            
-            for layer_id in range(self.current_num_layers):
-                holders = self.layer_assignments.get(layer_id, [])
-                if not holders:
-                    logger.error(f"Layer {layer_id} has no holders!")
-                    continue
-                
-                # ROBUSTNESS: Filter out stale holders (expired heartbeat)
-                active_holders = [
-                    h for h in holders
-                    if (now - h.last_heartbeat) < self.HEARTBEAT_TIMEOUT
-                ]
-                
-                if not active_holders:
-                    logger.warning(f"Layer {layer_id} has no ACTIVE holders "
-                                  f"({len(holders)} total, all stale)")
-                    continue
-                
-                # Pick best active holder (most recent heartbeat)
-                active_holders.sort(key=lambda h: -h.last_heartbeat)
-                route.append((layer_id, active_holders[0].grpc_addr))
-                
-                logger.debug(f"Layer {layer_id}: selected {active_holders[0].node_id[:16]}... "
-                            f"(heartbeat {now - active_holders[0].last_heartbeat:.1f}s ago)")
-            
-            return route
-    
-    def get_network_capacity(self) -> NetworkCapacity:
-        """Get current network capacity with dynamic architecture."""
-        with self.lock:
-            total_memory = sum(self.node_capacities.values())
-            
-            # Calculate max layers based on current architecture
-            if self.current_architecture:
-                memory_per_layer = estimate_memory_per_layer(self.current_architecture)
-                max_layers = int(total_memory * 0.6 / memory_per_layer)
-            else:
-                max_layers = 0
-            
-            layer_coverage = {
-                layer_id: len(assignments)
-                for layer_id, assignments in self.layer_assignments.items()
-            }
-            
-            return NetworkCapacity(
-                total_nodes=len(self.node_capacities),
-                total_memory_mb=total_memory,
-                max_layers=max_layers,
-                assigned_layers=self.current_num_layers,
-                layer_coverage=layer_coverage,
-            )
-    
-    def heartbeat(self, node_id: str, layer_ids: List[int]):
-        """Update heartbeat for a node's layers."""
-        with self.lock:
-            now = time.time()
-            for layer_id in layer_ids:
-                for assignment in self.layer_assignments.get(layer_id, []):
-                    if assignment.node_id == node_id:
-                        assignment.last_heartbeat = now
-    
-    def cleanup_stale_assignments(self) -> int:
-        """
-        Remove stale layer assignments (nodes that haven't heartbeat recently).
-        
-        Returns number of stale assignments removed.
-        
-        Called periodically to prevent dead peers from being selected for pipeline routing.
-        """
-        with self.lock:
-            now = time.time()
-            removed_count = 0
-            
-            for layer_id, assignments in list(self.layer_assignments.items()):
-                # Filter out stale assignments
-                active_assignments = [
-                    a for a in assignments
-                    if (now - a.last_heartbeat) < self.HEARTBEAT_TIMEOUT
-                ]
-                
-                stale_count = len(assignments) - len(active_assignments)
-                if stale_count > 0:
-                    logger.info(f"Layer {layer_id}: removed {stale_count} stale assignments "
-                               f"({len(active_assignments)} remain)")
-                    removed_count += stale_count
-                
-                # Update assignments
-                if active_assignments:
-                    self.layer_assignments[layer_id] = active_assignments
-                else:
-                    # No active holders for this layer!
-                    logger.warning(f"Layer {layer_id}: NO active holders remaining!")
-                    del self.layer_assignments[layer_id]
-            
-            return removed_count
+                logger.warning(f"Node {node_id[:8]}... left, {len(orphaned_layers)} layers orphaned")
 
 
-class DynamicNeuroLLM:
+class DynamicNeuroLLM(nn.Module):
     """
-    A NeuroLLM that dynamically scales with the network.
+    Dynamic LLM that holds a subset of layers.
     
-    Key differences from fixed-phase model:
-    - Number of layers AND hidden dimension determined by network capacity
-    - Layers are distributed across nodes
-    - Model grows organically in BOTH width and depth
-    - Architecture adapts automatically as network expands
+    Each node holds different layers based on capacity.
+    Forward/backward passes are pipelined across nodes via gRPC.
     """
     
-    def __init__(
-        self,
-        node_id: str,
-        layer_pool: DynamicLayerPool,
-        device: str = "cpu"
-    ):
+    def __init__(self, node_id: str, layer_pool: DynamicLayerPool, device: str = "cpu"):
+        super().__init__()
         self.node_id = node_id
         self.layer_pool = layer_pool
         self.device = device
         
-        # Get current architecture from layer pool
-        if layer_pool.current_architecture is None:
-            raise RuntimeError("Layer pool has no architecture - call _auto_recalculate_architecture first")
+        # Architecture from layer pool
         self.architecture = layer_pool.current_architecture
+        self.vocab_capacity = layer_pool.vocab_capacity
         
-        # My assigned layers
-        self.my_layers: Dict[int, torch.nn.Module] = {}
+        # Layers this node holds
+        self.my_layers: Dict[int, nn.Module] = {}
         self.my_layer_ids: List[int] = []
         
-        # Callback for when layers change (set by DynamicNeuroNode to sync state)
-        self._on_layers_changed: Optional[callable] = None
+        # Embedding and LM head (only if we're holder)
+        self.embedding: Optional[nn.Embedding] = None
+        self.lm_head: Optional[nn.Linear] = None
+        self.final_norm: Optional[nn.Module] = None
         
-        # Reference to P2P manager for DHT updates during layer removal
-        self._p2p_manager = None
-        
-        # Do I hold embedding/head?
         self.has_embedding = False
         self.has_lm_head = False
         
-        # Shared components (if I hold them)
-        self.embedding: Optional[torch.nn.Embedding] = None
-        self.lm_head: Optional[torch.nn.Linear] = None
-        self.final_norm: Optional[torch.nn.Module] = None
-        
-        # Training mode flag (PyTorch convention)
-        self.training = False
+        # P2P manager reference (set later)
+        self._p2p_manager = None
+        self._on_layers_changed = None
         
         logger.info(f"DynamicNeuroLLM initialized for node {node_id[:8]}... "
                    f"with {self.architecture.num_layers}L × {self.architecture.hidden_dim}H architecture")
     
     def initialize_layers(self, layer_ids: List[int]):
-        """Initialize the layers assigned to this node using DYNAMIC architecture."""
-        from neuroshard.core.model.llm import NeuroLLMConfig, NeuroDecoderLayer
+        """Initialize the layers assigned to this node."""
+        from neuroshard.core.model.llm import NeuroLLMConfig, NeuroDecoderLayer, RMSNorm
         
-        # Create config from current architecture (DYNAMIC!)
         config = NeuroLLMConfig(
             hidden_dim=self.architecture.hidden_dim,
             intermediate_dim=self.architecture.intermediate_dim,
@@ -1131,6 +419,7 @@ class DynamicNeuroLLM:
             rope_theta=self.architecture.rope_theta,
         )
         
+        # Initialize transformer layers
         for layer_id in layer_ids:
             layer = NeuroDecoderLayer(config, layer_id)
             layer.to(self.device)
@@ -1138,914 +427,203 @@ class DynamicNeuroLLM:
         
         self.my_layer_ids = sorted(layer_ids)
         
-        # Initialize embedding if I'm the holder (uses dynamic hidden_dim!)
-        # Vocab capacity can grow dynamically as tokenizer learns more merges
-        self.vocab_capacity = INITIAL_VOCAB_SIZE
+        # Initialize embedding if we're the holder
         if self.layer_pool.embedding_holder == self.node_id:
-            self.embedding = torch.nn.Embedding(self.vocab_capacity, self.architecture.hidden_dim)
+            self.embedding = nn.Embedding(self.vocab_capacity, self.architecture.hidden_dim)
             self.embedding.to(self.device)
             self.has_embedding = True
+            logger.info(f"Initialized embedding: {self.vocab_capacity} tokens")
         
-        # Initialize LM head if I'm the holder (uses dynamic hidden_dim!)
+        # Initialize LM head if we're the holder
         if self.layer_pool.lm_head_holder == self.node_id:
-            self.lm_head = torch.nn.Linear(self.architecture.hidden_dim, self.vocab_capacity, bias=False)
-            from neuroshard.core.model.llm import RMSNorm
+            self.lm_head = nn.Linear(self.architecture.hidden_dim, self.vocab_capacity, bias=False)
             self.final_norm = RMSNorm(self.architecture.hidden_dim)
             self.lm_head.to(self.device)
             self.final_norm.to(self.device)
             self.has_lm_head = True
+            logger.info(f"Initialized LM head: {self.vocab_capacity} outputs")
         
         logger.info(f"Initialized {len(layer_ids)} layers: {layer_ids}, "
                    f"arch={self.architecture.num_layers}L×{self.architecture.hidden_dim}H, "
                    f"embedding={self.has_embedding}, head={self.has_lm_head}")
     
-    def initialize_lm_head(self) -> bool:
-        """
-        Dynamically initialize the LM head (for validator upgrade).
-        
-        Called when a node is upgraded to Validator after staking.
-        No restart required - initializes the head in place.
-        
-        Returns True if initialization was successful.
-        """
-        if self.has_lm_head:
-            logger.info("LM head already initialized")
-            return True
-        
-        try:
-            from neuroshard.core.model.llm import RMSNorm
-            
-            self.lm_head = torch.nn.Linear(self.architecture.hidden_dim, self.vocab_capacity, bias=False)
-            self.final_norm = RMSNorm(self.architecture.hidden_dim)
-            self.lm_head.to(self.device)
-            self.final_norm.to(self.device)
-            self.has_lm_head = True
-            
-            # Add last layer to my layers if not already there
-            last_layer = self.architecture.num_layers - 1
-            if last_layer not in self.my_layer_ids:
-                self.my_layer_ids.append(last_layer)
-                self.my_layer_ids = sorted(self.my_layer_ids)
-            
-            logger.info(f"LM head initialized! Now computing REAL cross-entropy loss")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to initialize LM head: {e}")
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Convert token IDs to embeddings."""
+        if not self.has_embedding:
+            raise RuntimeError("This node doesn't have the embedding layer")
+        return self.embedding(input_ids)
     
-    def disable_lm_head(self) -> bool:
-        """
-        Disable the LM head (for validator demotion).
-        
-        Called when a validator is demoted due to insufficient stake.
-        The node reverts to Worker role and uses activation norm as loss.
-        
-        Returns True if demotion was successful.
-        """
+    def forward_my_layers(self, hidden_states: torch.Tensor, 
+                          attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward through only my layers."""
+        for layer_id in self.my_layer_ids:
+            layer = self.my_layers[layer_id]
+            hidden_states = layer(hidden_states, attention_mask=attention_mask)
+        return hidden_states
+    
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute output logits."""
         if not self.has_lm_head:
-            logger.debug("LM head not initialized, nothing to disable")
-            return False
-        
-        try:
-            # Free memory from LM head
-            if self.lm_head is not None:
-                del self.lm_head
-                self.lm_head = None
-            if self.final_norm is not None:
-                del self.final_norm
-                self.final_norm = None
-            
-            self.has_lm_head = False
-            
-            # Force garbage collection to free memory
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            logger.warning(f"LM head DISABLED - node demoted to Worker (will use activation norm as loss)")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to disable LM head: {e}")
-            return False
+            raise RuntimeError("This node doesn't have the LM head")
+        hidden_states = self.final_norm(hidden_states)
+        return self.lm_head(hidden_states)
     
-    def add_layers(self, new_layer_ids: List[int]) -> List[int]:
-        """
-        Dynamically add new layers to a running model.
+    def forward(self, input_ids: torch.Tensor, 
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Full forward pass (only works if we have all components)."""
+        if not self.has_embedding:
+            raise RuntimeError("Cannot do full forward without embedding")
         
-        This allows the model to grow during training without restart!
-        Called when:
-        - Network needs more layers
-        - Node has available memory
-        - Vocab expansion freed up memory
+        hidden_states = self.embed(input_ids)
+        hidden_states = self.forward_my_layers(hidden_states, attention_mask)
         
-        Args:
-            new_layer_ids: Layer IDs to add
-            
-        Returns:
-            List of layer IDs that were successfully added
-        """
-        from neuroshard.core.model.llm import NeuroLLMConfig, NeuroDecoderLayer
-        
-        # Filter out layers we already have
-        layers_to_add = [lid for lid in new_layer_ids if lid not in self.my_layers]
-        if not layers_to_add:
-            return []
-        
-        # Check memory before adding
-        memory_per_layer = estimate_memory_per_layer(self.architecture)
-        required_mb = memory_per_layer * len(layers_to_add)
-        
-        try:
-            if torch.cuda.is_available() and self.device != "cpu":
-                free_mb = (torch.cuda.get_device_properties(0).total_memory - 
-                          torch.cuda.memory_allocated()) / (1024 * 1024)
-            else:
-                import psutil
-                free_mb = psutil.virtual_memory().available / (1024 * 1024)
-            
-            if free_mb < required_mb * 1.5:  # 1.5x safety margin
-                logger.warning(f"[LAYER] Insufficient memory to add {len(layers_to_add)} layers: "
-                              f"need {required_mb:.0f}MB, have {free_mb:.0f}MB")
-                # Add as many as we can fit
-                can_fit = int(free_mb / (memory_per_layer * 1.5))
-                layers_to_add = layers_to_add[:can_fit]
-                if not layers_to_add:
-                    return []
-        except Exception as e:
-            logger.warning(f"[LAYER] Memory check failed: {e}, proceeding cautiously")
-        
-        # Create config from architecture
-        config = NeuroLLMConfig(
-            hidden_dim=self.architecture.hidden_dim,
-            intermediate_dim=self.architecture.intermediate_dim,
-            num_layers=self.architecture.num_layers,
-            num_heads=self.architecture.num_heads,
-            num_kv_heads=self.architecture.num_kv_heads,
-            vocab_size=self.architecture.vocab_size,
-            max_seq_len=self.architecture.max_seq_len,
-            dropout=self.architecture.dropout,
-            rope_theta=self.architecture.rope_theta,
-        )
-        
-        added = []
-        for layer_id in layers_to_add:
-            try:
-                layer = NeuroDecoderLayer(config, layer_id)
-                layer.to(self.device)
-                self.my_layers[layer_id] = layer
-                added.append(layer_id)
-            except Exception as e:
-                logger.error(f"[LAYER] Failed to add layer {layer_id}: {e}")
-                break  # Stop on first failure
-        
-        if added:
-            self.my_layer_ids = sorted(self.my_layers.keys())
-            logger.info(f"[LAYER] ✅ Added {len(added)} layers: {added}")
-            logger.info(f"[LAYER] Now holding {len(self.my_layer_ids)} layers: {self.my_layer_ids[:5]}...{self.my_layer_ids[-5:]}")
-        
-        return added
+        if self.has_lm_head:
+            return self.compute_logits(hidden_states)
+        return hidden_states
     
-    def remove_layers(self, layer_ids_to_remove: List[int], layer_pool=None, p2p_manager=None) -> List[int]:
-        """
-        Dynamically remove layers from a running model.
-        
-        This allows the model to shrink during training without restart!
-        Called when:
-        - Vocab growth needs more memory
-        - Network is redistributing layers
-        - Memory pressure detected
-        
-        IMPORTANT: This also updates layer_pool and DHT announcements so other
-        nodes know we no longer hold these layers!
-        
-        Args:
-            layer_ids_to_remove: Layer IDs to remove
-            layer_pool: DynamicLayerPool to update assignments (optional)
-            p2p_manager: P2PManager to update DHT announcements (optional)
-            
-        Returns:
-            List of layer IDs that were successfully removed
-        """
-        # Can't remove layers we don't have
-        layers_to_remove = [lid for lid in layer_ids_to_remove if lid in self.my_layers]
-        if not layers_to_remove:
-            return []
-        
-        # Don't remove all layers - keep at least 1
-        if len(layers_to_remove) >= len(self.my_layers):
-            layers_to_remove = layers_to_remove[:-1]  # Keep last one
-            if not layers_to_remove:
-                logger.warning("[LAYER] Cannot remove all layers")
-                return []
-        
-        removed = []
-        for layer_id in layers_to_remove:
-            try:
-                # Delete the layer
-                layer = self.my_layers.pop(layer_id)
-                del layer
-                removed.append(layer_id)
-            except Exception as e:
-                logger.error(f"[LAYER] Failed to remove layer {layer_id}: {e}")
-        
-        if removed:
-            self.my_layer_ids = sorted(self.my_layers.keys())
-            
-            # UPDATE LAYER POOL: Remove this node from removed layers' assignments
-            if layer_pool:
-                try:
-                    with layer_pool.lock:
-                        for layer_id in removed:
-                            if layer_id in layer_pool.layer_assignments:
-                                # Remove our node from this layer's holders
-                                layer_pool.layer_assignments[layer_id] = [
-                                    a for a in layer_pool.layer_assignments[layer_id]
-                                    if a.node_id != self.node_id
-                                ]
-                                logger.info(f"[LAYER] Updated layer_pool: removed self from layer {layer_id}")
-                except Exception as e:
-                    logger.warning(f"[LAYER] Could not update layer_pool: {e}")
-            
-            # UPDATE DHT: Change announced layer range
-            if p2p_manager and self.my_layer_ids:
-                try:
-                    new_start = min(self.my_layer_ids)
-                    new_end = max(self.my_layer_ids)
-                    p2p_manager.start_layer = new_start
-                    p2p_manager.end_layer = new_end
-                    p2p_manager.shard_range = f"{new_start}-{new_end}"
-                    logger.info(f"[LAYER] Updated P2P shard_range: {new_start}-{new_end}")
-                    
-                    # Re-announce immediately so network knows
-                    if hasattr(p2p_manager, '_announce_once'):
-                        p2p_manager._announce_once(verbose=True)
-                except Exception as e:
-                    logger.warning(f"[LAYER] Could not update P2P shard_range: {e}")
-            
-            # Force garbage collection to free memory
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            logger.info(f"[LAYER] ✅ Removed {len(removed)} layers: {removed}")
-            logger.info(f"[LAYER] Now holding {len(self.my_layer_ids)} layers")
-            
-            # NOTIFY: Call callback so node can sync its state
-            if self._on_layers_changed:
-                try:
-                    self._on_layers_changed(self.my_layer_ids)
-                except Exception as e:
-                    logger.warning(f"[LAYER] Callback failed: {e}")
-        
-        return removed
-    
-    def expand_vocabulary(self, new_vocab_size: int) -> bool:
-        """
-        Expand embedding and lm_head to accommodate a larger vocabulary.
-        
-        This is called when the tokenizer learns new BPE merges that exceed
-        the current vocabulary capacity. The expansion preserves existing
-        token embeddings while initializing new ones.
-        
-        For an ever-growing decentralized LLM, vocabulary expansion is essential
-        as millions of users contribute diverse training data across languages
-        and domains.
-        
-        Args:
-            new_vocab_size: The new vocabulary size (must be > current capacity)
-            
-        Returns:
-            True if expansion was successful, False otherwise
-        """
+    def check_and_expand_vocab_if_needed(self, new_vocab_size: int) -> bool:
+        """Expand vocabulary if needed."""
         if new_vocab_size <= self.vocab_capacity:
-            return True  # No expansion needed
+            return False
         
-        # Check against max (if set)
-        if MAX_VOCAB_SIZE is not None and new_vocab_size > MAX_VOCAB_SIZE:
-            logger.warning(f"Requested vocab {new_vocab_size} exceeds MAX_VOCAB_SIZE {MAX_VOCAB_SIZE}")
-            new_vocab_size = MAX_VOCAB_SIZE
+        # Round up to nearest 32K for efficiency
+        VOCAB_GROWTH_CHUNK = 32000
+        new_capacity = ((new_vocab_size // VOCAB_GROWTH_CHUNK) + 1) * VOCAB_GROWTH_CHUNK
+        new_capacity = min(new_capacity, MAX_VOCAB_SIZE)
         
-        # Round up to next VOCAB_GROWTH_CHUNK for efficient memory alignment
-        new_capacity = ((new_vocab_size + VOCAB_GROWTH_CHUNK - 1) // VOCAB_GROWTH_CHUNK) * VOCAB_GROWTH_CHUNK
-        if MAX_VOCAB_SIZE is not None:
-            new_capacity = min(new_capacity, MAX_VOCAB_SIZE)
-        
-        # MEMORY CHECK: Estimate memory needed for expansion
-        # Embedding + LM head expansion: 2 * (new - old) * hidden_dim * 4 bytes (float32)
-        hidden_dim = self.architecture.hidden_dim
-        expansion_params = 2 * (new_capacity - self.vocab_capacity) * hidden_dim
-        expansion_memory_mb = (expansion_params * 4) / (1024 * 1024)  # Just weights, no optimizer yet
-        
-        # Check available memory (GPU or CPU)
-        try:
-            if torch.cuda.is_available() and self.device != "cpu":
-                # Check GPU memory
-                free_memory_mb = (torch.cuda.get_device_properties(0).total_memory - 
-                                 torch.cuda.memory_allocated()) / (1024 * 1024)
-            else:
-                # Check system RAM
-                import psutil
-                free_memory_mb = psutil.virtual_memory().available / (1024 * 1024)
-            
-            # Need at least 2x expansion memory (weights + temporary copy during expansion)
-            required_mb = expansion_memory_mb * 2
-            
-            if free_memory_mb < required_mb:
-                logger.warning(f"[VOCAB] Insufficient memory for expansion: need {required_mb:.0f}MB, "
-                              f"have {free_memory_mb:.0f}MB free")
-                
-                # TRY: Remove some layers to make room for vocab expansion
-                # Vocab is more important than extra layers (all nodes need same vocab)
-                memory_per_layer = estimate_memory_per_layer(self.architecture)
-                layers_to_free = int((required_mb - free_memory_mb) / memory_per_layer) + 1
-                
-                if len(self.my_layers) > layers_to_free + 1:  # Keep at least 1 layer
-                    # Remove highest-numbered layers (least important for Driver/Validator)
-                    layers_to_remove = sorted(self.my_layers.keys(), reverse=True)[:layers_to_free]
-                    logger.warning(f"[VOCAB] Attempting to free memory by removing {layers_to_free} layers: {layers_to_remove}")
-                    
-                    # Pass layer_pool so network state is updated
-                    # p2p_manager will be notified via layer_pool.on_layers_changed callback
-                    removed = self.remove_layers(
-                        layers_to_remove, 
-                        layer_pool=self.layer_pool,
-                        p2p_manager=getattr(self, '_p2p_manager', None)
-                    )
-                    if removed:
-                        # Recalculate free memory after layer removal
-                        if torch.cuda.is_available() and self.device != "cpu":
-                            free_memory_mb = (torch.cuda.get_device_properties(0).total_memory - 
-                                             torch.cuda.memory_allocated()) / (1024 * 1024)
-                        else:
-                            import psutil
-                            free_memory_mb = psutil.virtual_memory().available / (1024 * 1024)
-                        
-                        if free_memory_mb >= required_mb:
-                            logger.info(f"[VOCAB] ✅ Freed enough memory by removing {len(removed)} layers")
-                            # Continue with expansion below
-                        else:
-                            logger.warning(f"[VOCAB] Still insufficient memory after layer removal")
-                            return False
-                    else:
-                        logger.warning(f"[VOCAB] Could not remove layers, capping expansion")
-                        return False
-                else:
-                    logger.warning(f"[VOCAB] Not enough layers to remove, capping expansion")
-                    return False
-                
-            logger.info(f"[VOCAB] Memory check passed: {expansion_memory_mb:.0f}MB needed, "
-                       f"{free_memory_mb:.0f}MB available")
-        except Exception as e:
-            logger.warning(f"[VOCAB] Could not check memory: {e}, proceeding with expansion")
+        if new_capacity <= self.vocab_capacity:
+            return False
         
         logger.info(f"[VOCAB] Expanding vocabulary: {self.vocab_capacity} → {new_capacity}")
         
-        try:
-            # Expand embedding if we have it
-            if self.has_embedding and self.embedding is not None:
-                old_embedding = self.embedding
-                old_vocab = old_embedding.weight.shape[0]
-                hidden_dim = old_embedding.weight.shape[1]
-                
-                # Create new larger embedding
-                new_embedding = torch.nn.Embedding(new_capacity, hidden_dim)
-                new_embedding.to(self.device)
-                
-                # Copy existing embeddings
-                with torch.no_grad():
-                    new_embedding.weight[:old_vocab] = old_embedding.weight
-                    # Initialize new embeddings with small random values
-                    # (similar to how transformers initialize)
-                    std = 0.02
-                    new_embedding.weight[old_vocab:].normal_(mean=0.0, std=std)
-                
-                # Replace old embedding
-                del self.embedding
-                self.embedding = new_embedding
-                
-                logger.info(f"[VOCAB] Expanded embedding: {old_vocab} → {new_capacity} tokens")
-            
-            # Expand lm_head if we have it
-            if self.has_lm_head and self.lm_head is not None:
-                old_lm_head = self.lm_head
-                old_vocab = old_lm_head.weight.shape[0]
-                hidden_dim = old_lm_head.weight.shape[1]
-                
-                # Create new larger lm_head
-                new_lm_head = torch.nn.Linear(hidden_dim, new_capacity, bias=False)
-                new_lm_head.to(self.device)
-                
-                # Copy existing weights
-                with torch.no_grad():
-                    new_lm_head.weight[:old_vocab] = old_lm_head.weight
-                    # Initialize new output weights
-                    std = 0.02
-                    new_lm_head.weight[old_vocab:].normal_(mean=0.0, std=std)
-                
-                # Replace old lm_head
-                del self.lm_head
-                self.lm_head = new_lm_head
-                
-                logger.info(f"[VOCAB] Expanded lm_head: {old_vocab} → {new_capacity} output classes")
-            
-            # Update capacity
-            old_capacity = self.vocab_capacity
-            self.vocab_capacity = new_capacity
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            logger.info(f"[VOCAB] ✅ Vocabulary expansion complete: {old_capacity} → {new_capacity}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"[VOCAB] Failed to expand vocabulary: {e}")
-            return False
-    
-    def check_and_expand_vocab_if_needed(self) -> bool:
-        """
-        Check if tokenizer vocabulary exceeds current capacity and expand if needed.
+        # Expand embedding
+        if self.has_embedding and self.embedding is not None:
+            old_embedding = self.embedding
+            self.embedding = nn.Embedding(new_capacity, self.architecture.hidden_dim)
+            with torch.no_grad():
+                self.embedding.weight[:old_embedding.num_embeddings] = old_embedding.weight
+            self.embedding.to(self.device)
+            logger.info(f"[VOCAB] Expanded embedding: {old_embedding.num_embeddings} → {new_capacity} tokens")
         
-        This should be called periodically (e.g., after loading new tokenizer from CDN)
-        to ensure the model can handle all tokens in the current vocabulary.
+        # Expand LM head
+        if self.has_lm_head and self.lm_head is not None:
+            old_lm_head = self.lm_head
+            self.lm_head = nn.Linear(self.architecture.hidden_dim, new_capacity, bias=False)
+            with torch.no_grad():
+                self.lm_head.weight[:old_lm_head.out_features] = old_lm_head.weight
+            self.lm_head.to(self.device)
+            logger.info(f"[VOCAB] Expanded lm_head: {old_lm_head.out_features} → {new_capacity} outputs")
         
-        Returns:
-            True if no expansion needed or expansion successful, False on failure
-        """
-        if self.tokenizer is None:
-            return True
+        self.vocab_capacity = new_capacity
+        self.layer_pool.vocab_capacity = new_capacity
         
-        current_vocab = self.tokenizer.current_vocab_size
-        if current_vocab > self.vocab_capacity:
-            logger.info(f"[VOCAB] Tokenizer vocab ({current_vocab}) exceeds capacity ({self.vocab_capacity})")
-            return self.expand_vocabulary(current_vocab)
-        
+        logger.info(f"[VOCAB] ✅ Vocabulary expansion complete: {self.vocab_capacity}")
         return True
     
-    def forward_my_layers(
-        self,
-        hidden_states: torch.Tensor,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Forward through my assigned layers."""
-        if start_layer is None:
-            start_layer = min(self.my_layer_ids) if self.my_layer_ids else 0
-        if end_layer is None:
-            end_layer = max(self.my_layer_ids) + 1 if self.my_layer_ids else 0
-        
-        x = hidden_states
-        
-        for layer_id in range(start_layer, end_layer):
-            if layer_id in self.my_layers:
-                x, _ = self.my_layers[layer_id](x)
-        
-        return x
-    
-    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Embed input tokens (only if I hold embedding)."""
-        if not self.has_embedding:
-            raise RuntimeError("This node does not hold the embedding layer")
-        return self.embedding(input_ids)
-    
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Compute logits (only if I hold LM head)."""
-        if not self.has_lm_head:
-            raise RuntimeError("This node does not hold the LM head")
-        x = self.final_norm(hidden_states)
-        return self.lm_head(x)
-    
-    def get_num_params(self) -> int:
-        """Get number of parameters on this node."""
-        total = 0
+    def parameters(self, recurse: bool = True):
+        """Get all parameters."""
+        params = []
         for layer in self.my_layers.values():
-            total += sum(p.numel() for p in layer.parameters())
-        if self.embedding:
-            total += sum(p.numel() for p in self.embedding.parameters())
-        if self.lm_head:
-            total += sum(p.numel() for p in self.lm_head.parameters())
-        if self.final_norm:
-            total += sum(p.numel() for p in self.final_norm.parameters())
-        return total
-    
-    def parameters(self):
-        """Yield all parameters for this node's model components (for optimizer/gradient clipping)."""
-        for layer in self.my_layers.values():
-            yield from layer.parameters()
-        if self.embedding:
-            yield from self.embedding.parameters()
-        if self.lm_head:
-            yield from self.lm_head.parameters()
-        if self.final_norm:
-            yield from self.final_norm.parameters()
+            params.extend(layer.parameters(recurse))
+        if self.embedding is not None:
+            params.extend(self.embedding.parameters(recurse))
+        if self.lm_head is not None:
+            params.extend(self.lm_head.parameters(recurse))
+        if self.final_norm is not None:
+            params.extend(self.final_norm.parameters(recurse))
+        return iter(params)
     
     def named_parameters(self, prefix: str = '', recurse: bool = True):
-        """
-        Yield (name, param) tuples for all parameters.
-        
-        This is the standard PyTorch interface for iterating over named parameters.
-        """
-        # Layers
+        """Get named parameters."""
+        for name, param in super().named_parameters(prefix, recurse):
+            yield name, param
         for layer_id, layer in self.my_layers.items():
-            layer_prefix = f"{prefix}layers.{layer_id}." if prefix else f"layers.{layer_id}."
-            for name, param in layer.named_parameters(prefix='', recurse=recurse):
-                yield layer_prefix + name, param
-        
-        # Embedding
-        if self.embedding:
-            emb_prefix = f"{prefix}embedding." if prefix else "embedding."
-            for name, param in self.embedding.named_parameters(prefix='', recurse=recurse):
-                yield emb_prefix + name, param
-        
-        # LM Head
-        if self.lm_head:
-            head_prefix = f"{prefix}lm_head." if prefix else "lm_head."
-            for name, param in self.lm_head.named_parameters(prefix='', recurse=recurse):
-                yield head_prefix + name, param
-        
-        # Final Norm
-        if self.final_norm:
-            norm_prefix = f"{prefix}final_norm." if prefix else "final_norm."
-            for name, param in self.final_norm.named_parameters(prefix='', recurse=recurse):
-                yield norm_prefix + name, param
-    
-    def state_dict(self) -> Dict[str, Any]:
-        """
-        Return the state dictionary of the model.
-        
-        This is the standard PyTorch interface for saving model state.
-        """
-        state = {}
-        
-        # Layers
-        for layer_id, layer in self.my_layers.items():
-            for name, param in layer.state_dict().items():
-                state[f"layers.{layer_id}.{name}"] = param
-        
-        # Embedding
-        if self.embedding:
-            for name, param in self.embedding.state_dict().items():
-                state[f"embedding.{name}"] = param
-        
-        # LM Head
-        if self.lm_head:
-            for name, param in self.lm_head.state_dict().items():
-                state[f"lm_head.{name}"] = param
-        
-        # Final Norm
-        if self.final_norm:
-            for name, param in self.final_norm.state_dict().items():
-                state[f"final_norm.{name}"] = param
-        
-        return state
-    
-    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True):
-        """
-        Load state dictionary into the model.
-        
-        This is the standard PyTorch interface for loading model state.
-        """
-        # Group state by component
-        layer_states: Dict[int, Dict[str, Any]] = {}
-        embedding_state: Dict[str, Any] = {}
-        lm_head_state: Dict[str, Any] = {}
-        final_norm_state: Dict[str, Any] = {}
-        
-        for key, value in state_dict.items():
-            if key.startswith("layers."):
-                parts = key.split(".", 2)
-                layer_id = int(parts[1])
-                param_name = parts[2]
-                if layer_id not in layer_states:
-                    layer_states[layer_id] = {}
-                layer_states[layer_id][param_name] = value
-            elif key.startswith("embedding."):
-                param_name = key[len("embedding."):]
-                embedding_state[param_name] = value
-            elif key.startswith("lm_head."):
-                param_name = key[len("lm_head."):]
-                lm_head_state[param_name] = value
-            elif key.startswith("final_norm."):
-                param_name = key[len("final_norm."):]
-                final_norm_state[param_name] = value
-        
-        # Load into components
-        for layer_id, layer in self.my_layers.items():
-            if layer_id in layer_states:
-                layer.load_state_dict(layer_states[layer_id], strict=strict)
-        
-        if self.embedding and embedding_state:
-            self.embedding.load_state_dict(embedding_state, strict=strict)
-        
-        if self.lm_head and lm_head_state:
-            self.lm_head.load_state_dict(lm_head_state, strict=strict)
-        
-        if self.final_norm and final_norm_state:
-            self.final_norm.load_state_dict(final_norm_state, strict=strict)
-    
-    def zero_grad(self, set_to_none: bool = False):
-        """
-        Zero all gradients.
-        
-        This is the standard PyTorch interface for zeroing gradients.
-        """
-        for param in self.parameters():
-            if param.grad is not None:
-                if set_to_none:
-                    param.grad = None
-                else:
-                    param.grad.zero_()
-    
-    def train(self, mode: bool = True) -> 'DynamicNeuroLLM':
-        """
-        Set the model to training mode.
-        
-        This is the standard PyTorch interface for setting training mode
-        on all submodules.
-        """
-        self.training = mode
-        for layer in self.my_layers.values():
-            layer.train(mode)
-        if self.embedding:
-            self.embedding.train(mode)
-        if self.lm_head:
-            self.lm_head.train(mode)
-        if self.final_norm:
-            self.final_norm.train(mode)
-        return self
-    
-    def eval(self) -> 'DynamicNeuroLLM':
-        """Set the model to evaluation mode."""
-        return self.train(False)
-    
-    def get_my_contribution(self) -> Dict[str, Any]:
-        """Get this node's contribution to the network."""
-        capacity = self.layer_pool.get_network_capacity()
-        
-        return {
-            "node_id": self.node_id[:16] + "...",
-            "my_layers": self.my_layer_ids,
-            "my_params": self.get_num_params(),
-            "has_embedding": self.has_embedding,
-            "has_lm_head": self.has_lm_head,
-            "network_total_layers": capacity.assigned_layers,
-            "network_total_nodes": capacity.total_nodes,
-            "contribution_ratio": len(self.my_layer_ids) / max(1, capacity.assigned_layers),
-        }
+            for name, param in layer.named_parameters(f"layer_{layer_id}", recurse):
+                yield name, param
 
-
-def calculate_reward_multiplier(
-    num_layers_held: int,
-    total_network_layers: int,
-    has_embedding: bool,
-    has_lm_head: bool
-) -> float:
-    """
-    Calculate NEURO reward multiplier based on contribution.
-    
-    Roles:
-    - Worker: Standard reward based on layers
-    - Driver (Embedding): 1.2x bonus (bandwidth cost)
-    - Validator (Head): 1.2x bonus (compute/consensus cost)
-    """
-    if total_network_layers == 0:
-        return 1.0
-    
-    # Base multiplier from layer contribution
-    layer_ratio = num_layers_held / total_network_layers
-    base_multiplier = 1.0 + layer_ratio  # 1.0 to 2.0 based on layers
-    
-    # Bonus for critical components (Roles)
-    if has_embedding:
-        base_multiplier *= 1.2  # 20% bonus for Driving (Data bandwidth)
-    if has_lm_head:
-        base_multiplier *= 1.2  # 20% bonus for Validating (Loss calc + Gradient origin)
-    
-    return base_multiplier
-
-
-# ============================================================================
-# DYNAMIC NEURO NODE - The Main Node Class
-# ============================================================================
 
 class DynamicNeuroNode:
     """
-    A truly decentralized node that contributes based on available memory.
+    A node in the NeuroShard network.
     
-    NO PHASES. NO CENTRAL COORDINATION.
-    
-    How it works:
-    1. Node starts, detects available memory
-    2. Registers with network, gets assigned layers
-    3. Loads only the layers it's responsible for
-    4. Participates in training (computes gradients for its layers)
-    5. Participates in inference (forwards through its layers)
-    6. Earns NEURO proportional to its contribution
-    
-    The more memory you have, the more layers you hold, the more you earn.
+    Manages:
+    - Layer assignment and initialization
+    - Training with pipeline parallelism
+    - Checkpointing and recovery
+    - P2P communication for distributed training
     """
-    
-    CHECKPOINT_DIR = None  # Set in __init__
     
     def __init__(
         self,
         node_id: str,
+        wallet_id: str,
         port: int = 8000,
-        tracker_url: str = "https://neuroshard.com/api/tracker",
-        node_token: Optional[str] = None,
+        available_memory_mb: float = 4000,
         device: str = "cpu",
-        available_memory_mb: Optional[float] = None,
         enable_training: bool = True,
-        max_storage_mb: float = 100.0,
-        max_cpu_threads: Optional[int] = None,
+        max_storage_mb: int = 5000
     ):
         self.node_id = node_id
+        self.wallet_id = wallet_id
         self.port = port
-        self.tracker_url = tracker_url
-        self.node_token = node_token
-        
-        # Detect device automatically if "auto" or "cpu" (backward compatibility)
-        if device in ("auto", "cpu"):
-            if torch.cuda.is_available():
-                self.device = "cuda"
-                logger.info(f"[NODE] GPU detected: CUDA available")
-            elif torch.backends.mps.is_available():
-                # MPS (Apple Silicon GPU) - enabled now that we have GIL yields
-                self.device = "mps"
-                logger.info(f"[NODE] GPU detected: Apple Metal (MPS)")
-            else:
-                self.device = "cpu"
-                logger.info(f"[NODE] No GPU detected, using CPU")
-                
-                # Help debug why CUDA isn't available
-                import subprocess
-                import sys
-                
-                # Check if NVIDIA GPU exists
-                has_nvidia_gpu = False
-                try:
-                    if sys.platform == 'win32':
-                        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=2)
-                        has_nvidia_gpu = result.returncode == 0
-                    elif sys.platform == 'darwin':
-                        # macOS doesn't have NVIDIA support (use MPS instead)
-                        pass
-                    else:  # Linux
-                        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=2)
-                        has_nvidia_gpu = result.returncode == 0
-                except Exception:
-                    pass
-                
-                # Detailed diagnostic
-                logger.info(f"[NODE] torch.cuda.is_available() = False")
-                
-                # Check if PyTorch was built with CUDA
-                try:
-                    cuda_available = torch.cuda.is_available()
-                    cuda_built = getattr(torch.version, 'cuda', None)
-                    torch_version = torch.__version__
-                    logger.info(f"[NODE] PyTorch version: {torch_version}")
-                    logger.info(f"[NODE] CUDA compiled version: {cuda_built if cuda_built else 'None (CPU-only build)'}")
-                except Exception as e:
-                    logger.info(f"[NODE] Could not get CUDA info: {e}")
-                
-                # Provide helpful diagnostic
-                if has_nvidia_gpu:
-                    logger.warning("⚠️  NVIDIA GPU DETECTED BUT NOT BEING USED!")
-                    logger.warning("Your system has an NVIDIA GPU, but this PyTorch installation is CPU-only.")
-                    logger.warning("🔧 TO ENABLE GPU (for 5-10x faster training):")
-                    logger.warning("If running the .exe (frozen build):")
-                    logger.warning("  Unfortunately, the bundled Python environment can't easily be modified.")
-                    logger.warning("  We recommend running from source for GPU support.")
-                    logger.warning("If running from source:")
-                    logger.warning("  pip uninstall torch")
-                    logger.warning("  pip install torch --index-url https://download.pytorch.org/whl/cu121")
-                    logger.warning("To verify: python -c \"import torch; print(torch.cuda.is_available())\"")
-        else:
-            self.device = device
-            logger.info(f"[NODE] Device manually set to: {self.device}")
-            
-        logger.info(f"Using device: {self.device}")
-        
+        self.available_memory_mb = available_memory_mb
+        self.device = device
         self.enable_training = enable_training
         self.max_storage_mb = max_storage_mb
-        self.max_cpu_threads = max_cpu_threads
         
-        # CPU thread limiting is done in runner.py BEFORE any torch operations
-        # (torch.set_num_interop_threads must be called before any parallel work)
-        if max_cpu_threads and self.device == "cpu":
-            torch.set_num_threads(max_cpu_threads)  # Intra-op parallelism only
-            logger.info(f"Set PyTorch intra-op threads: {max_cpu_threads}")
-        
-        # Detect memory if not provided
-        if available_memory_mb is None:
-            self.available_memory_mb = self._detect_available_memory()
-        else:
-            self.available_memory_mb = available_memory_mb
-        
-        # Checkpoint directory
-        from pathlib import Path
-        self.CHECKPOINT_DIR = Path.home() / ".neuroshard" / "checkpoints"
-        self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        
-        # Compute wallet_id from token for stable checkpoint naming
-        # (node_id can change if machine_id changes, but wallet_id is stable)
-        if node_token:
-            self.wallet_id = hashlib.sha256(node_token.encode()).hexdigest()[:16]
-        else:
-            self.wallet_id = self.node_id[:16]  # Fallback to node_id
-        
-        # Layer pool (shared across network via DHT)
+        # Components (initialized in start())
         self.layer_pool: Optional[DynamicLayerPool] = None
-        
-        # My model (only my layers)
         self.model: Optional[DynamicNeuroLLM] = None
-        self.my_layer_ids: List[int] = []
-        
-        # Tokenizer
+        self.optimizer: Optional[torch.optim.Optimizer] = None
         self.tokenizer = None
         
-        # Training components (enable_training set in __init__)
-        self.optimizer: Optional[torch.optim.Optimizer] = None
-        self.training_coordinator = None
-        self.data_manager = None
-        self.gradient_gossip = None
-        
-        # Training lock to prevent concurrent training operations
-        # (local training vs pipeline training conflict)
-        self._training_lock = threading.Lock()
-        
-        # P2P
+        # P2P manager (set externally before start)
         self.p2p_manager = None
         
-        # Stats
-        self.is_running = False
-        self.total_tokens_processed = 0
-        self.total_training_rounds = 0
-        self.current_loss = float('inf')
-        self.inference_count = 0
-        self.training_contribution_count = 0
+        # Layer tracking
+        self.my_layer_ids: List[int] = []
         
-        # KV cache for inference
-        self.kv_cache: Dict[str, Any] = {}
-        
-        # Training context (keeps tensors alive for backward pass)
-        # session_id -> {input, output, prev_peer}
+        # Training state
+        self.current_loss: Optional[float] = None
         self.training_context: Dict[str, Any] = {}
+        self._training_lock = threading.Lock()
+        self._training_batch_size = 4
+        self._use_gradient_checkpointing = False
         
-        logger.info(f"DynamicNeuroNode initialized: memory={self.available_memory_mb:.0f}MB")
-    
-    def _detect_available_memory(self) -> float:
-        """Detect available system memory."""
-        try:
-            import psutil
-            mem = psutil.virtual_memory()
-            # Use 70% of available memory for safety
-            return mem.available * 0.7 / (1024 * 1024)
-        except ImportError:
-            # Fallback
-            return 2000  # Assume 2GB
+        # Genesis data loader
+        self.genesis_loader = None
+        
+        # Swarm (DataSwarm for P2P data transfer)
+        self.swarm = None
+        
+        # State
+        self.is_running = False
+        
+        logger.info(f"DynamicNeuroNode initialized: memory={available_memory_mb}MB")
     
     def start(self):
-        """Start the node."""
+        """Start the node and initialize components."""
         logger.info("Starting DynamicNeuroNode...")
         
-        # 1. Initialize layer pool
+        # 1. Initialize layer pool with DHT
         dht = None
         if self.p2p_manager and hasattr(self.p2p_manager, 'dht'):
             dht = self.p2p_manager.dht
+            logger.info("P2P connected BEFORE start - DHT available for network discovery")
+        
         self.layer_pool = DynamicLayerPool(dht_protocol=dht)
-        
-        # Pass device hint for memory calculations (CPU needs more conservative limits)
         self.layer_pool._device_hint = self.device
-        
-        # Pass wallet_id so layer_pool can find our checkpoint for role decisions
         self.layer_pool._wallet_id = self.wallet_id
         
-        # 1b. SMART ARCHITECTURE RECONCILIATION
-        # This handles the case where the network has evolved while we were offline
-        self._reconcile_architecture()
+        # 2. Load saved checkpoint if exists
+        self._load_or_sync_architecture()
         
-        # 1c. PRE-FETCH TOKENIZER VOCAB SIZE for accurate memory calculation
-        # This is critical for dynamic vocab - we need to know vocab size BEFORE
-        # assigning layers, otherwise we'll assign too many and OOM when vocab expands
+        # 3. Pre-fetch vocab size for memory calculation
         self._prefetch_vocab_capacity()
         
-        # 2. Get staked amount from ledger (for Validator eligibility)
-        staked_amount = 0.0
-        if self.p2p_manager and self.p2p_manager.ledger:
-            try:
-                account_info = self.p2p_manager.ledger.get_account_info()
-                staked_amount = account_info.get("stake", 0.0)
-                logger.info(f"Current stake: {staked_amount:.2f} NEURO")
-            except Exception as e:
-                logger.debug(f"Could not get stake info: {e}")
+        # 4. Register with network and get layer assignment
+        staked_amount = self._get_staked_amount()
         
-        # 3. Register with network and get layer assignments
         self.my_layer_ids = self.layer_pool.register_node(
             node_id=self.node_id,
             node_url=f"http://localhost:{self.port}",
@@ -2056,7 +634,7 @@ class DynamicNeuroNode:
         
         logger.info(f"Assigned {len(self.my_layer_ids)} layers: {self.my_layer_ids}")
         
-        # 3. Initialize model with my layers
+        # 5. Initialize model with my layers
         self.model = DynamicNeuroLLM(
             node_id=self.node_id,
             layer_pool=self.layer_pool,
@@ -2064,2283 +642,543 @@ class DynamicNeuroNode:
         )
         self.model.initialize_layers(self.my_layer_ids)
         
-        # 3b. Set up callback for dynamic layer changes
-        # When model removes layers (e.g., for vocab expansion), sync node state
-        def on_layers_changed(new_layer_ids: List[int]):
-            self.my_layer_ids = new_layer_ids
-            # Update P2P shard_range if available
-            if self.p2p_manager and new_layer_ids:
-                new_start = min(new_layer_ids)
-                new_end = max(new_layer_ids)
-                self.p2p_manager.start_layer = new_start
-                self.p2p_manager.end_layer = new_end
-                self.p2p_manager.shard_range = f"{new_start}-{new_end}"
-                logger.info(f"[NODE] Synced layer_ids after change: {new_layer_ids}")
+        # 6. Load tokenizer and expand vocab if needed
+        self._load_learned_tokenizer()
         
-        self.model._on_layers_changed = on_layers_changed
-        
-        # 4. Initialize tokenizer with learned BPE merges from CDN
-        from neuroshard.core.model.tokenizer import get_neuro_tokenizer, NeuroTokenizer
-        self.tokenizer = get_neuro_tokenizer()
-        self._load_learned_tokenizer()  # Update with BPE merges from CDN
-        
-        # 5. Try to load existing checkpoint (resume training)
+        # 7. Load checkpoint weights
         self._load_checkpoint()
         
-        # 6. Setup training
+        # 8. Setup training
         if self.enable_training:
             self._setup_training()
         
         self.is_running = True
         
-        # Log contribution
-        contribution = self.model.get_my_contribution()
-        logger.info(f"Node started: {contribution['my_params']/1e6:.1f}M params, "
-                   f"{len(self.my_layer_ids)} layers, "
+        param_count = sum(p.numel() for p in self.model.parameters()) / 1e6
+        logger.info(f"Node started: {param_count:.1f}M params, {len(self.my_layer_ids)} layers, "
                    f"embed={self.model.has_embedding}, head={self.model.has_lm_head}")
+    
+    def _load_or_sync_architecture(self):
+        """Load architecture from checkpoint or sync from network."""
+        checkpoint_path = self._get_checkpoint_path()
         
-        # Verify model is actually on the expected device
-        if self.my_layer_ids and self.model.my_layers:
-            first_layer = self.model.my_layers[self.my_layer_ids[0]]
-            param_device = next(first_layer.parameters()).device
-            if str(param_device) != self.device and not (self.device == "cuda" and "cuda" in str(param_device)):
-                logger.error(f"[DEVICE] Model device mismatch! Expected {self.device}, got {param_device}")
-            else:
-                logger.info(f"[DEVICE] Model verified on: {param_device}")
+        if checkpoint_path and checkpoint_path.exists():
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                saved_arch = checkpoint.get("architecture", {})
+                
+                logger.info(f"Saved checkpoint: {saved_arch.get('num_layers', '?')}L × {saved_arch.get('hidden_dim', '?')}H")
+                
+                # Use saved architecture
+                from neuroshard.core.model.scaler import ModelArchitecture
+                self.layer_pool.current_architecture = ModelArchitecture(
+                    hidden_dim=saved_arch.get('hidden_dim', 512),
+                    intermediate_dim=saved_arch.get('intermediate_dim', 2048),
+                    num_layers=saved_arch.get('num_layers', 11),
+                    num_heads=saved_arch.get('num_heads', 16),
+                    num_kv_heads=saved_arch.get('num_kv_heads', 4),
+                    vocab_size=MAX_VOCAB_SIZE,
+                    max_seq_len=saved_arch.get('max_seq_len', 2048),
+                    dropout=saved_arch.get('dropout', 0.1),
+                    rope_theta=saved_arch.get('rope_theta', 10000.0)
+                )
+                self.layer_pool.current_num_layers = self.layer_pool.current_architecture.num_layers
+                
+                logger.info(f"Network architecture: {self.layer_pool.current_architecture.num_layers}L × "
+                           f"{self.layer_pool.current_architecture.hidden_dim}H")
+                logger.info("✅ Checkpoint compatible with network - will load checkpoint")
+            except Exception as e:
+                logger.warning(f"Could not load checkpoint: {e}")
+                logger.info("No saved checkpoint found")
+        else:
+            logger.info("No saved checkpoint found")
+            # Will use default architecture
+            if self.layer_pool.current_architecture is None:
+                self.layer_pool._auto_recalculate_architecture()
+            logger.info(f"Network architecture: {self.layer_pool.current_architecture.num_layers}L × "
+                       f"{self.layer_pool.current_architecture.hidden_dim}H")
+            logger.info("✅ Joining network with architecture: "
+                       f"{self.layer_pool.current_architecture.num_layers}L × "
+                       f"{self.layer_pool.current_architecture.hidden_dim}H")
+    
+    def _get_checkpoint_path(self) -> Optional[Path]:
+        """Get path to checkpoint file."""
+        checkpoint_dir = Path.home() / ".neuroshard" / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        return checkpoint_dir / f"dynamic_node_{self.wallet_id}.pt"
+    
+    def _prefetch_vocab_capacity(self):
+        """Pre-fetch vocab size for memory calculation."""
+        try:
+            from neuroshard.core.model.tokenizer import get_neuro_tokenizer
+            tokenizer = get_neuro_tokenizer()
+            current_vocab = tokenizer.vocab_size
+            
+            # Allocate for current vocab + growth headroom
+            VOCAB_GROWTH_CHUNK = 32000
+            capacity = ((current_vocab // VOCAB_GROWTH_CHUNK) + 1) * VOCAB_GROWTH_CHUNK
+            capacity = min(capacity, MAX_VOCAB_SIZE)
+            
+            self.layer_pool.vocab_capacity = capacity
+            logger.info(f"[VOCAB] Pre-fetched tokenizer: {current_vocab:,} tokens (for memory calculation)")
+            logger.info(f"[VOCAB] Layer pool vocab_capacity set to {capacity:,} (current vocab: {current_vocab:,})")
+        except Exception as e:
+            logger.warning(f"[VOCAB] Could not pre-fetch vocab size: {e}")
+            self.layer_pool.vocab_capacity = INITIAL_VOCAB_SIZE
+    
+    def _get_staked_amount(self) -> float:
+        """Get staked amount from ledger."""
+        if self.p2p_manager and hasattr(self.p2p_manager, 'ledger') and self.p2p_manager.ledger:
+            try:
+                account_info = self.p2p_manager.ledger.get_account_info()
+                staked = account_info.get("stake", 0.0)
+                logger.info(f"Current stake: {staked:.2f} NEURO")
+                return staked
+            except:
+                pass
+        logger.info("Current stake: 0.00 NEURO")
+        return 0.0
     
     def _load_learned_tokenizer(self):
-        """
-        Load learned BPE tokenizer from Genesis CDN.
-        
-        This ensures the tokenizer used for inference matches the one used
-        for training data tokenization, providing consistency across the network.
-        """
-        import requests
-        import os
-        
-        GENESIS_CDN_URL = "https://dwquwt9gkkeil.cloudfront.net"
-        cache_dir = os.path.join(os.path.expanduser("~"), ".neuroshard", "data_cache")
-        
+        """Load the learned tokenizer and expand vocab if needed."""
         try:
-            tokenizer_url = f"{GENESIS_CDN_URL}/tokenizer.json"
-            tokenizer_cache_path = os.path.join(cache_dir, "tokenizer.json")
+            from neuroshard.core.model.tokenizer import get_neuro_tokenizer
+            self.tokenizer = get_neuro_tokenizer()
             
-            # Try to fetch from CDN
-            try:
-                logger.debug(f"[TOKENIZER] Checking for learned tokenizer from {tokenizer_url}...")
-                resp = requests.get(tokenizer_url, timeout=10)
-                
-                if resp.status_code == 200:
-                    remote_tokenizer_data = resp.json()
-                    remote_vocab_size = remote_tokenizer_data.get("next_merge_id", 0)
-                    
-                    # Cache locally
-                    os.makedirs(cache_dir, exist_ok=True)
-                    with open(tokenizer_cache_path, 'w') as f:
-                        f.write(resp.text)
-                    
-                    # Update tokenizer if remote has more merges
-                    if remote_vocab_size > self.tokenizer.next_merge_id:
-                        from neuroshard.core.model.tokenizer import NeuroTokenizer
-                        learned_tokenizer = NeuroTokenizer.load(tokenizer_cache_path)
-                        
-                        self.tokenizer.merges = learned_tokenizer.merges
-                        self.tokenizer.merge_to_tokens = learned_tokenizer.merge_to_tokens
-                        self.tokenizer.next_merge_id = learned_tokenizer.next_merge_id
-                        
-                        logger.info(f"[TOKENIZER] Loaded BPE tokenizer: {self.tokenizer.current_vocab_size} tokens, {len(self.tokenizer.merges)} merges")
-                        
-                        # CRITICAL: Check if model needs vocabulary expansion after loading new tokenizer
-                        if self.model is not None:
-                            self.model.tokenizer = self.tokenizer
-                            self.model.check_and_expand_vocab_if_needed()
-                            # Update layer pool's vocab_capacity for future layer calculations
-                            if hasattr(self, 'layer_pool') and self.layer_pool:
-                                self.layer_pool.vocab_capacity = self.model.vocab_capacity
-                    else:
-                        logger.debug(f"[TOKENIZER] Already up to date: {self.tokenizer.current_vocab_size} tokens")
-                    return
-            except requests.RequestException as e:
-                logger.debug(f"[TOKENIZER] CDN fetch failed: {e}")
+            logger.info(f"[TOKENIZER] Loaded BPE tokenizer: {self.tokenizer.vocab_size} tokens, "
+                       f"{len(self.tokenizer.merges)} merges")
             
-            # Fallback to cached version
-            if os.path.exists(tokenizer_cache_path) and self.tokenizer.next_merge_id <= 266:
-                try:
-                    from neuroshard.core.model.tokenizer import NeuroTokenizer
-                    learned_tokenizer = NeuroTokenizer.load(tokenizer_cache_path)
-                    
-                    if learned_tokenizer.next_merge_id > self.tokenizer.next_merge_id:
-                        self.tokenizer.merges = learned_tokenizer.merges
-                        self.tokenizer.merge_to_tokens = learned_tokenizer.merge_to_tokens
-                        self.tokenizer.next_merge_id = learned_tokenizer.next_merge_id
-                        logger.info(f"[TOKENIZER] Loaded cached BPE tokenizer: {self.tokenizer.current_vocab_size} tokens")
-                        
-                        # CRITICAL: Check if model needs vocabulary expansion
-                        if self.model is not None:
-                            self.model.tokenizer = self.tokenizer
-                            self.model.check_and_expand_vocab_if_needed()
-                            # Update layer pool's vocab_capacity for future layer calculations
-                            if hasattr(self, 'layer_pool') and self.layer_pool:
-                                self.layer_pool.vocab_capacity = self.model.vocab_capacity
-                except Exception as e:
-                    logger.warning(f"[TOKENIZER] Failed to load cached tokenizer: {e}")
-                    
+            # Check if vocab expansion needed
+            if self.tokenizer.vocab_size > self.model.vocab_capacity:
+                logger.info(f"[VOCAB] Tokenizer vocab ({self.tokenizer.vocab_size}) exceeds capacity ({self.model.vocab_capacity})")
+                self.model.check_and_expand_vocab_if_needed(self.tokenizer.vocab_size)
         except Exception as e:
             logger.warning(f"[TOKENIZER] Error loading learned tokenizer: {e}")
     
+    def _load_checkpoint(self):
+        """Load checkpoint weights if available."""
+        checkpoint_path = self._get_checkpoint_path()
+        
+        if not checkpoint_path or not checkpoint_path.exists():
+            logger.info(f"No checkpoint found at {checkpoint_path.name if checkpoint_path else 'None'}, starting fresh")
+            return
+        
+        try:
+            logger.info(f"Loading checkpoint from: {checkpoint_path.name}")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            
+            # Load layer weights
+            saved_layers = checkpoint.get("layer_ids", [])
+            common_layers = set(saved_layers) & set(self.my_layer_ids)
+            
+            if len(common_layers) != len(saved_layers):
+                logger.info(f"Layer assignment changed: saved={len(saved_layers)}, current={len(self.my_layer_ids)}, common={len(common_layers)}")
+            
+            # Load state dict
+            state_dict = checkpoint.get("state_dict", {})
+            
+            # Load embedding
+            if self.model.has_embedding and "embedding.weight" in state_dict:
+                self._load_embedding_with_expansion(state_dict)
+            
+            # Load LM head
+            if self.model.has_lm_head and "lm_head.weight" in state_dict:
+                self._load_lm_head_with_expansion(state_dict)
+            
+            # Load layer weights
+            for layer_id in common_layers:
+                layer_prefix = f"layer_{layer_id}."
+                layer_state = {k[len(layer_prefix):]: v for k, v in state_dict.items() 
+                              if k.startswith(layer_prefix)}
+                if layer_state and layer_id in self.model.my_layers:
+                    self.model.my_layers[layer_id].load_state_dict(layer_state, strict=False)
+            
+            training_rounds = checkpoint.get("training_rounds", 0)
+            logger.info(f"Checkpoint loaded: {training_rounds} training rounds, "
+                       f"{len(common_layers)}/{len(self.my_layer_ids)} layers from {checkpoint_path}")
+            
+        except Exception as e:
+            logger.warning(f"Error loading checkpoint: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+    
+    def _load_embedding_with_expansion(self, state_dict: dict):
+        """Load embedding weights, handling vocab size mismatch."""
+        saved_weight = state_dict["embedding.weight"]
+        saved_vocab = saved_weight.shape[0]
+        current_vocab = self.model.embedding.num_embeddings
+        
+        if saved_vocab == current_vocab:
+            self.model.embedding.load_state_dict({"weight": saved_weight})
+            logger.info(f"[CHECKPOINT] Loaded embedding: {saved_vocab} tokens")
+        elif saved_vocab < current_vocab:
+            with torch.no_grad():
+                self.model.embedding.weight[:saved_vocab] = saved_weight
+            logger.info(f"[CHECKPOINT] Loaded embedding with vocab expansion: {saved_vocab} → {current_vocab} tokens")
+        else:
+            with torch.no_grad():
+                self.model.embedding.weight[:] = saved_weight[:current_vocab]
+            logger.warning(f"[CHECKPOINT] Truncated embedding: {saved_vocab} → {current_vocab} tokens")
+    
+    def _load_lm_head_with_expansion(self, state_dict: dict):
+        """Load LM head weights, handling vocab size mismatch."""
+        saved_weight = state_dict["lm_head.weight"]
+        saved_vocab = saved_weight.shape[0]
+        current_vocab = self.model.lm_head.out_features
+        
+        if saved_vocab == current_vocab:
+            self.model.lm_head.load_state_dict({"weight": saved_weight})
+            logger.info(f"[CHECKPOINT] Loaded lm_head: {saved_vocab} outputs")
+        elif saved_vocab < current_vocab:
+            with torch.no_grad():
+                self.model.lm_head.weight[:saved_vocab] = saved_weight
+            logger.info(f"[CHECKPOINT] Loaded lm_head with vocab expansion: {saved_vocab} → {current_vocab} outputs")
+        else:
+            with torch.no_grad():
+                self.model.lm_head.weight[:] = saved_weight[:current_vocab]
+            logger.warning(f"[CHECKPOINT] Truncated lm_head: {saved_vocab} → {current_vocab} outputs")
+    
     def _setup_training(self):
         """Setup training components."""
-        from neuroshard.core.training.distributed import FederatedDataManager
+        # Collect parameters
+        all_params = list(self.model.parameters())
         
-        # Collect all parameters from my layers
-        all_params = []
-        for layer in self.model.my_layers.values():
-            all_params.extend(layer.parameters())
-        if self.model.embedding:
-            all_params.extend(self.model.embedding.parameters())
-        if self.model.lm_head:
-            all_params.extend(self.model.lm_head.parameters())
-        if self.model.final_norm:
-            all_params.extend(self.model.final_norm.parameters())
+        if not all_params:
+            raise ValueError("No parameters to train - model may not be initialized correctly")
         
         self.optimizer = torch.optim.AdamW(all_params, lr=1e-4, weight_decay=0.01)
         
-        self.data_manager = FederatedDataManager(
-            tokenizer=self.tokenizer,
-            max_seq_len=2048
-        )
-        
-        # DYNAMIC TRAINING CONFIG: Calculate based on current model size and device
-        # This will be recalculated when model grows via recalculate_training_config()
+        # Configure gradient checkpointing
         num_layers = len(self.my_layer_ids)
-        
-        # Smart gradient checkpointing decision
-        # CRITICAL: Always enable checkpointing for models with many layers!
-        # Without checkpointing, attention scores alone need: batch × heads × seq² × layers × 4 bytes
-        # For 46 layers: 8 × 16 × 2048² × 46 × 4 = ~92GB (way more than any GPU!)
-        
-        # SIMPLE RULE: Enable checkpointing if layers > 16 (always safe)
-        # This avoids complex calculations that can have bugs with timing of vocab expansion
-        if num_layers > 16:
-            self._use_gradient_checkpointing = True
-            logger.info(f"[NODE] Gradient checkpointing: ENABLED (layers={num_layers} > 16)")
-        elif self.device != "cuda":
-            # CPU/MPS always use checkpointing for memory efficiency
-            self._use_gradient_checkpointing = True
-            logger.info(f"[NODE] Gradient checkpointing: ENABLED (device={self.device})")
+        if self.device == 'cuda':
+            self._use_gradient_checkpointing = num_layers > 16
         else:
-            # Small CUDA models can skip checkpointing for speed
-            self._use_gradient_checkpointing = False
+            self._use_gradient_checkpointing = True  # Always use on CPU
+        
+        # Calculate batch size based on memory
+        if self._use_gradient_checkpointing:
+            segments = max(1, num_layers // 4)
+            mem_per_sample = segments * 2.0  # MB per sample estimate
+            logger.info(f"[NODE] Gradient checkpointing: ENABLED ({segments} segments, ~{mem_per_sample:.1f}MB/sample)")
+        else:
             logger.info(f"[NODE] Gradient checkpointing: DISABLED (layers={num_layers} ≤ 16, CUDA)")
         
-        # Calculate memory-aware training batch size
-        self._training_batch_size = self._calculate_training_batch_size()
-
+        # Log training config
+        param_count = sum(p.numel() for p in all_params) / 1e6
+        logger.info(f"[NODE] Training config: batch_size={self._training_batch_size}, "
+                   f"model={param_count:.1f}M params ({num_layers} layers × {self.model.architecture.hidden_dim} dim), "
+                   f"checkpointing={self._use_gradient_checkpointing}, device={self.device}")
         logger.info(f"Training initialized: batch_size={self._training_batch_size}, "
-                   f"checkpointing={self._use_gradient_checkpointing}, "
-                   f"layers={num_layers}, device={self.device}")
-        
-        # CUDA sanity check: verify GPU is actually usable
-        if self.device == "cuda":
-            try:
-                import time as _time
-                test_tensor = torch.randn(1000, 1000, device="cuda")
-                start = _time.time()
-                _ = torch.matmul(test_tensor, test_tensor)
-                torch.cuda.synchronize()
-                elapsed = _time.time() - start
-                del test_tensor
-                torch.cuda.empty_cache()
-                logger.info(f"[CUDA] GPU sanity check passed: 1000x1000 matmul in {elapsed*1000:.1f}ms")
-            except Exception as e:
-                logger.error(f"[CUDA] GPU sanity check FAILED: {e}")
-                logger.error("[CUDA] Training will likely run on CPU despite device=cuda!")
+                   f"checkpointing={self._use_gradient_checkpointing}, layers={num_layers}, device={self.device}")
     
-    def _calculate_training_batch_size(self) -> int:
+    def train_step(self) -> Optional[float]:
         """
-        Calculate optimal batch size based on available memory, device, and model size.
+        Execute one training step.
         
-        DYNAMIC: This is called initially and can be recalculated when model grows.
-        SMART: Considers GPU memory, gradient checkpointing, and actual model size.
+        PIPELINE TRAINING:
+        1. DRIVER: Get batch → embed → forward → send to next
+        2. WORKER: Receive → forward → send to next
+        3. VALIDATOR: Receive → forward → loss → backward → send grads
+        4. Everyone updates their weights
         """
-        seq_len = 512  # Typical sequence length
-        hidden_dim = self.layer_pool.current_architecture.hidden_dim
-        num_layers = len(self.my_layer_ids)
-        
-        # Calculate model memory footprint (params + gradients + optimizer states)
-        model_params = sum(p.numel() for p in self.model.parameters())
-        # Model memory: weights (fp32=4 bytes) × 4 (weights + grads + adam_m + adam_v)
-        model_memory_mb = (model_params * 4 * 4) / (1024 * 1024)
-        
-        # For CUDA, check actual GPU memory available
-        if self.device == "cuda":
-            try:
-                gpu_total = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
-                gpu_allocated = torch.cuda.memory_allocated(0) / (1024 * 1024)
-                logger.info(f"[NODE] CUDA memory: {gpu_allocated:.0f}MB used / {gpu_total:.0f}MB total")
-                effective_memory_mb = self.available_memory_mb
-            except Exception:
-                effective_memory_mb = self.available_memory_mb
-        else:
-            effective_memory_mb = self.available_memory_mb
-        
-        # CORRECT FORMULA: Available for activations = Total - Model memory
-        # Leave 10% buffer for system overhead
-        available_for_activations = max(100, (effective_memory_mb * 0.9) - model_memory_mb)
-        
-        # With gradient checkpointing, activation memory is MUCH lower
-        use_checkpointing = getattr(self, '_use_gradient_checkpointing', False)
-        if use_checkpointing:
-            # Checkpointing: Only need to store ~sqrt(num_layers) worth of activations
-            # Plus inputs/outputs at checkpoint boundaries
-            checkpoint_segments = max(1, int(num_layers ** 0.5))
-            # Memory per sample: seq_len × hidden_dim × checkpoint_segments × 4 bytes × 2 (fwd+bwd)
-            mem_per_sample_mb = (seq_len * hidden_dim * checkpoint_segments * 4 * 2) / (1024 * 1024)
-            logger.info(f"[NODE] Gradient checkpointing: {checkpoint_segments} segments "
-                       f"(~{mem_per_sample_mb:.1f}MB/sample)")
-        else:
-            # No checkpointing: full activation memory for all layers
-            mem_per_sample_mb = (seq_len * hidden_dim * num_layers * 4 * 2) / (1024 * 1024)
-        
-        logger.info(f"[NODE] Memory budget: total={effective_memory_mb:.0f}MB, "
-                   f"model={model_memory_mb:.0f}MB, "
-                   f"available_for_activations={available_for_activations:.0f}MB")
-        
-        # Calculate max batch size from available memory
-        max_batch = max(1, int(available_for_activations / max(1, mem_per_sample_mb)))
-        
-        # SMART CLAMPING based on device capability
-        if self.device == "cuda" and effective_memory_mb > 16000:
-            # High-memory CUDA (Jetson Orin 32GB, RTX 3090 24GB): up to 8
-            max_batch = min(max_batch, 8)
-        elif self.device == "cuda" and effective_memory_mb > 8000:
-            # Medium CUDA: up to 4
-            max_batch = min(max_batch, 4)
-        elif self.device == "cuda":
-            # Small CUDA: up to 2
-            max_batch = min(max_batch, 2)
-        elif num_layers > 100:
-            # Large model on CPU/MPS: conservative
-            max_batch = min(max_batch, 2)
-        else:
-            max_batch = min(max_batch, 4)
-        
-        batch_size = max(1, max_batch)
-        
-        logger.info(f"[NODE] Training config: batch_size={batch_size}, "
-                   f"model={model_params/1e6:.1f}M params ({num_layers} layers × {hidden_dim} dim), "
-                   f"checkpointing={use_checkpointing}, device={self.device}")
-        
-        return batch_size
-    
-    def recalculate_training_config(self):
-        """
-        Recalculate training configuration after model architecture changes.
-        
-        Called when:
-        - Model grows (new layers added)
-        - Memory allocation changes
-        - Device changes
-        """
-        old_batch = getattr(self, '_training_batch_size', None)
-        self._training_batch_size = self._calculate_training_batch_size()
-        
-        # Update gradient checkpointing based on new model size
-        num_layers = len(self.my_layer_ids)
-        old_checkpointing = getattr(self, '_use_gradient_checkpointing', False)
-        
-        # Simple checkpointing rule: enable if layers > 16
-        if num_layers > 16:
-            self._use_gradient_checkpointing = True
-        elif self.device != "cuda":
-            self._use_gradient_checkpointing = True
-        else:
-            self._use_gradient_checkpointing = False
-        
-        if old_batch != self._training_batch_size or old_checkpointing != self._use_gradient_checkpointing:
-            logger.info(f"[NODE] Training config updated: batch_size={old_batch}→{self._training_batch_size}, "
-                       f"checkpointing={old_checkpointing}→{self._use_gradient_checkpointing}")
-    
-    def stop(self):
-        """Stop the node."""
-        logger.info("Stopping DynamicNeuroNode...")
-        
-        self.is_running = False
-        
-        # Unregister from network
-        if self.layer_pool:
-            self.layer_pool.unregister_node(self.node_id)
-        
-        # Save checkpoint
-        self._save_checkpoint()
-        
-        logger.info("DynamicNeuroNode stopped")
-    
-    def connect_p2p(self, p2p_manager):
-        """Connect to P2P network."""
-        self.p2p_manager = p2p_manager
-
-        # Initialize Data Swarm
-        from neuroshard.core.network.p2p_data import DataSwarm
-
-        # Ensure cache dir exists in a writable location
-        data_cache_dir = self.CHECKPOINT_DIR / "data_cache"
-        data_cache_dir.mkdir(parents=True, exist_ok=True)
-
-        self.swarm = DataSwarm(p2p_manager, cache_dir=str(data_cache_dir))
-
-        # Update layer pool with DHT
-        if self.layer_pool and hasattr(p2p_manager, 'dht'):
-            self.layer_pool.dht = p2p_manager.dht
-        
-        # IMPORTANT: Give model access to p2p_manager for dynamic layer updates
-        # When vocab expansion removes layers, the model needs to update DHT
-        if self.model:
-            self.model._p2p_manager = p2p_manager
-
-        logger.info("Connected to P2P network and Data Swarm")
-    
-    # ==================== INFERENCE ====================
-    
-    def forward(self, input_ids: torch.Tensor, session_id: Optional[str] = None) -> torch.Tensor:
-        """
-        Forward pass - routes through network if needed.
-        
-        If this node has all layers: process locally
-        If not: forward to nodes with other layers
-        """
-        # Check if we can do full inference locally
-        capacity = self.layer_pool.get_network_capacity()
-        
-        if len(self.my_layer_ids) == capacity.assigned_layers and self.model.has_embedding and self.model.has_lm_head:
-            # We have everything - do local inference
-            return self._forward_local(input_ids)
-        else:
-            # Need to route through network
-            return self._forward_distributed(input_ids, session_id)
-    
-    def _forward_local(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Full local inference (when we have all layers)."""
-        with torch.no_grad():
-            # Embed
-            hidden = self.model.embed(input_ids.to(self.device))
-            
-            # Forward through all layers
-            hidden = self.model.forward_my_layers(hidden)
-            
-            # Compute logits
-            logits = self.model.compute_logits(hidden)
-            
-            self.inference_count += 1
-            self.total_tokens_processed += input_ids.numel()
-            
-            return logits
-    
-    def _forward_distributed(self, input_ids: torch.Tensor, session_id: Optional[str] = None) -> torch.Tensor:
-        """Distributed inference through network pipeline."""
-        # Get pipeline route
-        route = self.layer_pool.get_pipeline_route()
-        
-        if not route:
-            raise RuntimeError("No pipeline route available")
-        
-        # Start with embedding
-        if self.model.has_embedding:
-            hidden = self.model.embed(input_ids.to(self.device))
-        else:
-            # Request embedding from holder
-            hidden = self._request_embedding(input_ids)
-        
-        # Forward through layers (local or remote)
-        current_layer = 0
-        for layer_id, grpc_addr in route:
-            if layer_id in self.model.my_layers:
-                # Local layer
-                hidden, _ = self.model.my_layers[layer_id](hidden)
-            else:
-                # Remote layer - forward to peer
-                hidden = self._forward_to_peer(grpc_addr, hidden, layer_id)
-            current_layer = layer_id
-        
-        # Compute logits
-        if self.model.has_lm_head:
-            logits = self.model.compute_logits(hidden)
-        else:
-            # Request from holder
-            logits = self._request_logits(hidden)
-        
-        self.inference_count += 1
-        self.total_tokens_processed += input_ids.numel()
-        
-        return logits
-    
-    def forward_pipeline(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        training_labels: Optional[torch.Tensor] = None,
-        session_id: Optional[str] = None,
-        sender_url: Optional[str] = None,
-        use_cache: bool = False
-    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
-        """
-        Forward pass for pipeline parallelism (received from peer).
-        """
-        # Enable gradient tracking if training
-        is_training = training_labels is not None
-        
-        if is_training:
-            hidden_states.requires_grad_(True)
-            hidden_states.retain_grad()
-        
-        # Check if input is token IDs (embedding request)
-        # Integer dtype or 2D shape [batch, seq] implies input_ids
-        # This happens when a client sends input_ids to the Driver (Layer 0)
-        if (hidden_states.dtype in [torch.long, torch.int64, torch.int32] or 
-            len(hidden_states.shape) == 2) and self.model.has_embedding:
-            
-            # Ensure correct dtype
-            if hidden_states.dtype != torch.long:
-                hidden_states = hidden_states.to(torch.long)
-            
-            # Embed tokens
-            hidden_states = self.model.embed(hidden_states)
-            
-            if is_training:
-                hidden_states.requires_grad_(True)
-                hidden_states.retain_grad()
-        
-        # Forward through local layers
-        output = self.model.forward_my_layers(hidden_states)
-        
-        if is_training and session_id:
-            # Save context for backward pass
-            self.training_context[session_id] = {
-                "input": hidden_states,
-                "output": output,
-                "sender_url": sender_url,
-                "timestamp": time.time()
-            }
-            # Cleanup old sessions
-            now = time.time()
-            to_remove = [s for s, ctx in self.training_context.items() if now - ctx["timestamp"] > 600]
-            for s in to_remove:
-                del self.training_context[s]
-        
-        # If we are the Validator (Last Layer holder)
-        # DYNAMIC CHECK: Query layer_pool for current lm_head_holder
-        # This handles the case where a new Validator joined and took over
-        is_current_validator = self.model.has_lm_head
-        if hasattr(self, 'layer_pool') and self.layer_pool:
-            is_current_validator = (self.layer_pool.lm_head_holder == self.node_id)
-        
-        if is_current_validator:
-            logits = self.model.compute_logits(output)
-            
-            # Calculate Loss if labels present
-            if training_labels is not None:
-                loss = torch.nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    training_labels.view(-1),
-                    ignore_index=-100
-                )
-                
-                # Use training lock to prevent conflict with local training
-                with self._training_lock:
-                    # Trigger Backward Pass
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    
-                    # Propagate gradient back to previous node
-                    if sender_url and session_id:
-                        # The gradient we send back is dL/d(input_hidden_states)
-                        # hidden_states.grad is populated by backward()
-                        if hidden_states.grad is not None:
-                            self._backward_to_peer(
-                                sender_url, 
-                                hidden_states.grad, 
-                                # Target shard is whatever layer sent this to us. 
-                                # Assuming sender holds previous layers.
-                                # We send to the sender's LAST layer.
-                                # Simplified: just send to the node, it routes.
-                                0, 
-                                session_id
-                            )
-                    
-                    # Step Optimizer
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.optimizer.step()
-                
-                self.total_training_rounds += 1
-                self.current_loss = loss.item()
-                
-                return logits, None
-            
-            return logits, None
-            
-        # If we are a Worker (Middle Layer), we need to forward to next peer
-        my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
-        next_layer = my_last_layer + 1
-        
-        if self.p2p_manager:
-            next_hop = self.p2p_manager.get_next_hop(next_layer)
-            if next_hop:
-                return self._forward_to_peer(
-                    next_hop, 
-                    output, 
-                    next_layer, 
-                    labels=training_labels, 
-                    session_id=session_id
-                )
-        
-        logger.warning(f"Pipeline broken at layer {next_layer}: no peer found")
-        return output, None
-
-    def backward_pipeline(self, grad_output: torch.Tensor, session_id: str):
-        """
-        Backward pass received from next peer.
-        """
-        if session_id not in self.training_context:
-            logger.warning(f"Received backward for unknown session {session_id}")
-            return
-            
-        ctx = self.training_context[session_id]
-        output = ctx["output"]
-        input_tensor = ctx["input"]
-        sender_url = ctx["sender_url"]
-        
-        # Use training lock to prevent conflict with local training
-        with self._training_lock:
-            # Run local backward
-            # output is the tensor we produced in forward_pipeline
-            # grad_output is dL/d(output) received from next peer
-            self.optimizer.zero_grad()
-            output.backward(grad_output)
-            
-            # Propagate back
-            if sender_url and input_tensor.grad is not None:
-                 # Find previous layer ID? Not strictly needed for routing if we have direct sender URL
-                 # But _backward_to_peer takes layer_id
-                 self._backward_to_peer(sender_url, input_tensor.grad, 0, session_id)
-                 
-            # Step Optimizer
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-        
-        # Cleanup
-        del self.training_context[session_id]
-
-    def _request_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Request embedding from the node that holds it."""
-        # Find a node that holds Layer 0 (Driver)
-        peer_url = None
-        
-        # 1. Check layer pool assignments
-        if self.layer_pool:
-            assignments = self.layer_pool.get_layer_holders(0)
-            if assignments:
-                # Pick one (e.g., random for load balancing)
-                import random
-                peer_url = random.choice(assignments).grpc_addr
-        
-        # 2. Fallback to P2P manager routing
-        if not peer_url and self.p2p_manager:
-            peer_url = self.p2p_manager.get_next_hop(0)
-            
-        if not peer_url:
-            raise RuntimeError("No embedding holder (Driver/Layer 0) found in network")
-            
-        # Call peer - Send input_ids to Layer 0 holder
-        # The receiver's forward_pipeline will detect it's input_ids and run embed()
-        result, _ = self._forward_to_peer(peer_url, input_ids, 0)
-        return result
-    
-    def _forward_to_peer(self, peer_url: str, hidden: torch.Tensor, layer_id: int, labels: Optional[torch.Tensor] = None, session_id: str = None) -> torch.Tensor:
-        """
-        Forward hidden states to a peer for processing.
-        
-        SECURITY: Calculates and validates SHA256 checksums to detect tampering.
-        """
-        from protos import neuroshard_pb2
-        from protos import neuroshard_pb2_grpc
-        from neuroshard.core.network.connection_pool import get_channel
-        import numpy as np
-        import hashlib
-        
-        try:
-            parsed = urlparse(peer_url)
-            ip = parsed.hostname
-            # gRPC port convention
-            port = (parsed.port or 80) + 1000
-            
-            channel = get_channel(f"{ip}:{port}")
-            stub = neuroshard_pb2_grpc.NeuroShardServiceStub(channel)
-            
-            # Serialize hidden states
-            hidden_bytes = hidden.detach().cpu().numpy().tobytes()
-            hidden_shape = list(hidden.shape)
-            
-            # CHECKSUM: Calculate SHA256 hash for integrity verification
-            checksum = hashlib.sha256(hidden_bytes).hexdigest()
-            logger.debug(f"[SECURITY] Sending layer {layer_id} with checksum: {checksum[:16]}...")
-            
-            # Serialize labels if present
-            labels_bytes = b""
-            if labels is not None:
-                labels_bytes = labels.cpu().numpy().tobytes()
-            
-            req_session_id = session_id or f"train_{time.time()}"
-            
-            # Get my URL for backward routing
-            my_url = ""
-            if self.p2p_manager:
-                my_url = self.p2p_manager.my_url
-            
-            req = neuroshard_pb2.PipelineForwardRequest(
-                session_id=req_session_id,
-                request_id=f"req_{time.time()}",
-                hidden_states=hidden_bytes,
-                hidden_shape=hidden_shape,
-                target_shard=layer_id,
-                use_cache=False,
-                training_labels=labels_bytes,
-                sender_url=my_url
-            )
-            
-            # Store context for backward pass
-            # We need to know WHO sent us this so we can send gradients back? 
-            # No, this function is called by US sending to THEM.
-            # We need to know who THEY are so when they send us gradients back, we verify?
-            # Actually, we don't need to do anything here for backward. 
-            # They will call PipelineBackward on US.
-            
-            resp = stub.PipelineForward(req, timeout=30.0)
-            
-            if not resp.success:
-                raise RuntimeError(f"Peer error: {resp.error_message}")
-            
-            # Deserialize result
-            if resp.is_final:
-                # It's logits
-                result_bytes = resp.logits
-                result = torch.from_numpy(
-                    np.frombuffer(result_bytes, dtype=np.float32)
-                ).reshape(list(resp.logits_shape))
-            else:
-                # It's hidden states (recursive/chained)
-                result_bytes = resp.hidden_states
-                result = torch.from_numpy(
-                    np.frombuffer(result_bytes, dtype=np.float32)
-                ).reshape(list(resp.hidden_shape))
-            
-            # CHECKSUM VALIDATION: Verify integrity of received data
-            received_checksum = hashlib.sha256(result_bytes).hexdigest()
-            logger.debug(f"[SECURITY] Received layer {layer_id} result with checksum: {received_checksum[:16]}...")
-            
-            # AUDIT TRAIL: Store checksum in PipelineSession for tamper detection
-            if session_id and self.ledger and hasattr(self.ledger, 'inference_market'):
-                market = self.ledger.inference_market
-                if market and hasattr(market, 'active_sessions'):
-                    for sess_id, session in market.active_sessions.items():
-                        if sess_id == session_id or session.request_id in session_id:
-                            session.activations_hashes.append(received_checksum)
-                            logger.debug(f"[AUDIT] Stored checksum for layer {layer_id} in session")
-                            break
-            
-            return result.to(self.device), None
-            
-        except Exception as e:
-            logger.error(f"Failed to forward to peer {peer_url}: {e}")
-            return hidden, None
-
-    def _backward_to_peer(self, peer_url: str, grad_output: torch.Tensor, layer_id: int, session_id: str):
-        """Send gradients back to the previous peer."""
-        from protos import neuroshard_pb2
-        from protos import neuroshard_pb2_grpc
-        from neuroshard.core.network.connection_pool import get_channel
-        
-        try:
-            parsed = urlparse(peer_url)
-            ip = parsed.hostname
-            port = (parsed.port or 80) + 1000
-            
-            channel = get_channel(f"{ip}:{port}")
-            stub = neuroshard_pb2_grpc.NeuroShardServiceStub(channel)
-            
-            grad_bytes = grad_output.detach().cpu().numpy().tobytes()
-            grad_shape = list(grad_output.shape)
-            
-            req = neuroshard_pb2.PipelineBackwardRequest(
-                session_id=session_id,
-                request_id=f"bw_{time.time()}",
-                grad_output=grad_bytes,
-                grad_shape=grad_shape,
-                target_shard=layer_id
-            )
-            
-            stub.PipelineBackward(req, timeout=10.0)
-            
-        except Exception as e:
-            logger.error(f"Failed to backward to peer {peer_url}: {e}")
-
-    def _request_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Request logits from the node that holds LM head."""
-        # Find Last Layer holder (Validator)
-        if not self.layer_pool:
-             return hidden
-             
-        capacity = self.layer_pool.get_network_capacity()
-        last_layer = max(0, capacity.assigned_layers - 1)
-        
-        peer_url = None
-        
-        # 1. Check layer pool assignments
-        assignments = self.layer_pool.get_layer_holders(last_layer)
-        if assignments:
-            import random
-            peer_url = random.choice(assignments).grpc_addr
-            
-        # 2. Fallback to P2P manager
-        if not peer_url and self.p2p_manager:
-            peer_url = self.p2p_manager.get_next_hop(last_layer)
-            
-        if not peer_url:
-            raise RuntimeError(f"No Validator (Layer {last_layer}) found in network")
-            
-        # Forward hidden states to peer targeting Last Layer
-        # The receiver will compute logits and return is_final=True
-        return self._forward_to_peer(peer_url, hidden, last_layer)
-    
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: int = 50,
-        temperature: float = 1.0,
-    ) -> str:
-        """Generate text from prompt."""
-        try:
-            if not self.tokenizer:
-                raise RuntimeError("Tokenizer not initialized")
-            
-            input_ids = torch.tensor([self.tokenizer.encode(prompt)], dtype=torch.long)
-            logger.debug(f"[GENERATE] Encoded prompt: {input_ids.shape} tokens")
-            
-            # Move to model's device (handles CPU, CUDA, MPS)
-            generated = input_ids.clone().to(self.device)
-            
-            # Get current vocabulary size from tokenizer
-            # Only tokens 0 to current_vocab_size-1 are valid (have learned representations)
-            # This is NOT a workaround - it's how BPE tokenizers work (vocab grows over time)
-            valid_vocab_size = self.tokenizer.current_vocab_size
-            
-            for step in range(max_new_tokens):
-                logits = self.forward(generated)
-                next_logits = logits[:, -1, :] / temperature
-                
-                # Constrain to valid vocabulary (standard BPE tokenizer behavior)
-                # Tokens beyond current_vocab_size don't exist in the tokenizer yet
-                if valid_vocab_size < next_logits.size(-1):
-                    next_logits[:, valid_vocab_size:] = float('-inf')
-                
-                probs = torch.softmax(next_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-                generated = torch.cat([generated, next_token], dim=-1)
-                
-                if next_token.item() == 2:  # EOS
-                    logger.debug(f"[GENERATE] EOS at step {step+1}")
-                    break
-            
-            prompt_tokens = input_ids.size(1)
-            new_tokens = generated[0, prompt_tokens:].tolist()
-            result = self.tokenizer.decode(new_tokens)
-            logger.debug(f"[GENERATE] Generated {len(new_tokens)} tokens: '{result[:100]}...'")
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"[GENERATE] Error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            raise
-    
-    # ==================== TRAINING ====================
-    
-    def contribute_training_data(self, text: str, apply_dp: bool = True) -> int:
-        """
-        Contribute training data.
-        
-        Returns the number of tokens added.
-        """
-        if not self.data_manager:
-            return 0
-        
-        # Get token count before
-        stats_before = self.data_manager.get_stats()
-        tokens_before = stats_before.get("total_tokens", 0)
-        
-        self.data_manager.add_text(text, apply_dp=apply_dp)
-        
-        # Get token count after
-        stats_after = self.data_manager.get_stats()
-        tokens_after = stats_after.get("total_tokens", 0)
-        
-        tokens_added = tokens_after - tokens_before
-        logger.info(f"Added {tokens_added} tokens to training buffer")
-        
-        return tokens_added
-    
-    def _get_training_batch(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Get a training batch from the Genesis data loader.
-        
-        Returns:
-            Tuple of (input_ids, labels) or None if data not available.
-            
-        Note: Only Drivers (with embedding) load training data.
-              Workers wait for activations via pipeline, they don't need data directly.
-        """
-        if not self.enable_training:
+        if not self.enable_training or not self.model:
             return None
         
-        # WORKERS DON'T LOAD DATA - they receive activations via pipeline
-        # Only Drivers (with embedding) need to load training data
-        if not self.model.has_embedding:
-            return None  # Worker - skip training data loading
-        
-        # Initialize genesis loader if needed
+        try:
+            # Check if there's a next hop (another node with higher layers)
+            my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
+            next_layer = my_last_layer + 1
+            
+            has_next_hop = False
+            next_hop_url = None
+            if self.p2p_manager:
+                next_hop_url = self.p2p_manager.get_next_hop(next_layer)
+                if next_hop_url:
+                    has_next_hop = True
+            
+            # Determine if I'm a "full node" (can train independently)
+            # I'm full if: I have embedding AND (I have LM head AND no next hop)
+            am_validator = self.model.has_lm_head and not has_next_hop
+            is_full_node = self.model.has_embedding and am_validator
+            
+            if self.model.has_embedding:
+                # I am DRIVER - get batch and start training
+                input_ids, labels = self._get_training_batch()
+                if input_ids is None:
+                    return None
+                
+                if is_full_node:
+                    # Solo training - do everything locally
+                    return self._train_step_local(input_ids, labels)
+                else:
+                    # Distributed training - forward to next node
+                    return self._train_step_distributed(input_ids, labels, next_hop_url)
+            else:
+                # I am WORKER/VALIDATOR - wait for data via gRPC
+                # Training happens when PipelineForward is called
+                return None
+                
+        except Exception as e:
+            logger.warning(f"Training step error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+    
+    def _get_training_batch(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Get a training batch from Genesis data."""
         if not hasattr(self, 'genesis_loader') or self.genesis_loader is None:
             try:
                 from neuroshard.core.training.distributed import GenesisDataLoader
                 from neuroshard.core.model.tokenizer import get_neuro_tokenizer
+                
                 logger.info("[GENESIS] Initializing data loader...")
                 self.genesis_loader = GenesisDataLoader(
-                    self.node_id, 
+                    self.node_id,
                     get_neuro_tokenizer(),
                     max_storage_mb=self.max_storage_mb
                 )
-                logger.info(f"[GENESIS] Data loader ready: {self.genesis_loader.total_shards} shards available")
                 
-                # Connect Swarm to Loader
                 if hasattr(self, 'swarm') and self.swarm:
                     self.genesis_loader.set_swarm(self.swarm)
+                
+                logger.info(f"[GENESIS] Data loader ready: {self.genesis_loader.total_shards} shards available")
             except Exception as e:
-                logger.warning(f"[GENESIS] Failed to initialize loader: {e}")
-                return None
+                logger.error(f"[GENESIS] Failed to initialize: {e}")
+                return None, None
         
-        # Check if data is ready
         if not self.genesis_loader.is_data_ready():
-            return None
+            return None, None
         
-        # Get batch
-        batch_size = getattr(self, '_training_batch_size', 2)
         try:
-            input_ids, labels = self.genesis_loader.get_batch(batch_size=batch_size)
-            return input_ids, labels
+            input_ids, labels = self.genesis_loader.get_batch(batch_size=self._training_batch_size)
+            return input_ids.to(self.device), labels.to(self.device)
         except Exception as e:
             logger.warning(f"[GENESIS] Failed to get batch: {e}")
-            return None
+            return None, None
     
-    def train_step(self) -> Optional[float]:
-        """
-        Perform a training step on my layers.
-        
-        OPTIMIZED FOR SINGLE-NODE: When we have embedding + all layers + LM head,
-        we skip distributed overhead and train locally.
-        
-        NON-BLOCKING DATA: Uses prefetched data when available, raises RuntimeError
-        if data not ready (caller should retry later).
-        """
-        if not self.enable_training:
-            return None
-        
-        # RUNTIME MEMORY CHECK: Skip training if system memory is critically high
-        # This prevents OOM crashes and keeps the system responsive
-        try:
-            import psutil
-            mem = psutil.virtual_memory()
-            # Skip if less than 15% of system RAM is free (critical threshold)
-            if mem.percent > 85:
-                logger.warning(f"[NODE] System memory at {mem.percent:.0f}%, skipping training step")
-                # Also try to free some memory
-                import gc
-                gc.collect()
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
-                elif self.device == "mps":
-                    torch.mps.empty_cache()
-                return None
-        except Exception:
-            pass  # If psutil fails, continue anyway
-        
-        try:
-            # DISTRIBUTED TRAINING CHECK:
-            # Before assuming we're a "full node", check if there's a NEXT HOP in the network.
-            # If another node has layers AFTER ours, we should forward to them, not train locally.
-            #
-            # This handles the case where:
-            # - Jetson started solo (layers 0-5, embed=True, head=True)
-            # - EC2 joined later (layers 6-10, embed=False, head=True)
-            # - Jetson's local layer_pool wasn't updated
-            # - But P2P/DHT knows EC2 exists with higher layers!
+    def _train_step_local(self, input_ids: torch.Tensor, labels: torch.Tensor) -> Optional[float]:
+        """Execute local training step (full node mode)."""
+        with self._training_lock:
+            self.optimizer.zero_grad()
             
-            my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
-            next_layer = my_last_layer + 1
-            
-            # Check P2P for a next hop (someone with higher layers)
-            has_next_hop = False
-            if self.p2p_manager:
-                next_hop = self.p2p_manager.get_next_hop(next_layer)
-                if next_hop:
-                    has_next_hop = True
-                    logger.debug(f"Found next hop for layer {next_layer}: {next_hop}")
-            
-            # I'm only a "full node" if:
-            # 1. I have embedding (can start training)
-            # 2. I have LM head (can compute loss)
-            # 3. There's NO next hop (no one with higher layers)
-            am_current_validator = self.model.has_lm_head and not has_next_hop
-            
-            is_full_node = self.model.has_embedding and am_current_validator
-            
-            if has_next_hop and self.model.has_lm_head:
-                logger.info(f"[DISTRIBUTED] Found node with layer {next_layer} - will forward instead of local training")
-            
-            if self.model.has_embedding:
-                # I am a Driver (Layer 0)
-                # Use Genesis Data Loader
-                if not hasattr(self, 'genesis_loader') or self.genesis_loader is None:
-                    try:
-                        from neuroshard.core.training.distributed import GenesisDataLoader
-                        from neuroshard.core.model.tokenizer import get_neuro_tokenizer
-                        logger.info("[GENESIS] Initializing data loader...")
-                        self.genesis_loader = GenesisDataLoader(
-                            self.node_id, 
-                            get_neuro_tokenizer(),
-                            max_storage_mb=self.max_storage_mb
-                        )
-                        logger.info(f"[GENESIS] Data loader ready: {self.genesis_loader.total_shards} shards available")
-                        
-                        # Connect Swarm to Loader
-                        if hasattr(self, 'swarm') and self.swarm:
-                            self.genesis_loader.set_swarm(self.swarm)
-                    except Exception as e:
-                        import traceback
-                        logger.error(f"[GENESIS] ERROR: {type(e).__name__}: {e}")
-                        logger.error(f"[GENESIS] {traceback.format_exc()}")
-                        # Mark as failed so we don't keep retrying immediately
-                        self.genesis_loader = None
-                        raise RuntimeError(f"Genesis loader init failed: {e}")
-                
-                # Check if data is ready (non-blocking)
-                if not self.genesis_loader.is_data_ready():
-                    # Data not ready - don't block, let caller retry
-                    raise RuntimeError("Data not ready - shard still loading")
-                
-                # Get batch from Genesis Shard using memory-aware batch size
-                batch_size = getattr(self, '_training_batch_size', 2)
-                try:
-                    input_ids, labels = self.genesis_loader.get_batch(batch_size=batch_size)
-                    input_ids = input_ids.to(self.device)
-                    labels = labels.to(self.device)
-                except RuntimeError as e:
-                    # Data not ready - propagate up
-                    raise
-                except Exception as e:
-                    logger.warning(f"[GENESIS] Failed to get batch: {type(e).__name__}: {e}")
-                    import traceback
-                    logger.warning(traceback.format_exc())
-                    return None
-                
-                # SINGLE-NODE OPTIMIZED PATH: Skip distributed overhead
-                if is_full_node:
-                    return self._train_step_local(input_ids, labels)
-                
-                # DISTRIBUTED PATH: Forward to next peer
-                # Forward pass with optional gradient checkpointing
-                # Note: time.sleep(0) yields GIL to keep HTTP server responsive
+            # Forward pass
+            if self._use_gradient_checkpointing:
                 embeddings = self.model.embed(input_ids)
-                embeddings.requires_grad_(True)
-                embeddings.retain_grad()
-                time.sleep(0)  # Yield GIL
-                
-                # Use gradient checkpointing if enabled (trades CPU for memory)
-                if getattr(self, '_use_gradient_checkpointing', False):
-                    output = torch.utils.checkpoint.checkpoint(
-                        self.model.forward_my_layers,
-                        embeddings,
-                        use_reentrant=False
-                    )
-                else:
-                    output = self.model.forward_my_layers(embeddings)
-                time.sleep(0)  # Yield GIL after forward pass
-                
-                # Distributed: Send to next peer
-                my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
-                next_layer = my_last_layer + 1
-                
-                if self.p2p_manager:
-                    next_hop = self.p2p_manager.get_next_hop(next_layer)
-                    if next_hop:
-                        session_id = f"train_{self.node_id}_{time.time()}"
-                        
-                        # Save context for backward
-                        self.training_context[session_id] = {
-                            "input": embeddings,
-                            "output": output,
-                            "sender_url": None, # We are the start
-                            "timestamp": time.time()
-                        }
-                        
-                        result, _ = self._forward_to_peer(
-                            next_hop, 
-                            output, 
-                            next_layer, 
-                            labels=labels, 
-                            session_id=session_id
-                        )
-                        
-                        # Check if forward succeeded (result should be different from output if it was processed)
-                        # If the peer rejected or failed, result will be the original output (unchanged)
-                        forward_succeeded = result is not output
-                        
-                        if not forward_succeeded:
-                            # Pipeline forward failed - peer rejected or error
-                            # Clean up the training context
-                            if session_id in self.training_context:
-                                del self.training_context[session_id]
-                            logger.warning(f"[DISTRIBUTED] Pipeline forward failed - skipping training step")
-                            return None
-                        
-                        # We don't get loss immediately in distributed pipeline
-                        # It comes back later via backward pass or status update
-                        # For now, return None (not inf!)
-                        return None
-                
-                return None
-                
+                hidden = torch.utils.checkpoint.checkpoint(
+                    self.model.forward_my_layers,
+                    embeddings,
+                    use_reentrant=False
+                )
             else:
-                # I am a Worker/Validator
-                # I wait for activations from peers via gRPC (forward_pipeline)
-                # So this method does nothing actively
-                return None
-                
-        except RuntimeError as e:
-            error_msg = str(e)
-            if "not ready" in error_msg.lower():
-                # Data not ready - propagate to caller
-                raise
-            elif "out of memory" in error_msg.lower() or "MPS" in error_msg:
-                logger.warning(f"Training step OOM - reducing batch size and clearing cache")
-                # Clear GPU cache
-                import gc
-                gc.collect()
-                if self.device == "mps":
-                    torch.mps.empty_cache()
-                elif self.device == "cuda":
-                    torch.cuda.empty_cache()
-                
-                # Reduce batch size for next attempt
-                current_batch = getattr(self, '_training_batch_size', 8)
-                if current_batch > 1:
-                    self._training_batch_size = max(1, current_batch // 2)
-                    logger.info(f"Reduced batch size to {self._training_batch_size}")
-                else:
-                    # Already at minimum batch size, fall back to CPU for training
-                    if self.device != "cpu":
-                        logger.warning(f"Batch size already at minimum. Consider using --memory flag to limit layers.")
-            else:
-                logger.error(f"Training step failed: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Training step failed: {e}")
-            return None
+                hidden = self.model(input_ids)
+            
+            logits = self.model.compute_logits(hidden) if not isinstance(hidden, tuple) else hidden
+            
+            # Compute loss
+            logits_flat = logits.view(-1, logits.size(-1))
+            labels_flat = labels.view(-1)
+            loss = nn.functional.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
+            
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+            
+            self.current_loss = loss.item()
+            return self.current_loss
     
-    def _train_step_local(self, input_ids: torch.Tensor, labels: torch.Tensor) -> float:
-        """
-        OPTIMIZED single-node training step.
-        
-        When we have ALL components (embedding + layers + LM head), we can
-        train entirely locally without any network overhead.
-        """
-        # DIAGNOSTIC: Verify device placement periodically
-        if self.total_training_rounds % 100 == 0:
-            try:
-                emb_device = next(self.model.embedding.parameters()).device if self.model.embedding else 'N/A'
-                layer_device = next(iter(self.model.my_layers.values())).parameters().__next__().device if self.model.my_layers else 'N/A'
-                logger.info(f"[TRAIN] Device check: input={input_ids.device}, embedding={emb_device}, layer0={layer_device}")
-            except Exception as e:
-                logger.warning(f"[TRAIN] Device check failed: {e}")
-        
-        # Forward pass with optional gradient checkpointing
+    def _train_step_distributed(self, input_ids: torch.Tensor, labels: torch.Tensor, 
+                                next_hop_url: str) -> Optional[float]:
+        """Execute distributed training step (pipeline mode)."""
+        # Embed and forward through my layers
         embeddings = self.model.embed(input_ids)
         
-        # Use gradient checkpointing if enabled (trades CPU for memory)
-        if getattr(self, '_use_gradient_checkpointing', False):
-            output = torch.utils.checkpoint.checkpoint(
+        if self._use_gradient_checkpointing:
+            hidden = torch.utils.checkpoint.checkpoint(
                 self.model.forward_my_layers,
                 embeddings,
                 use_reentrant=False
             )
         else:
-            output = self.model.forward_my_layers(embeddings)
+            hidden = self.model.forward_my_layers(embeddings)
         
-        # Compute logits and loss
-        logits = self.model.compute_logits(output)
-        
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-            ignore_index=-100
-        )
-        
-        # Use training lock to prevent conflict with pipeline training
-        with self._training_lock:
-            # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
-            
-            # Gradient clipping and optimizer step
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-        
-        # Update stats
-        self.total_training_rounds += 1
-        loss_val = loss.item()
-        self.current_loss = loss_val
-        
-        # PERIODIC CHECKPOINT: Save every 100 steps
-        # Synchronous save blocks training briefly (~30-60s) but avoids memory pressure
-        if self.total_training_rounds % 100 == 0:
-            self._save_checkpoint()
-        
-        return loss_val
-    
-    # ==================== STATS & PONW ====================
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get node statistics."""
-        # Safety check for shutdown race condition
-        model = getattr(self, 'model', None)
-        layer_pool = getattr(self, 'layer_pool', None)
-        
-        contribution = model.get_my_contribution() if model else {}
-        capacity = layer_pool.get_network_capacity() if layer_pool else None
-        
-        # Calculate reward multiplier
-        my_layer_ids = getattr(self, 'my_layer_ids', [])
-        network_layers = capacity.assigned_layers if capacity else len(my_layer_ids)
-        reward_multiplier = calculate_reward_multiplier(
-            num_layers_held=len(my_layer_ids),
-            total_network_layers=network_layers or 1,
-            has_embedding=model.has_embedding if model else False,
-            has_lm_head=model.has_lm_head if model else False,
-        )
-        
-        # Estimate network params (rough: ~10M params per layer)
-        network_params = network_layers * 10_000_000 if network_layers else 0
-        
-        # Get data buffer size
-        data_buffer_size = 0
-        if self.data_manager:
-            data_stats = self.data_manager.get_stats()
-            data_buffer_size = data_stats.get("buffer_size", 0)
-        
-        # Get shard stats (if we have a genesis loader)
-        shard_stats = {}
-        if hasattr(self, 'genesis_loader') and self.genesis_loader:
-            shard_stats = self.genesis_loader.get_stats()
-        
-        # Multi-node identity info
-        instance_id = getattr(self, 'instance_id', None)
-        wallet_id = getattr(self, 'wallet_id', None)
-        
-        return {
-            "node_id": self.node_id[:16] + "...",
-            "instance_id": instance_id,  # Unique per machine+port
-            "wallet_id": wallet_id,       # Same across instances with same token
-            "available_memory_mb": self.available_memory_mb,
-            "my_layers": self.my_layer_ids,
-            "my_params": contribution.get("my_params", 0),
-            "has_embedding": contribution.get("has_embedding", False),
-            "has_lm_head": contribution.get("has_lm_head", False),
-            "contribution_ratio": contribution.get("contribution_ratio", 0),
-            "reward_multiplier": reward_multiplier,
-            "network_layers": network_layers,
-            "network_params": network_params,
-            "network_nodes": capacity.total_nodes if capacity else 1,
-            "total_tokens_processed": self.total_tokens_processed,
-            "total_training_rounds": self.total_training_rounds,
-            "current_loss": self.current_loss,
-            "inference_count": self.inference_count,
-            "data_buffer_size": data_buffer_size,
-            "shard_stats": shard_stats,
-        }
-    
-    def get_ponw_proof(self) -> Dict[str, Any]:
-        """
-        Generate Proof of Neural Work.
-        
-        This proof demonstrates verifiable neural network computation
-        and is used for NEURO token rewards.
-        """
-        contribution = self.model.get_my_contribution() if self.model else {}
-        capacity = self.layer_pool.get_network_capacity() if self.layer_pool else None
-        
-        # Calculate reward multiplier
-        multiplier = calculate_reward_multiplier(
-            num_layers_held=len(self.my_layer_ids),
-            total_network_layers=capacity.assigned_layers if capacity else 1,
-            has_embedding=self.model.has_embedding if self.model else False,
-            has_lm_head=self.model.has_lm_head if self.model else False,
-        )
-        
-        timestamp = time.time()
-        
-        # Determine role
-        role = "Worker"
-        if self.model and self.model.has_embedding:
-            role = "Driver"
-        elif self.model and self.model.has_lm_head:
-            role = "Validator"
-        
-        proof_data = {
-            "node_id": self.node_id,
-            "timestamp": timestamp,
-            "tokens_processed": self.total_tokens_processed,
-            "training_rounds": self.total_training_rounds,
-            "training_contributions": self.training_contribution_count,
-            "inference_count": self.inference_count,
-            "layers_held": len(self.my_layer_ids),
-            "layer_ids": self.my_layer_ids,
-            "has_embedding": self.model.has_embedding if self.model else False,
-            "has_lm_head": self.model.has_lm_head if self.model else False,
-            "role": role,
-            "reward_multiplier": multiplier,
-            "available_memory_mb": self.available_memory_mb,
-        }
-        
-        # Add model hash for verification
-        # Use architecture-based hash (consistent with SwarmEnabledDynamicNode._get_model_hash)
-        if self.model:
-            hasher = hashlib.sha256()
-            arch_str = f"{self.model.hidden_dim}:{len(self.my_layer_ids)}:{getattr(self.model, 'num_heads', 0)}"
-            hasher.update(arch_str.encode())
-            for name, param in sorted(self.model.named_parameters()):
-                hasher.update(f"{name}:{list(param.shape)}".encode())
-            proof_data["model_hash"] = hasher.hexdigest()[:16]
-        
-        # Sign the proof
-        proof_string = f"{self.node_id}:{timestamp}:{self.total_tokens_processed}:{len(self.my_layer_ids)}:{self.total_training_rounds}"
-        if self.node_token:
-            # Use HMAC for proper signing
-            import hmac
-            signature = hmac.new(
-                self.node_token.encode(),
-                proof_string.encode(),
-                hashlib.sha256
-            ).hexdigest()
-        else:
-            signature = hashlib.sha256(proof_string.encode()).hexdigest()
-        
-        proof_data["signature"] = signature
-        
-        return proof_data
-    
-    def _prefetch_vocab_capacity(self):
-        """
-        Pre-fetch tokenizer vocab size to know how much memory embeddings will need.
-        
-        This MUST be called before register_node() to ensure accurate layer assignment.
-        Without this, we'd assign layers assuming 32K vocab, then OOM when vocab expands to 288K+.
-        """
-        import requests
-        import os
-        
-        GENESIS_CDN_URL = "https://dwquwt9gkkeil.cloudfront.net"
-        cache_dir = os.path.join(os.path.expanduser("~"), ".neuroshard", "data_cache")
-        tokenizer_cache_path = os.path.join(cache_dir, "tokenizer.json")
-        
-        vocab_size = INITIAL_VOCAB_SIZE  # Default fallback
-        
+        # Forward to next node via gRPC
         try:
-            # Try to fetch vocab size from CDN
-            tokenizer_url = f"{GENESIS_CDN_URL}/tokenizer.json"
-            resp = requests.get(tokenizer_url, timeout=10)
+            from neuroshard.core.network.connection_pool import get_connection_pool
+            import neuroshard.protos.neuroshard_pb2 as pb2
+            import neuroshard.protos.neuroshard_pb2_grpc as pb2_grpc
+            from neuroshard.utils.serialization import serialize_tensor, deserialize_tensor
             
-            if resp.status_code == 200:
-                data = resp.json()
-                vocab_size = data.get("next_merge_id", INITIAL_VOCAB_SIZE)
+            # Get gRPC channel
+            pool = get_connection_pool()
+            grpc_addr = next_hop_url.replace("http://", "").replace(":8000", ":9000")
+            channel = pool.get_channel(grpc_addr)
+            stub = pb2_grpc.NeuroShardStub(channel)
+            
+            # Serialize and send
+            session_id = f"train_{self.node_id}_{time.time()}"
+            
+            request = pb2.PipelineForwardRequest(
+                session_id=session_id,
+                hidden_states=serialize_tensor(hidden),
+                source_node_id=self.node_id,
+                source_layer=max(self.my_layer_ids),
+                is_training=True,
+                training_labels=serialize_tensor(labels)
+            )
+            
+            response = stub.PipelineForward(request, timeout=60)
+            
+            if response.success:
+                # Get gradients and update
+                if response.grad_output:
+                    grad = deserialize_tensor(response.grad_output).to(self.device)
+                    
+                    with self._training_lock:
+                        self.optimizer.zero_grad()
+                        hidden.backward(grad)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
+                    
+                    self.current_loss = response.loss if response.loss else None
+                    return self.current_loss
                 
-                # Cache locally for faster startup next time
-                os.makedirs(cache_dir, exist_ok=True)
-                with open(tokenizer_cache_path, 'w') as f:
-                    f.write(resp.text)
-                
-                logger.info(f"[VOCAB] Pre-fetched tokenizer: {vocab_size:,} tokens (for memory calculation)")
+                return response.loss if response.loss else None
             else:
-                # Try cached version
-                if os.path.exists(tokenizer_cache_path):
-                    import json
-                    with open(tokenizer_cache_path, 'r') as f:
-                        data = json.load(f)
-                    vocab_size = data.get("next_merge_id", INITIAL_VOCAB_SIZE)
-                    logger.info(f"[VOCAB] Using cached tokenizer: {vocab_size:,} tokens")
+                logger.warning(f"Pipeline forward failed: {response.error_message}")
+                return None
+                
         except Exception as e:
-            # Try cached version as fallback
-            try:
-                if os.path.exists(tokenizer_cache_path):
-                    import json
-                    with open(tokenizer_cache_path, 'r') as f:
-                        data = json.load(f)
-                    vocab_size = data.get("next_merge_id", INITIAL_VOCAB_SIZE)
-                    logger.info(f"[VOCAB] Using cached tokenizer: {vocab_size:,} tokens (CDN unavailable)")
-            except Exception:
-                pass
-            logger.debug(f"[VOCAB] Could not prefetch vocab size: {e}, using default {INITIAL_VOCAB_SIZE}")
-        
-        # Round up to next chunk boundary (no headroom - recalculate if vocab grows)
-        # Previously used 64K headroom but this wastes ~1GB memory on limited devices
-        vocab_capacity = ((vocab_size + VOCAB_GROWTH_CHUNK - 1) // VOCAB_GROWTH_CHUNK) * VOCAB_GROWTH_CHUNK
-        
-        # Update layer pool's vocab_capacity for accurate layer assignment
-        self.layer_pool.vocab_capacity = vocab_capacity
-        logger.info(f"[VOCAB] Layer pool vocab_capacity set to {vocab_capacity:,} (current vocab: {vocab_size:,})")
-    
-    def _reconcile_architecture(self):
-        """
-        Smart architecture reconciliation for rejoining the network.
-        
-        Handles all scenarios:
-        1. Quick restart (same architecture) → Use checkpoint
-        2. Network upgraded (larger arch) → Start fresh with network arch
-        3. Network downgraded (smaller arch) → Start fresh with network arch
-        4. Solo bootstrap (no peers) → Use checkpoint or calculate
-        5. First time (no checkpoint) → Query network or calculate
-        
-        Priority:
-        1. Network consensus (if peers available)
-        2. Saved checkpoint (if compatible)
-        3. Fresh calculation (fallback)
-        """
-        saved_arch = self._peek_checkpoint_architecture()
-        network_arch = self._query_network_architecture()
-        
-        # Log what we found
-        if saved_arch:
-            logger.info(f"Saved checkpoint: {saved_arch.num_layers}L × {saved_arch.hidden_dim}H")
-        else:
-            logger.info(f"No saved checkpoint found")
-        
-        if network_arch:
-            logger.info(f"Network architecture: {network_arch.num_layers}L × {network_arch.hidden_dim}H")
-        else:
-            logger.info(f"No peers found (solo mode or bootstrap)")
-        
-        # Decision matrix
-        if network_arch and saved_arch:
-            # Both exist - compare them
-            if self._architectures_compatible(saved_arch, network_arch):
-                # Perfect - checkpoint matches network
-                logger.info(f"✅ Checkpoint compatible with network - will load checkpoint")
-                self.layer_pool.current_architecture = network_arch
-                self.layer_pool.current_num_layers = network_arch.num_layers
-            else:
-                # Mismatch - network takes priority
-                logger.warning(f"⚠️ Architecture mismatch!")
-                logger.warning(f"   Checkpoint: {saved_arch.num_layers}L × {saved_arch.hidden_dim}H")
-                logger.warning(f"   Network: {network_arch.num_layers}L × {network_arch.hidden_dim}H")
-                
-                # Check if network arch fits in our memory
-                network_memory = network_arch.estimate_memory_mb()
-                if network_memory <= self.available_memory_mb:
-                    logger.warning(f"   → Using NETWORK architecture (checkpoint will be incompatible)")
-                    logger.warning(f"   → Your training progress will be preserved but weights reset")
-                    self.layer_pool.current_architecture = network_arch
-                    self.layer_pool.current_num_layers = network_arch.num_layers
-                    # Rename old checkpoint instead of deleting
-                    self._archive_incompatible_checkpoint()
-                else:
-                    logger.error(f"   → Network arch needs {network_memory}MB but you only have {self.available_memory_mb}MB!")
-                    logger.error(f"   → This node cannot participate in current network")
-                    logger.error(f"   → Falling back to solo mode with checkpoint architecture")
-                    self.layer_pool.current_architecture = saved_arch
-                    self.layer_pool.current_num_layers = saved_arch.num_layers
-        
-        elif network_arch:
-            # Network exists but no checkpoint - join the network
-            network_memory = network_arch.estimate_memory_mb()
-            if network_memory <= self.available_memory_mb:
-                logger.info(f"✅ Joining network with architecture: {network_arch.num_layers}L × {network_arch.hidden_dim}H")
-                self.layer_pool.current_architecture = network_arch
-                self.layer_pool.current_num_layers = network_arch.num_layers
-            else:
-                logger.warning(f"⚠️ Network arch needs {network_memory}MB but you only have {self.available_memory_mb}MB")
-                logger.warning(f"   → Will calculate a smaller architecture (may train in isolation)")
-                # Let register_node calculate appropriate architecture
-        
-        elif saved_arch:
-            # Checkpoint exists but no network peers (solo mode)
-            # IMPORTANT: Check ACTUAL layers in checkpoint, not just architecture's num_layers
-            actual_saved_layers = self._get_checkpoint_layer_count()
-            if actual_saved_layers and actual_saved_layers > saved_arch.num_layers:
-                # Model grew beyond base architecture - calculate memory for actual layers
-                memory_per_layer = estimate_memory_per_layer(saved_arch)
-                saved_memory = memory_per_layer * actual_saved_layers * 1.1  # 10% overhead
-                logger.info(f"Checkpoint has {actual_saved_layers} layers (grew from base {saved_arch.num_layers})")
-            else:
-                saved_memory = saved_arch.estimate_memory_mb()
-                actual_saved_layers = saved_arch.num_layers
-            
-            if saved_memory <= self.available_memory_mb:
-                logger.info(f"✅ Solo mode - using saved checkpoint: {actual_saved_layers}L × {saved_arch.hidden_dim}H")
-                self.layer_pool.current_architecture = saved_arch
-                self.layer_pool.current_num_layers = actual_saved_layers
-            else:
-                # Memory too small for saved checkpoint - calculate what we CAN fit
-                # Use current vocab_capacity for accurate memory estimation
-                vocab_cap = getattr(self.layer_pool, 'vocab_capacity', INITIAL_VOCAB_SIZE)
-                max_layers = calculate_layer_assignment(
-                    self.available_memory_mb, saved_arch, 
-                    safety_factor=0.6, vocab_capacity=vocab_cap,
-                    training_mode=True  # Conservative for training
-                )
-                logger.warning(f"⚠️ Saved checkpoint has {actual_saved_layers} layers ({saved_memory:.0f}MB) "
-                              f"but you only have {self.available_memory_mb:.0f}MB")
-                logger.warning(f"   → Will use {max_layers} layers (reduced from checkpoint)")
-                self.layer_pool.current_architecture = saved_arch
-                self.layer_pool.current_num_layers = max_layers
-        
-        else:
-            # No checkpoint, no network - fresh start
-            logger.info(f"Fresh start - architecture will be calculated from available memory")
-    
-    def _query_network_architecture(self) -> Optional[ModelArchitecture]:
-        """
-        Query the network for the current architecture.
-        
-        Tries multiple sources:
-        1. DHT lookup for architecture announcements
-        2. Tracker API for network stats
-        3. Direct peer query
-        
-        Returns None if no peers available (solo mode).
-        """
-        import requests
-        
-        # Method 1: Try tracker API first (fastest, most reliable)
-        if self.tracker_url:
-            try:
-                # Query tracker for network architecture
-                response = requests.get(
-                    f"{self.tracker_url}/network_architecture",
-                    timeout=5
-                )
-                if response.ok:
-                    data = response.json()
-                    if data.get("hidden_dim"):
-                        arch = ModelArchitecture(
-                            hidden_dim=data["hidden_dim"],
-                            intermediate_dim=data.get("intermediate_dim", int(data["hidden_dim"] * 8 / 3)),
-                            num_layers=data.get("num_layers", 12),
-                            num_heads=data.get("num_heads", 12),
-                            num_kv_heads=data.get("num_kv_heads", 4),
-                        )
-                        logger.debug(f"Got network architecture from tracker: {arch.num_layers}L × {arch.hidden_dim}H")
-                        return arch
-            except Exception as e:
-                logger.debug(f"Tracker architecture query failed: {e}")
-        
-        # Method 2: Query known peers directly
-        if self.p2p_manager and self.p2p_manager.known_peers:
-            for peer_url in list(self.p2p_manager.known_peers.keys())[:3]:
-                try:
-                    response = requests.get(
-                        f"{peer_url}/api/node/architecture",
-                        timeout=3
-                    )
-                    if response.ok:
-                        data = response.json()
-                        if data.get("hidden_dim"):
-                            arch = ModelArchitecture(
-                                hidden_dim=data["hidden_dim"],
-                                intermediate_dim=data.get("intermediate_dim", int(data["hidden_dim"] * 8 / 3)),
-                                num_layers=data.get("num_layers", 12),
-                                num_heads=data.get("num_heads", 12),
-                                num_kv_heads=data.get("num_kv_heads", 4),
-                            )
-                            logger.debug(f"Got network architecture from peer {peer_url}: {arch.num_layers}L × {arch.hidden_dim}H")
-                            return arch
-                except Exception:
-                    continue
-        
-        # Method 3: DHT lookup (if available)
-        if self.p2p_manager and hasattr(self.p2p_manager, 'dht') and self.p2p_manager.dht:
-            try:
-                import hashlib
-                key = int(hashlib.sha1("network_architecture".encode()).hexdigest(), 16)
-                value = self.p2p_manager.dht.lookup_value(key)
-                if value:
-                    import json
-                    data = json.loads(value)
-                    if isinstance(data, dict) and data.get("hidden_dim"):
-                        arch = ModelArchitecture(
-                            hidden_dim=data["hidden_dim"],
-                            intermediate_dim=data.get("intermediate_dim", int(data["hidden_dim"] * 8 / 3)),
-                            num_layers=data.get("num_layers", 12),
-                            num_heads=data.get("num_heads", 12),
-                            num_kv_heads=data.get("num_kv_heads", 4),
-                        )
-                        logger.debug(f"Got network architecture from DHT: {arch.num_layers}L × {arch.hidden_dim}H")
-                        return arch
-            except Exception as e:
-                logger.debug(f"DHT architecture lookup failed: {e}")
-        
-        return None
-    
-    def _architectures_compatible(self, arch1: ModelArchitecture, arch2: ModelArchitecture) -> bool:
-        """
-        Check if two architectures are compatible for gradient exchange.
-        
-        Compatible means: same hidden_dim, num_heads, num_kv_heads
-        (num_layers can differ - nodes just hold different subsets)
-        """
-        return (
-            arch1.hidden_dim == arch2.hidden_dim and
-            arch1.num_heads == arch2.num_heads and
-            arch1.num_kv_heads == arch2.num_kv_heads
-        )
-    
-    def _archive_incompatible_checkpoint(self):
-        """
-        Archive an incompatible checkpoint instead of deleting it.
-        
-        Storage-aware: Keeps only MAX_ARCHIVED_CHECKPOINTS and respects
-        the user's storage budget.
-        """
-        MAX_ARCHIVED_CHECKPOINTS = 2  # Keep at most 2 old checkpoints
-        
-        path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
-        
-        if not path.exists():
-            return
-        
-        # First, clean up old archives to stay within limits
-        self._cleanup_old_archives(MAX_ARCHIVED_CHECKPOINTS - 1)  # Make room for new one
-        
-        # Now archive the current checkpoint
-        import time
-        timestamp = int(time.time())
-        archive_path = self.CHECKPOINT_DIR / f"archived_{self.wallet_id}_{timestamp}.pt"
-        
-        try:
-            path.rename(archive_path)
-            logger.info(f"Archived incompatible checkpoint to: {archive_path.name}")
-        except Exception as e:
-            logger.warning(f"Could not archive checkpoint: {e}")
-            # If archive fails, just delete it
-            try:
-                path.unlink()
-                logger.info(f"Deleted incompatible checkpoint (archive failed)")
-            except Exception:
-                pass
-    
-    def _cleanup_old_archives(self, max_keep: int = 2):
-        """
-        Clean up old archived checkpoints, keeping only the most recent ones.
-        
-        Also enforces storage budget if archives are taking too much space.
-        """
-        # Find all archives for this wallet
-        pattern = f"archived_{self.wallet_id}_*.pt"
-        archives = sorted(
-            self.CHECKPOINT_DIR.glob(pattern),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True  # Newest first
-        )
-        
-        # Calculate total archive size
-        total_archive_mb = sum(p.stat().st_size / (1024 * 1024) for p in archives)
-        
-        # Storage budget: archives should use at most 20% of max_storage
-        archive_budget_mb = self.max_storage_mb * 0.2
-        
-        # Delete archives that exceed count OR storage limits
-        deleted_count = 0
-        for i, archive in enumerate(archives):
-            should_delete = False
-            
-            # Too many archives
-            if i >= max_keep:
-                should_delete = True
-            
-            # Over storage budget
-            if total_archive_mb > archive_budget_mb:
-                should_delete = True
-            
-            if should_delete:
-                try:
-                    archive_size_mb = archive.stat().st_size / (1024 * 1024)
-                    archive.unlink()
-                    total_archive_mb -= archive_size_mb
-                    deleted_count += 1
-                    logger.debug(f"Cleaned up old archive: {archive.name}")
-                except Exception:
-                    pass
-        
-        if deleted_count > 0:
-            logger.info(f"Cleaned up {deleted_count} old archived checkpoint(s)")
-    
-    def _get_checkpoint_layer_count(self) -> Optional[int]:
-        """
-        Get the actual number of layers saved in checkpoint.
-        
-        This is important because the model may have GROWN beyond the base architecture.
-        The architecture might say 11 layers, but 110 layers could be saved!
-        """
-        path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
-        legacy_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.node_id[:16]}.pt"
-        
-        checkpoint_path = path if path.exists() else (legacy_path if legacy_path.exists() else None)
-        if not checkpoint_path:
+            logger.warning(f"Distributed training error: {e}")
             return None
-        
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            layers = checkpoint.get("layers", {})
-            if layers:
-                return len(layers)
-            # Fall back to layer_ids if present
-            layer_ids = checkpoint.get("layer_ids", [])
-            if layer_ids:
-                return len(layer_ids)
-        except Exception as e:
-            logger.debug(f"Could not get checkpoint layer count: {e}")
-        
-        return None
     
-    def _peek_checkpoint_architecture(self) -> Optional[ModelArchitecture]:
-        """
-        Peek at checkpoint to get saved architecture WITHOUT loading weights.
-
-        This allows us to use the same architecture as the checkpoint,
-        preventing architecture drift between restarts on the same machine.
-        """
-        # Use wallet_id for stable checkpoint path
-        path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
-        
-        # Also check legacy path
-        legacy_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.node_id[:16]}.pt"
-        
-        checkpoint_path = None
-        if path.exists():
-            checkpoint_path = path
-        elif legacy_path.exists():
-            checkpoint_path = legacy_path
-        
-        if not checkpoint_path:
-            return None
-        
-        try:
-            # Load just the metadata (weights_only would fail, but we catch it)
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            
-            arch_dict = checkpoint.get("architecture")
-            if arch_dict:
-                return ModelArchitecture.from_dict(arch_dict)
-        except Exception as e:
-            logger.debug(f"Could not peek checkpoint architecture: {e}")
-        
-        return None
-    
-    def _load_embedding_with_vocab_expansion(self, embedding: nn.Embedding, state_dict: dict, name: str):
-        """
-        Load embedding weights, handling vocab size expansion gracefully.
-        
-        When vocabulary grows (tokenizer learns new merges), the checkpoint has fewer
-        tokens than the current model. This method:
-        1. Loads weights for existing tokens (preserves all training)
-        2. Keeps randomly initialized weights for new tokens
-        """
-        checkpoint_weight = state_dict.get("weight")
-        if checkpoint_weight is None:
-            logger.warning(f"[CHECKPOINT] No weight found in {name} state_dict")
-            return
-        
-        checkpoint_vocab_size = checkpoint_weight.shape[0]
-        current_vocab_size = embedding.weight.shape[0]
-        
-        if checkpoint_vocab_size == current_vocab_size:
-            # Same size - normal load
-            embedding.load_state_dict(state_dict)
-            logger.info(f"[CHECKPOINT] Loaded {name}: {current_vocab_size} tokens")
-        elif checkpoint_vocab_size < current_vocab_size:
-            # Vocab expanded - partial load (PRESERVE TRAINING!)
-            with torch.no_grad():
-                embedding.weight[:checkpoint_vocab_size] = checkpoint_weight
-            logger.info(f"[CHECKPOINT] Loaded {name} with vocab expansion: "
-                       f"{checkpoint_vocab_size} → {current_vocab_size} tokens "
-                       f"(preserved {checkpoint_vocab_size} trained embeddings)")
-        else:
-            # Vocab shrunk (unusual) - load what fits
-            with torch.no_grad():
-                embedding.weight[:] = checkpoint_weight[:current_vocab_size]
-            logger.warning(f"[CHECKPOINT] Loaded {name} with vocab truncation: "
-                          f"{checkpoint_vocab_size} → {current_vocab_size} tokens")
-    
-    def _load_lm_head_with_vocab_expansion(self, lm_head: nn.Linear, state_dict: dict, name: str):
-        """
-        Load LM head weights, handling vocab size expansion gracefully.
-        
-        Similar to embedding expansion - preserves trained weights for existing tokens.
-        """
-        checkpoint_weight = state_dict.get("weight")
-        checkpoint_bias = state_dict.get("bias")
-        
-        if checkpoint_weight is None:
-            logger.warning(f"[CHECKPOINT] No weight found in {name} state_dict")
-            return
-        
-        checkpoint_vocab_size = checkpoint_weight.shape[0]
-        current_vocab_size = lm_head.weight.shape[0]
-        
-        if checkpoint_vocab_size == current_vocab_size:
-            # Same size - normal load
-            lm_head.load_state_dict(state_dict)
-            logger.info(f"[CHECKPOINT] Loaded {name}: {current_vocab_size} outputs")
-        elif checkpoint_vocab_size < current_vocab_size:
-            # Vocab expanded - partial load (PRESERVE TRAINING!)
-            with torch.no_grad():
-                lm_head.weight[:checkpoint_vocab_size] = checkpoint_weight
-                if checkpoint_bias is not None and lm_head.bias is not None:
-                    lm_head.bias[:checkpoint_vocab_size] = checkpoint_bias
-            logger.info(f"[CHECKPOINT] Loaded {name} with vocab expansion: "
-                       f"{checkpoint_vocab_size} → {current_vocab_size} outputs "
-                       f"(preserved {checkpoint_vocab_size} trained weights)")
-        else:
-            # Vocab shrunk (unusual) - load what fits
-            with torch.no_grad():
-                lm_head.weight[:] = checkpoint_weight[:current_vocab_size]
-                if checkpoint_bias is not None and lm_head.bias is not None:
-                    lm_head.bias[:] = checkpoint_bias[:current_vocab_size]
-            logger.warning(f"[CHECKPOINT] Loaded {name} with vocab truncation: "
-                          f"{checkpoint_vocab_size} → {current_vocab_size} outputs")
-    
-    def _load_checkpoint(self):
-        """Load checkpoint from disk if it exists (resume training)."""
-        # Use wallet_id for stable checkpoint path (survives node_id changes)
-        path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
-        
-        # Also check legacy path (node_id-based) for migration
-        legacy_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.node_id[:16]}.pt"
-        if not path.exists() and legacy_path.exists():
-            logger.info(f"Migrating checkpoint from legacy path: {legacy_path.name} -> {path.name}")
-            legacy_path.rename(path)
-        
-        if not path.exists():
-            logger.info(f"No checkpoint found at {path.name}, starting fresh")
-            return False
-        
-        logger.info(f"Loading checkpoint from: {path.name}")
-        try:
-            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-            
-            # ARCHITECTURE COMPATIBILITY CHECK
-            saved_arch_dict = checkpoint.get("architecture")
-            if saved_arch_dict:
-                saved_arch = ModelArchitecture.from_dict(saved_arch_dict)
-                current_arch = self.model.architecture
-                
-                # Check if architecture changed (includes num_heads for head_dim compatibility)
-                if (saved_arch.hidden_dim != current_arch.hidden_dim or 
-                    saved_arch.intermediate_dim != current_arch.intermediate_dim or
-                    saved_arch.num_heads != current_arch.num_heads or
-                    saved_arch.num_kv_heads != current_arch.num_kv_heads):
-                    logger.warning(f"Architecture mismatch! Checkpoint is incompatible.")
-                    logger.warning(f"  Saved: {saved_arch.num_layers}L × {saved_arch.hidden_dim}H, "
-                                   f"heads={saved_arch.num_heads}/{saved_arch.num_kv_heads}")
-                    logger.warning(f"  Current: {current_arch.num_layers}L × {current_arch.hidden_dim}H, "
-                                   f"heads={current_arch.num_heads}/{current_arch.num_kv_heads}")
-                    logger.warning(f"  Starting fresh (architecture was upgraded)")
-                    # Delete incompatible checkpoint
-                    try:
-                        path.unlink()
-                        logger.info(f"Deleted incompatible checkpoint: {path}")
-                    except Exception:
-                        pass
-                    return False
-            else:
-                logger.warning("Legacy checkpoint without architecture info - starting fresh")
-                # Delete legacy checkpoint
-                try:
-                    path.unlink()
-                    logger.info(f"Deleted legacy checkpoint: {path}")
-                except Exception:
-                    pass
-                return False
-            
-            # Check layer assignment compatibility
-            saved_layers = set(checkpoint.get("layer_ids", []))
-            current_layers = set(self.my_layer_ids)
-            
-            if saved_layers != current_layers:
-                # Layers changed - try to load what we can
-                common_layers = saved_layers.intersection(current_layers)
-                if common_layers:
-                    logger.warning(f"Layer assignment changed: saved={len(saved_layers)}, current={len(current_layers)}, common={len(common_layers)}")
-                    logger.info(f"Will load {len(common_layers)} common layers from checkpoint")
-                else:
-                    logger.warning(f"No common layers between checkpoint and current assignment, starting fresh")
-                    return False
-            
-            # Load layer weights
-            for layer_id, state_dict in checkpoint.get("layers", {}).items():
-                layer_id = int(layer_id)
-                if layer_id in self.model.my_layers:
-                    self.model.my_layers[layer_id].load_state_dict(state_dict)
-            
-            # Load embedding if present (handle vocab size changes gracefully)
-            if self.model.embedding and "embedding" in checkpoint:
-                self._load_embedding_with_vocab_expansion(
-                    self.model.embedding, 
-                    checkpoint["embedding"],
-                    "embedding"
-                )
-            
-            # Load LM head if present (handle vocab size changes gracefully)
-            if self.model.lm_head and "lm_head" in checkpoint:
-                self._load_lm_head_with_vocab_expansion(
-                    self.model.lm_head,
-                    checkpoint["lm_head"],
-                    "lm_head"
-                )
-            
-            # Load final norm if present
-            if self.model.final_norm and "final_norm" in checkpoint:
-                self.model.final_norm.load_state_dict(checkpoint["final_norm"])
-            
-            # Restore training state
-            self.total_training_rounds = checkpoint.get("total_training_rounds", 0)
-            
-            # Store optimizer state for later loading (after optimizer is created)
-            if "optimizer" in checkpoint:
-                self._pending_optimizer_state = checkpoint["optimizer"]
-            
-            # Store DiLoCo state for later loading (after swarm is created)
-            if "diloco" in checkpoint:
-                self._pending_diloco_state = checkpoint["diloco"]
-                logger.info("[NODE] DiLoCo state found in checkpoint, will restore after swarm init")
-            
-            # Count how many layers were actually loaded
-            loaded_layer_count = sum(1 for lid in checkpoint.get("layers", {}).keys() if int(lid) in self.model.my_layers)
-            logger.info(f"Checkpoint loaded: {self.total_training_rounds} training rounds, "
-                       f"{loaded_layer_count}/{len(current_layers)} layers from {path}")
-            return True
-            
-        except Exception as e:
-            logger.warning(f"Failed to load checkpoint: {e}, starting fresh")
-            return False
-    
-    def _restore_pending_state(self):
-        """
-        Restore optimizer and DiLoCo state after they are initialized.
-        
-        Called after swarm/optimizer are set up to restore checkpoint state.
-        """
-        # Restore optimizer state
-        if hasattr(self, '_pending_optimizer_state') and self._pending_optimizer_state:
-            if hasattr(self, 'optimizer') and self.optimizer:
-                try:
-                    self.optimizer.load_state_dict(self._pending_optimizer_state)
-                    logger.info("[NODE] Restored optimizer state from checkpoint")
-                except Exception as e:
-                    logger.warning(f"[NODE] Could not restore optimizer state: {e}")
-            del self._pending_optimizer_state
-        
-        # Restore DiLoCo state
-        if hasattr(self, '_pending_diloco_state') and self._pending_diloco_state:
-            if hasattr(self, 'swarm') and self.swarm:
-                diloco = getattr(self.swarm, 'diloco_trainer', None)
-                if diloco and hasattr(diloco, 'load_state_dict'):
-                    try:
-                        diloco.load_state_dict(self._pending_diloco_state)
-                        logger.info(f"[NODE] Restored DiLoCo state (inner_step={diloco.stats.inner_step_count})")
-                    except Exception as e:
-                        logger.warning(f"[NODE] Could not restore DiLoCo state: {e}")
-            del self._pending_diloco_state
-    
-    # Class-level save lock to prevent concurrent checkpoint saves
-    _checkpoint_save_lock = threading.Lock()
-    _checkpoint_save_in_progress = False
-    
-    def _save_checkpoint(self, async_save: bool = True):
-        """
-        Smart checkpoint saving with STREAMING ASYNC for memory-constrained systems.
-        
-        THREE MODES:
-        1. BULK ASYNC (>32GB free OR >2.5x checkpoint): Clone all, save in thread
-        2. STREAMING ASYNC (>500MB free): Clone one layer at a time, save incrementally
-        3. SYNC (<500MB free): Blocking save (last resort)
-        
-        Streaming async blocks training only during the brief snapshot (~1-2s for 110 layers),
-        then saves to disk in background (~10-60s) while training continues.
-        
-        Thread-safe: concurrent saves are serialized via lock.
-        """
+    def save_checkpoint(self):
+        """Save checkpoint."""
         if not self.model:
             return
         
-        # Prevent concurrent saves (async save might still be in progress)
-        if not DynamicNeuroNode._checkpoint_save_lock.acquire(blocking=False):
-            logger.debug("[NODE] Checkpoint save skipped - another save in progress")
-            return
+        checkpoint_path = self._get_checkpoint_path()
         
-        # Use wallet_id for stable checkpoint path
-        path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt"
-        temp_path = self.CHECKPOINT_DIR / f"dynamic_node_{self.wallet_id}.pt.tmp"
-
-        # 1. Assess memory situation (respect configured --memory limit!)
-        try:
-            total_params = sum(p.numel() for p in self.model.parameters())
-            checkpoint_size_mb = (total_params * 4) / (1024 * 1024)
-            
-            # Get ACTUAL available memory (respecting configured limit)
-            vm = psutil.virtual_memory()
-            system_available_mb = vm.available / (1024 * 1024)
-            
-            # Check current process memory usage
-            process = psutil.Process()
-            process_used_mb = process.memory_info().rss / (1024 * 1024)
-            
-            # If user set --memory limit, respect it
-            # Available = min(system_available, configured_limit - current_usage)
-            configured_limit = getattr(self, 'available_memory_mb', None)
-            if configured_limit:
-                # How much headroom do we have within our configured limit?
-                headroom_mb = max(0, configured_limit - process_used_mb)
-                # Use the more conservative of system available or our headroom
-                available_mb = min(system_available_mb, headroom_mb)
-                logger.debug(f"[NODE] Memory check: process={process_used_mb:.0f}MB, "
-                           f"limit={configured_limit:.0f}MB, headroom={headroom_mb:.0f}MB, "
-                           f"system_free={system_available_mb:.0f}MB, using={available_mb:.0f}MB")
-            else:
-                available_mb = system_available_mb
-            
-            # Determine save mode based on available headroom
-            # Bulk async needs 2.5x checkpoint size to clone everything
-            can_bulk_async = (available_mb > (checkpoint_size_mb * 2.5)) or (available_mb > 32000)
-            # Streaming async just needs enough for 1 layer (~50-100MB typically)
-            can_stream_async = available_mb > 500
-            
-        except Exception as e:
-            logger.warning(f"[NODE] Could not assess memory: {e}. Using streaming async.")
-            can_bulk_async = False
-            can_stream_async = True
-            checkpoint_size_mb = 0
-            available_mb = 0
+        state_dict = {}
         
-        try:
-            # ============ ATOMIC SNAPSHOT PHASE ============
-            # ALL state must be captured together to ensure consistency.
-            # DiLoCo state + model weights must be from the same "moment in time".
-            
-            # Helper to deep-clone DiLoCo state (ALL tensors to CPU for async safety)
-            def _clone_diloco_state():
-                if not hasattr(self, 'swarm') or not self.swarm:
-                    return None
-                diloco = getattr(self.swarm, 'diloco_trainer', None)
-                if not diloco or not hasattr(diloco, 'state_dict'):
-                    return None
-                try:
-                    state = diloco.state_dict()
-                    
-                    # Deep clone optimizer state (handles both PyTorch and custom formats)
-                    def _clone_optimizer_state(opt_state):
-                        if opt_state is None:
-                            return None
-                        cloned = {}
-                        for key, value in opt_state.items():
-                            if isinstance(value, torch.Tensor):
-                                # Direct tensor (e.g., in custom optimizers)
-                                cloned[key] = value.detach().clone().cpu()
-                            elif isinstance(value, dict):
-                                # Nested dict (e.g., 'state' or 'velocity' dicts)
-                                cloned[key] = {}
-                                for k, v in value.items():
-                                    if isinstance(v, torch.Tensor):
-                                        cloned[key][k] = v.detach().clone().cpu()
-                                    elif isinstance(v, dict):
-                                        # PyTorch optimizer 'state' has param_idx -> {key: tensor}
-                                        cloned[key][k] = {}
-                                        for kk, vv in v.items():
-                                            if isinstance(vv, torch.Tensor):
-                                                cloned[key][k][kk] = vv.detach().clone().cpu()
-                                            else:
-                                                cloned[key][k][kk] = vv
-                                    else:
-                                        cloned[key][k] = v
-                            elif isinstance(value, list):
-                                # List (e.g., param_groups) - shallow copy is fine
-                                cloned[key] = list(value)
-                            else:
-                                # Scalar values (lr, momentum, etc.)
-                                cloned[key] = value
-                        return cloned
-                    
-                    # Deep clone all tensors to CPU for async safety
-                    cloned = {
-                        'config': dict(state.get('config', {})),
-                        'inner_optimizer': _clone_optimizer_state(state.get('inner_optimizer')),
-                        'outer_optimizer': _clone_optimizer_state(state.get('outer_optimizer')),
-                        'initial_weights': {
-                            k: v.detach().clone().cpu() 
-                            for k, v in state.get('initial_weights', {}).items()
-                        },
-                        'stats': dict(state.get('stats', {})),
-                        'phase': state.get('phase', 'idle'),
-                    }
-                    return cloned
-                except Exception as e:
-                    logger.warning(f"[NODE] Could not snapshot DiLoCo state: {e}")
-                    return None
-            
-            # ============ MODE 1: BULK ASYNC (plenty of memory) ============
-            if async_save and can_bulk_async:
-                logger.debug(f"[NODE] Checkpoint: BULK ASYNC (Free: {available_mb:.0f}MB)")
+        # Save embedding
+        if self.model.has_embedding and self.model.embedding is not None:
+            state_dict["embedding.weight"] = self.model.embedding.weight.cpu()
+        
+        # Save LM head
+        if self.model.has_lm_head:
+            if self.model.lm_head is not None:
+                state_dict["lm_head.weight"] = self.model.lm_head.weight.cpu()
+            if self.model.final_norm is not None:
+                for name, param in self.model.final_norm.named_parameters():
+                    state_dict[f"final_norm.{name}"] = param.cpu()
+        
+        # Save layers
+        for layer_id, layer in self.model.my_layers.items():
+            for name, param in layer.named_parameters():
+                state_dict[f"layer_{layer_id}.{name}"] = param.cpu()
+        
+        checkpoint = {
+            "state_dict": state_dict,
+            "layer_ids": self.my_layer_ids,
+            "architecture": {
+                "hidden_dim": self.model.architecture.hidden_dim,
+                "intermediate_dim": self.model.architecture.intermediate_dim,
+                "num_layers": self.model.architecture.num_layers,
+                "num_heads": self.model.architecture.num_heads,
+                "num_kv_heads": self.model.architecture.num_kv_heads,
+                "max_seq_len": self.model.architecture.max_seq_len,
+            },
+            "vocab_capacity": self.model.vocab_capacity,
+            "training_rounds": getattr(self, 'training_rounds', 0),
+            "timestamp": time.time()
+        }
+        
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"Checkpoint saved: {checkpoint_path.name}")
+    
+    def forward_pipeline(self, hidden_states: torch.Tensor, session_id: str,
+                        source_layer: int, is_training: bool = False,
+                        labels: Optional[torch.Tensor] = None,
+                        attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[float], Optional[torch.Tensor]]:
+        """
+        Handle incoming pipeline forward request.
+        
+        Called via gRPC when another node forwards activations to us.
+        """
+        hidden_states = hidden_states.to(self.device)
+        if labels is not None:
+            labels = labels.to(self.device)
+        
+        # Forward through my layers
+        output = self.model.forward_my_layers(hidden_states, attention_mask)
+        
+        # Check if there's a next hop
+        my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
+        next_layer = my_last_layer + 1
+        
+        next_hop = None
+        if self.p2p_manager:
+            next_hop = self.p2p_manager.get_next_hop(next_layer)
+        
+        if next_hop:
+            # Forward to next node
+            # (Similar to _train_step_distributed)
+            # For now, return output for caller to forward
+            return output, None, None
+        
+        # I'm the last node - compute loss if training
+        if is_training and labels is not None and self.model.has_lm_head:
+            with self._training_lock:
+                self.optimizer.zero_grad()
                 
-                # Capture everything atomically
-                checkpoint = {
-                    "node_id": self.node_id,
-                    "layer_ids": list(self.my_layer_ids),
-                    "architecture": self.model.architecture.to_dict(),
-                    "architecture_version": self.layer_pool.architecture_version if self.layer_pool else 1,
-                    "has_embedding": self.model.has_embedding,
-                    "has_lm_head": self.model.has_lm_head,
-                    "total_training_rounds": self.total_training_rounds,
-                    "current_loss": self.current_loss,
-                    "timestamp": time.time(),
-                    "layers": {
-                        layer_id: {k: v.clone().cpu() for k, v in layer.state_dict().items()}
-                        for layer_id, layer in self.model.my_layers.items()
-                    },
-                }
-                if self.model.embedding:
-                    checkpoint["embedding"] = {k: v.clone().cpu() for k, v in self.model.embedding.state_dict().items()}
-                if self.model.lm_head:
-                    checkpoint["lm_head"] = {k: v.clone().cpu() for k, v in self.model.lm_head.state_dict().items()}
-                if self.model.final_norm:
-                    checkpoint["final_norm"] = {k: v.clone().cpu() for k, v in self.model.final_norm.state_dict().items()}
+                logits = self.model.compute_logits(output)
+                logits_flat = logits.view(-1, logits.size(-1))
+                labels_flat = labels.view(-1)
+                loss = nn.functional.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
                 
-                # DiLoCo state captured AFTER model weights (both in same atomic snapshot)
-                diloco_state = _clone_diloco_state()
-                if diloco_state:
-                    checkpoint["diloco"] = diloco_state
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
                 
-                def _do_bulk_save():
-                    try:
-                        torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=False)
-                        import shutil
-                        shutil.move(str(temp_path), str(path))
-                        logger.info(f"[NODE] Checkpoint saved ({len(self.my_layer_ids)} layers)")
-                    except Exception as e:
-                        logger.error(f"[NODE] Checkpoint save failed: {e}")
-                        if temp_path.exists(): temp_path.unlink()
-                    finally:
-                        DynamicNeuroNode._checkpoint_save_lock.release()
-                
-                # Use daemon=False so checkpoint completes even during shutdown
-                threading.Thread(target=_do_bulk_save, daemon=False).start()
-                return  # Lock will be released by background thread
-            
-            # ============ MODE 2: STREAMING ASYNC (memory-efficient) ============
-            if async_save and can_stream_async:
-                logger.info(f"[NODE] Checkpoint: STREAMING ASYNC (Free: {available_mb:.0f}MB, cloning {len(self.model.my_layers)} layers)")
-                
-                # SNAPSHOT PHASE: Clone one layer at a time into a list
-                # This brief pause (~1-2s) ensures consistency without needing full clone memory
-                snapshot_start = time.time()
-                
-                # Capture metadata first (lightweight)
-                checkpoint_meta = {
-                    "node_id": self.node_id,
-                    "layer_ids": list(self.my_layer_ids),
-                    "architecture": self.model.architecture.to_dict(),
-                    "architecture_version": self.layer_pool.architecture_version if self.layer_pool else 1,
-                    "has_embedding": self.model.has_embedding,
-                    "has_lm_head": self.model.has_lm_head,
-                    "total_training_rounds": self.total_training_rounds,
-                    "current_loss": self.current_loss,
-                    "timestamp": time.time(),
-                }
-                
-                # Clone layers one at a time (memory efficient)
-                layer_snapshots = []
-                for layer_id, layer in self.model.my_layers.items():
-                    layer_state = {k: v.detach().clone().cpu() for k, v in layer.state_dict().items()}
-                    layer_snapshots.append((layer_id, layer_state))
-                
-                # Clone special modules
-                embedding_snapshot = None
-                lm_head_snapshot = None
-                final_norm_snapshot = None
-                
-                if self.model.embedding:
-                    embedding_snapshot = {k: v.detach().clone().cpu() for k, v in self.model.embedding.state_dict().items()}
-                if self.model.lm_head:
-                    lm_head_snapshot = {k: v.detach().clone().cpu() for k, v in self.model.lm_head.state_dict().items()}
-                if self.model.final_norm:
-                    final_norm_snapshot = {k: v.detach().clone().cpu() for k, v in self.model.final_norm.state_dict().items()}
-                
-                # DiLoCo state - captured in SAME snapshot window as model weights
-                diloco_snapshot = _clone_diloco_state()
-                
-                snapshot_time = time.time() - snapshot_start
-                logger.debug(f"[NODE] Snapshot complete in {snapshot_time:.1f}s, starting async save")
-                
-                # ASYNC SAVE PHASE: Write to disk in background thread
-                # All data is now cloned and owned by this closure - safe for async
-                def _do_streaming_save():
-                    try:
-                        checkpoint = dict(checkpoint_meta)
-                        checkpoint["layers"] = {lid: lstate for lid, lstate in layer_snapshots}
-                        if embedding_snapshot:
-                            checkpoint["embedding"] = embedding_snapshot
-                        if lm_head_snapshot:
-                            checkpoint["lm_head"] = lm_head_snapshot
-                        if final_norm_snapshot:
-                            checkpoint["final_norm"] = final_norm_snapshot
-                        if diloco_snapshot:
-                            checkpoint["diloco"] = diloco_snapshot
-                        
-                        torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=False)
-                        import shutil
-                        shutil.move(str(temp_path), str(path))
-                        logger.info(f"[NODE] Checkpoint saved ({len(layer_snapshots)} layers)")
-                    except Exception as e:
-                        logger.error(f"[NODE] Checkpoint save failed: {e}")
-                        if temp_path.exists(): temp_path.unlink()
-                    finally:
-                        DynamicNeuroNode._checkpoint_save_lock.release()
-                
-                # Use daemon=False so checkpoint completes even during shutdown
-                threading.Thread(target=_do_streaming_save, daemon=False).start()
-                return  # Lock will be released by background thread
-            
-            # ============ MODE 3: SYNC (last resort, very low memory) ============
-            logger.warning(f"[NODE] Checkpoint: SYNC mode (Free: {available_mb:.0f}MB < 500MB minimum)")
-            
-            checkpoint = {
-                "node_id": self.node_id,
-                "layer_ids": list(self.my_layer_ids),
-                "architecture": self.model.architecture.to_dict(),
-                "architecture_version": self.layer_pool.architecture_version if self.layer_pool else 1,
-                "has_embedding": self.model.has_embedding,
-                "has_lm_head": self.model.has_lm_head,
-                "total_training_rounds": self.total_training_rounds,
-                "current_loss": self.current_loss,
-                "timestamp": time.time(),
-                "layers": {
-                    layer_id: layer.state_dict()
-                    for layer_id, layer in self.model.my_layers.items()
-                },
-            }
-            if self.model.embedding:
-                checkpoint["embedding"] = self.model.embedding.state_dict()
-            if self.model.lm_head:
-                checkpoint["lm_head"] = self.model.lm_head.state_dict()
-            if self.model.final_norm:
-                checkpoint["final_norm"] = self.model.final_norm.state_dict()
-            
-            # DiLoCo state (no need to clone for sync - we block anyway)
-            diloco_state = _clone_diloco_state()
-            if diloco_state:
-                checkpoint["diloco"] = diloco_state
-            
-            torch.save(checkpoint, temp_path, _use_new_zipfile_serialization=False)
-            import shutil
-            shutil.move(str(temp_path), str(path))
-            logger.info(f"[NODE] Checkpoint saved ({len(self.my_layer_ids)} layers)")
-            
-            # Sync mode completed successfully, release lock
-            DynamicNeuroNode._checkpoint_save_lock.release()
-            
-        except Exception as e:
-            logger.error(f"[NODE] Checkpoint preparation failed: {type(e).__name__}: {e}")
-            try:
-                if temp_path.exists(): temp_path.unlink()
-            except:
-                pass
-            # Release lock on exception
-            DynamicNeuroNode._checkpoint_save_lock.release()
+                # Return gradients for backward pass
+                grad_output = hidden_states.grad if hidden_states.requires_grad else None
+                return output, loss.item(), grad_output
+        
+        return output, None, None
+    
+    def backward_pipeline(self, grad_output: torch.Tensor, session_id: str) -> Optional[torch.Tensor]:
+        """
+        Handle incoming gradient for backward pass.
+        """
+        # This would be called if we're not the last node but received gradients
+        # For now, this is handled inline in forward_pipeline
+        return None
 
 
 def create_dynamic_node(
-    node_token: str,
+    node_id: str,
+    wallet_id: str,
     port: int = 8000,
-    tracker_url: str = "https://neuroshard.com/api/tracker",
-    available_memory_mb: Optional[float] = None,
-    enable_training: bool = True,
-    max_storage_mb: float = 100.0,
-    max_cpu_threads: Optional[int] = None,
-    device: str = "auto",
-    p2p_manager: Optional[Any] = None,  # NEW: Pass P2P for DHT discovery during layer assignment
+    memory_mb: float = 4000,
+    device: str = "cpu",
+    training: bool = True,
+    max_storage_mb: int = 5000,
+    p2p_manager = None
 ) -> DynamicNeuroNode:
-    """
-    Create and start a dynamic node.
-
-    MULTI-NODE SUPPORT:
-    If the same token is used on multiple machines or ports, each gets a unique
-    node_id (based on machine + port) while sharing the same wallet_id (based on token).
-
-    This means:
-    - Each physical node has a unique network identity
-    - Earnings accumulate to the same NEURO wallet
-    - No conflicts in DHT/layer assignments
-    
-    FULLY DECENTRALIZED:
-    If p2p_manager is provided, DHT is used for network discovery during layer
-    assignment. No tracker fallbacks - pure P2P!
-    """
-    from neuroshard.utils.hardware import get_instance_id
-
-    # Generate instance-specific node_id
-    instance_id = get_instance_id(port)
-
-    # Combine token with instance for unique network identity
-    # wallet_id (from token alone) is used for NEURO earnings
-    # node_id (from token + instance) is used for network identity
-    combined = f"{node_token}:{instance_id}"
-    node_id = str(int(hashlib.sha256(combined.encode()).hexdigest(), 16))
-    
-    # Log multi-node info
-    wallet_id = hashlib.sha256(node_token.encode()).hexdigest()[:16]
-    logger.info(f"Instance ID: {instance_id} (machine+port)")
-    logger.info(f"Wallet ID: {wallet_id}... (for NEURO earnings)")
-    logger.info(f"Node ID: {node_id[:16]}... (unique network identity)")
-    
+    """Create and start a dynamic node."""
     node = DynamicNeuroNode(
         node_id=node_id,
+        wallet_id=wallet_id,
         port=port,
-        tracker_url=tracker_url,
-        node_token=node_token,
-        available_memory_mb=available_memory_mb,
-        enable_training=enable_training,
-        max_storage_mb=max_storage_mb,
-        max_cpu_threads=max_cpu_threads,
+        available_memory_mb=memory_mb,
         device=device,
+        enable_training=training,
+        max_storage_mb=max_storage_mb
     )
     
-    # Store instance info for debugging
-    node.instance_id = instance_id
-    node.wallet_id = wallet_id
-    
-    # CRITICAL: Connect P2P BEFORE start() so DHT is available for layer discovery!
-    # This enables fully decentralized network discovery without tracker fallbacks.
     if p2p_manager:
         node.p2p_manager = p2p_manager
-        logger.info("P2P connected BEFORE start - DHT available for network discovery")
     
     node.start()
-    
     return node
-

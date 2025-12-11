@@ -861,6 +861,7 @@ class P2PManager:
             # Use iterative lookup
             val = self.dht.lookup_value(key)
             if val:
+                logger.debug(f"[ROUTING] DHT lookup for layer {current_end_layer}: found {val[:100] if len(val) > 100 else val}")
                 try:
                     # Try parsing as list of peers
                     dht_candidates = json.loads(val)
@@ -885,6 +886,8 @@ class P2PManager:
                         candidates.append(f"http://{val}")
                     else:
                         candidates.append(val)
+            else:
+                logger.debug(f"[ROUTING] DHT lookup for layer {current_end_layer}: no value found")
 
         # Strategy 2: Local Cache (Fallback)
         # Check if target layer is WITHIN the peer's range (not just at start)
@@ -894,10 +897,16 @@ class P2PManager:
                 start, end = map(int, r.split("-"))
                 # Peer can handle layer if it's within their range
                 if start <= current_end_layer <= end:
-                    candidates.append(url)
+                    if url not in candidates:  # Avoid duplicates
+                        candidates.append(url)
+                        logger.debug(f"[ROUTING] Local cache: {url} has layer {current_end_layer} (range {start}-{end})")
             except: continue
             
-        if not candidates: return None
+        if not candidates:
+            # Log why we couldn't find a next hop
+            peer_ranges = {url: info.get("shard_range", "unknown") for url, info in self.known_peers.items()}
+            logger.debug(f"[ROUTING] No next hop for layer {current_end_layer}. Known peers: {peer_ranges}")
+            return None
         
         if session_id:
             # Sticky routing
