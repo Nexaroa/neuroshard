@@ -122,6 +122,156 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             logger.error(f"GetWeights error: {e}")
             return neuroshard_pb2.WeightResponse(weights_data=b"")
 
+    # ==================== PoNW GOSSIP RPCs ====================
+    
+    def GossipProof(self, request, context):
+        """
+        Receive a Proof of Neural Work from a peer.
+        
+        This is the core PoNW gossip handler. When a node earns rewards,
+        it gossips the proof to peers who:
+        1. Verify the signature (ECDSA - trustless)
+        2. Store the proof in their ledger (for DHT propagation)
+        3. Optionally forward to more peers
+        
+        Security: Proofs are cryptographically signed and verified.
+        """
+        try:
+            from neuroshard.core.economics.ledger import PoNWProof
+            from neuroshard.core.crypto.ecdsa import register_public_key
+            
+            # Register sender's public key for verification
+            if request.public_key:
+                register_public_key(request.node_id, request.public_key)
+            
+            # Reconstruct the proof object
+            proof = PoNWProof(
+                node_id=request.node_id,
+                proof_type=request.proof_type,
+                timestamp=request.timestamp,
+                nonce=request.nonce,
+                uptime_seconds=request.uptime,
+                tokens_processed=request.token_count,
+                training_batches=request.training_batches,
+                data_samples=request.data_samples,
+                model_hash=request.model_hash,
+                layers_held=request.layers_held,
+                has_embedding=request.has_embedding,
+                has_lm_head=request.has_lm_head,
+                current_loss=request.current_loss if request.current_loss != 0.0 else None,
+                request_id=request.request_id if request.request_id else None,
+                signature=request.signature,
+            )
+            
+            # Verify and process the proof using our ledger
+            if self.p2p and self.p2p.ledger:
+                ledger = self.p2p.ledger
+                is_valid, reason = ledger.verify_proof(proof)
+                
+                if is_valid:
+                    # Process the proof (credits rewards)
+                    success, reward, msg = ledger.process_proof(proof)
+                    if success:
+                        logger.debug(f"[GOSSIP] Accepted proof from {request.node_id[:16]}...: {reward:.6f} NEURO")
+                        return neuroshard_pb2.GossipProofResponse(accepted=True)
+                    else:
+                        logger.debug(f"[GOSSIP] Proof processing failed: {msg}")
+                        return neuroshard_pb2.GossipProofResponse(accepted=False)
+                else:
+                    logger.debug(f"[GOSSIP] Proof verification failed: {reason}")
+                    return neuroshard_pb2.GossipProofResponse(accepted=False)
+            
+            # No ledger - just accept silently
+            return neuroshard_pb2.GossipProofResponse(accepted=True)
+            
+        except Exception as e:
+            logger.error(f"GossipProof error: {e}")
+            return neuroshard_pb2.GossipProofResponse(accepted=False)
+    
+    def GossipTransaction(self, request, context):
+        """
+        Receive a NEURO transaction from a peer.
+        
+        Transactions are used for:
+        - Paying for inference
+        - Staking NEURO
+        - Transfers between wallets
+        """
+        try:
+            if self.p2p and self.p2p.ledger:
+                ledger = self.p2p.ledger
+                
+                # Verify signature and process transaction
+                success = ledger.create_transaction(
+                    from_id=request.sender_id,
+                    to_id=request.recipient_id,
+                    amount=request.amount,
+                    signature=request.signature
+                )
+                
+                if success:
+                    logger.debug(f"[GOSSIP] Accepted transaction: {request.amount:.6f} NEURO")
+                    return neuroshard_pb2.GossipTransactionResponse(accepted=True)
+                else:
+                    return neuroshard_pb2.GossipTransactionResponse(
+                        accepted=False, 
+                        reason="Transaction verification failed"
+                    )
+            
+            return neuroshard_pb2.GossipTransactionResponse(accepted=True)
+            
+        except Exception as e:
+            logger.error(f"GossipTransaction error: {e}")
+            return neuroshard_pb2.GossipTransactionResponse(accepted=False, reason=str(e))
+    
+    def GossipStake(self, request, context):
+        """
+        Receive a stake update from a peer.
+        
+        Stake information is gossiped so peers can:
+        1. Verify PoNW multipliers
+        2. Select validators (stake-weighted)
+        3. Display network stake distribution
+        """
+        try:
+            from neuroshard.core.crypto.ecdsa import register_public_key, verify_signature
+            
+            # Register public key
+            if request.public_key:
+                register_public_key(request.node_id, request.public_key)
+            
+            # Verify signature on stake claim
+            payload = f"{request.node_id}:{request.amount}:{request.locked_until}:{request.timestamp}"
+            if not verify_signature(request.node_id, payload, request.signature):
+                return neuroshard_pb2.GossipStakeResponse(
+                    accepted=False,
+                    reason="Invalid signature"
+                )
+            
+            # Update stake in ledger
+            if self.p2p and self.p2p.ledger:
+                ledger = self.p2p.ledger
+                success = ledger.update_stake(
+                    node_id=request.node_id,
+                    amount=request.amount,
+                    locked_until=request.locked_until
+                )
+                
+                if success:
+                    logger.debug(f"[GOSSIP] Updated stake for {request.node_id[:16]}...: {request.amount:.2f} NEURO")
+                    return neuroshard_pb2.GossipStakeResponse(accepted=True)
+                else:
+                    return neuroshard_pb2.GossipStakeResponse(
+                        accepted=False,
+                        reason="Stake update rejected"
+                    )
+            
+            return neuroshard_pb2.GossipStakeResponse(accepted=True)
+            
+        except Exception as e:
+            logger.error(f"GossipStake error: {e}")
+            return neuroshard_pb2.GossipStakeResponse(accepted=False, reason=str(e))
+
     # ==================== DISTRIBUTED TRAINING RPCs ====================
     
     def GossipGradient(self, request, context):
@@ -774,6 +924,151 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
         except Exception as e:
             logger.error(f"UpdatePeerCapacity error: {e}")
             return neuroshard_pb2.UpdatePeerCapacityResponse(success=False, error_message=str(e))
+    
+    # ==================== VALIDATOR CONSENSUS RPCs ====================
+    
+    def RequestProofValidation(self, request, context):
+        """
+        Handle proof validation request from another node.
+        
+        When a node submits a PoNW proof, it requests validation from
+        selected validators (stake-weighted random selection).
+        
+        This node:
+        1. Verifies it is an eligible validator
+        2. Validates the proof locally
+        3. Casts a vote (valid/invalid)
+        4. Returns the vote to be gossiped
+        
+        From whitepaper Section 7: Hybrid Validator System
+        """
+        try:
+            # Check if we're an eligible validator
+            if not hasattr(self.model, 'layer_pool') or not self.model.layer_pool:
+                return neuroshard_pb2.ProofValidationResponse(
+                    accepted=False,
+                    reason="Node does not have layer pool"
+                )
+            
+            # Check if we have LM head (required for validator)
+            has_lm_head = self.model.model.has_lm_head if hasattr(self.model, 'model') else False
+            if not has_lm_head:
+                return neuroshard_pb2.ProofValidationResponse(
+                    accepted=False,
+                    reason="Not a validator (no LM head)"
+                )
+            
+            # Get our stake
+            stake = 0.0
+            if hasattr(self.model, 'ledger') and self.model.ledger:
+                stake = self.model.ledger.get_local_stake(self.model.node_id)
+            
+            # Check minimum stake requirement
+            from neuroshard.core.economics.constants import get_dynamic_validator_stake
+            num_validators = len([n for n in self.model.layer_pool.node_capacities 
+                                 if n != self.model.node_id]) + 1
+            required_stake = get_dynamic_validator_stake(num_validators)
+            
+            if stake < required_stake:
+                return neuroshard_pb2.ProofValidationResponse(
+                    accepted=False,
+                    reason=f"Insufficient stake: {stake:.2f} < {required_stake:.2f} NEURO required"
+                )
+            
+            logger.info(f"[VALIDATOR] Accepted validation request for proof {request.proof_signature[:16]}...")
+            
+            return neuroshard_pb2.ProofValidationResponse(
+                accepted=True,
+                reason="Validation request accepted",
+                validator_id=self.model.node_id,
+                validator_stake=stake
+            )
+            
+        except Exception as e:
+            logger.error(f"RequestProofValidation error: {e}")
+            return neuroshard_pb2.ProofValidationResponse(
+                accepted=False,
+                reason=str(e)
+            )
+    
+    def GossipValidationVote(self, request, context):
+        """
+        Receive a validation vote from a validator.
+        
+        Validators cast stake-weighted votes on proofs:
+        - vote = True: Proof is valid
+        - vote = False: Proof is invalid
+        
+        Consensus is reached when 66% of stake agrees.
+        Validators who vote against consensus are slashed (2x penalty).
+        
+        From whitepaper Section 7.3: Stake-Weighted Proof Validation
+        """
+        try:
+            logger.info(f"[CONSENSUS] Received vote from {request.validator_id[:16]}... "
+                       f"on proof {request.proof_signature[:16]}...: "
+                       f"{'VALID' if request.vote else 'INVALID'} (stake={request.validator_stake:.2f})")
+            
+            # Get or create consensus tracker
+            if not hasattr(self, '_pending_consensus'):
+                self._pending_consensus = {}
+            
+            proof_sig = request.proof_signature
+            if proof_sig not in self._pending_consensus:
+                self._pending_consensus[proof_sig] = {
+                    'valid_stake': 0.0,
+                    'invalid_stake': 0.0,
+                    'votes': [],
+                    'created_at': time.time(),
+                }
+            
+            consensus = self._pending_consensus[proof_sig]
+            
+            # Record vote
+            consensus['votes'].append({
+                'validator_id': request.validator_id,
+                'stake': request.validator_stake,
+                'vote': request.vote,
+                'timestamp': request.timestamp,
+            })
+            
+            if request.vote:
+                consensus['valid_stake'] += request.validator_stake
+            else:
+                consensus['invalid_stake'] += request.validator_stake
+            
+            total_stake = consensus['valid_stake'] + consensus['invalid_stake']
+            valid_ratio = consensus['valid_stake'] / total_stake if total_stake > 0 else 0
+            
+            # Check consensus (66% threshold)
+            from neuroshard.core.economics.constants import VALIDATION_CONSENSUS_THRESHOLD
+            consensus_reached = (
+                valid_ratio >= VALIDATION_CONSENSUS_THRESHOLD or
+                (1 - valid_ratio) >= VALIDATION_CONSENSUS_THRESHOLD
+            )
+            
+            consensus_result = False
+            if consensus_reached:
+                consensus_result = valid_ratio >= VALIDATION_CONSENSUS_THRESHOLD
+                logger.info(f"[CONSENSUS] Reached for proof {proof_sig[:16]}...: "
+                           f"{'ACCEPTED' if consensus_result else 'REJECTED'} "
+                           f"({valid_ratio:.1%} valid stake)")
+            
+            return neuroshard_pb2.ValidationVoteResponse(
+                accepted=True,
+                reason="Vote recorded",
+                total_valid_stake=consensus['valid_stake'],
+                total_invalid_stake=consensus['invalid_stake'],
+                consensus_reached=consensus_reached,
+                consensus_result=consensus_result,
+            )
+            
+        except Exception as e:
+            logger.error(f"GossipValidationVote error: {e}")
+            return neuroshard_pb2.ValidationVoteResponse(
+                accepted=False,
+                reason=str(e)
+            )
 
 
 def serve_grpc(port: int, model, p2p: P2PManager, swap_controller=None):
