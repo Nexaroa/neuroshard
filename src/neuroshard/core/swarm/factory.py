@@ -663,15 +663,17 @@ class SwarmEnabledDynamicNode:
         
         # STEP 1: Check if there's a next hop (another node with higher layers)
         # This is THE KEY check - if someone else has layers after us, use pipeline!
+        # IMPORTANT: Use for_training=True to only find training-capable peers!
         my_last_layer = max(self.base_node.my_layer_ids) if self.base_node.my_layer_ids else 0
         next_layer = my_last_layer + 1
         
         has_next_hop = False
         if hasattr(self.base_node, 'p2p_manager') and self.base_node.p2p_manager:
-            next_hop_url = self.base_node.p2p_manager.get_next_hop(next_layer)
+            # Only find peers that can participate in training (not observers)
+            next_hop_url = self.base_node.p2p_manager.get_next_hop(next_layer, for_training=True)
             if next_hop_url:
                 has_next_hop = True
-                logger.debug(f"[SWARM] Found next hop for layer {next_layer}: {next_hop_url}")
+                logger.debug(f"[SWARM] Found training-capable next hop for layer {next_layer}: {next_hop_url}")
         
         # STEP 2: Decide training mode based on role and network state
         if not self.model.has_embedding:
@@ -685,7 +687,12 @@ class SwarmEnabledDynamicNode:
             # Forward to them via base_node.train_step() which handles the pipeline
             # Even if I have a temporary LM head, use distributed mode!
             logger.debug(f"[SWARM] DRIVER using distributed training (next_hop exists)")
-            return self.base_node.train_step()
+            loss = self.base_node.train_step()
+            if loss is not None:
+                # Increment swarm's counter even for distributed training
+                self._total_training_rounds += 1
+                self._current_loss = loss
+            return loss
         
         # No next_hop - check if we can do local training
         if not self.model.has_lm_head:
