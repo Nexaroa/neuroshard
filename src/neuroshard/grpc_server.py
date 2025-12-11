@@ -284,13 +284,15 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
         """
         Pipeline Forward for distributed training and inference.
         
-        Flow:
-        1. DRIVER sends hidden states + labels to WORKER/VALIDATOR
-        2. Node processes through its layers
-        3. If VALIDATOR (has LM head): compute loss, send gradients back
-        4. Return response with output/loss
+        PRODUCTION-READY MULTI-HOP PIPELINE:
+        1. Receive hidden states from previous node (DRIVER or WORKER)
+        2. Process through MY layers
+        3. Check for next_hop:
+           - If next_hop exists → forward to next node, return their response
+           - If no next_hop (I'm VALIDATOR) → compute loss, send gradients back
         
-        Used for: Driver → Workers → Validator pipeline
+        This enables: DRIVER → WORKER₁ → WORKER₂ → ... → VALIDATOR
+        Any number of nodes in the pipeline!
         """
         if not hasattr(self.model, 'forward_pipeline'):
             return neuroshard_pb2.PipelineForwardResponse(
@@ -300,17 +302,16 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
         
         try:
             import numpy as np
-            import hashlib
+            from neuroshard.core.network.connection_pool import get_channel
+            from urllib.parse import urlparse
             
             logger.info(f"[PIPELINE] Received forward request {request.request_id[:8]}... from {request.sender_url}")
             
             # STEP 1: Deserialize hidden states
-            # 3D = hidden_states (float32), shape: [batch, seq_len, hidden_dim]
             hidden_states = torch.from_numpy(
                 np.frombuffer(request.hidden_states, dtype=np.float32).copy()
             ).reshape(list(request.hidden_shape))
             
-            # Move to model device
             model_device = self.model.device if hasattr(self.model, 'device') else 'cpu'
             hidden_states = hidden_states.to(model_device)
             
@@ -327,7 +328,6 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             training_labels = None
             is_training = False
             if request.training_labels:
-                # Labels shape is [batch, seq_len]
                 batch_size = request.hidden_shape[0]
                 seq_len = request.hidden_shape[1]
                 training_labels = torch.from_numpy(
@@ -336,78 +336,125 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 is_training = True
                 logger.info(f"[PIPELINE] Training mode: labels shape {training_labels.shape}")
             
-            # STEP 4: Forward through our layers
-            output, loss, grad_output = self.model.forward_pipeline(
-                hidden_states=hidden_states,
-                session_id=request.session_id,
-                source_layer=request.source_shard,
-                is_training=is_training,
-                labels=training_labels,
-                attention_mask=attention_mask,
-            )
+            # STEP 4: Forward through MY layers (no loss computation here)
+            output = self.model.model.forward_my_layers(hidden_states, attention_mask)
             
-            # Determine if we're the final node (VALIDATOR with LM head)
-            is_final = self.model.model.has_lm_head
+            # STEP 5: Check for next_hop - KEY for multi-hop pipeline!
+            my_last_layer = max(self.model.my_layer_ids) if self.model.my_layer_ids else 0
+            next_layer = my_last_layer + 1
             
-            logger.info(f"[PIPELINE] Processed: output={output.shape}, is_final={is_final}, loss={loss}")
+            next_hop_url = None
+            if hasattr(self.model, 'p2p_manager') and self.model.p2p_manager:
+                next_hop_url = self.model.p2p_manager.get_next_hop(next_layer)
             
-            # STEP 5: Submit PoNW proof for this work
-            if hasattr(self.model, 'ledger') and self.model.ledger:
-                try:
-                    from neuroshard.core.economics.ledger import PoNWProof, sign_proof
-                    import uuid
-                    
-                    tokens_processed = output.shape[1] if len(output.shape) > 1 else output.shape[0]
-                    
-                    proof = PoNWProof(
-                        node_id=self.model.node_id,
-                        proof_type="training" if is_training else "inference",
-                        timestamp=time.time(),
-                        nonce=str(uuid.uuid4()),
-                        tokens_processed=tokens_processed,
-                        request_id=request.request_id,
-                        has_embedding=self.model.model.has_embedding,
-                        has_lm_head=self.model.model.has_lm_head,
-                        layers_held=len(self.model.my_layer_ids)
-                    )
-                    
-                    signed_proof = sign_proof(proof, self.model.node_token)
-                    success, reward, msg = self.model.ledger.process_proof(signed_proof)
-                    
-                    if success:
-                        role = "VALIDATOR" if is_final else "WORKER"
-                        logger.info(f"[{role}] ✅ Earned {reward:.6f} NEURO")
-                except Exception as e:
-                    logger.warning(f"[PIPELINE] PoNW proof failed: {e}")
+            # STEP 6: Submit PoNW proof for MY work (before forwarding)
+            self._submit_pipeline_proof(request, output, is_training, is_final=(next_hop_url is None))
             
-            # STEP 6: Build response
-            output_bytes = output.detach().cpu().numpy().astype(np.float32).tobytes()
-            output_shape = list(output.shape)
-            
-            response = neuroshard_pb2.PipelineForwardResponse(
-                request_id=request.request_id,
-                success=True,
-                hidden_states=output_bytes,
-                hidden_shape=output_shape,
-                is_final=is_final,
-            )
-            
-            # If VALIDATOR, include loss and send gradients back to DRIVER
-            if is_final and loss is not None:
-                response.loss = loss
-                logger.info(f"[VALIDATOR] ✅ Loss: {loss:.4f}")
+            # STEP 7: Route based on network topology
+            if next_hop_url:
+                # ═══════════════════════════════════════════════════════════════
+                # MULTI-HOP: Forward to next node and return THEIR response
+                # ═══════════════════════════════════════════════════════════════
+                logger.info(f"[PIPELINE] Forwarding to next hop: {next_hop_url} (layer {next_layer})")
                 
-                # Send gradients back to DRIVER for backpropagation
-                if is_training and grad_output is not None and request.sender_url:
-                    self._send_gradients_to_driver(
-                        grad_output=grad_output,
-                        sender_url=request.sender_url,
-                        session_id=request.session_id,
+                # Derive gRPC address from HTTP URL
+                parsed = urlparse(next_hop_url)
+                next_http_port = parsed.port or 8000
+                next_grpc_port = next_http_port + 1000
+                next_grpc_addr = f"{parsed.hostname}:{next_grpc_port}"
+                
+                # Serialize output for next hop
+                output_bytes = output.detach().cpu().numpy().astype(np.float32).tobytes()
+                output_shape = list(output.shape)
+                
+                # Build forward request for next hop
+                next_request = neuroshard_pb2.PipelineForwardRequest(
+                    request_id=request.request_id,
+                    session_id=request.session_id,
+                    hidden_states=output_bytes,
+                    hidden_shape=output_shape,
+                    source_shard=my_last_layer,  # My last layer
+                    sender_url=request.sender_url,  # Original DRIVER URL (for gradients)
+                    attention_mask=request.attention_mask,
+                    training_labels=request.training_labels,  # Pass through labels
+                )
+                
+                # Forward to next node
+                try:
+                    channel = get_channel(next_grpc_addr)
+                    stub = neuroshard_pb2_grpc.NeuroShardServiceStub(channel)
+                    
+                    # Call next hop and return their response directly
+                    next_response = stub.PipelineForward(next_request, timeout=60.0)
+                    
+                    logger.info(f"[PIPELINE] Next hop response: is_final={next_response.is_final}, loss={next_response.loss if next_response.is_final else 'N/A'}")
+                    return next_response
+                    
+                except Exception as e:
+                    logger.error(f"[PIPELINE] Failed to forward to {next_grpc_addr}: {e}")
+                    return neuroshard_pb2.PipelineForwardResponse(
                         request_id=request.request_id,
-                        source_shard=request.source_shard,
+                        success=False,
+                        error_message=f"Multi-hop forward failed: {e}"
                     )
             
-            return response
+            else:
+                # ═══════════════════════════════════════════════════════════════
+                # FINAL NODE (VALIDATOR): Compute loss and send gradients back
+                # ═══════════════════════════════════════════════════════════════
+                logger.info(f"[VALIDATOR] I am final node - computing loss")
+                
+                loss = None
+                grad_output = None
+                
+                if is_training and training_labels is not None and self.model.model.has_lm_head:
+                    # Save hidden states for gradient computation
+                    hidden_states_for_grad = hidden_states.clone().requires_grad_(True)
+                    output_for_loss = self.model.model.forward_my_layers(hidden_states_for_grad, attention_mask)
+                    
+                    with self.model._training_lock:
+                        self.model.optimizer.zero_grad()
+                        
+                        logits = self.model.model.compute_logits(output_for_loss)
+                        logits_flat = logits.view(-1, logits.size(-1))
+                        labels_flat = training_labels.view(-1)
+                        loss_tensor = torch.nn.functional.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
+                        
+                        loss_tensor.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.model.parameters(), 1.0)
+                        self.model.optimizer.step()
+                        
+                        loss = loss_tensor.item()
+                        grad_output = hidden_states_for_grad.grad
+                        
+                        logger.info(f"[VALIDATOR] ✅ Loss: {loss:.4f}")
+                
+                # Build response
+                output_bytes = output.detach().cpu().numpy().astype(np.float32).tobytes()
+                output_shape = list(output.shape)
+                
+                response = neuroshard_pb2.PipelineForwardResponse(
+                    request_id=request.request_id,
+                    success=True,
+                    hidden_states=output_bytes,
+                    hidden_shape=output_shape,
+                    is_final=True,
+                )
+                
+                if loss is not None:
+                    response.loss = loss
+                    
+                    # Send gradients back to DRIVER for backpropagation
+                    if grad_output is not None and request.sender_url:
+                        self._send_gradients_to_driver(
+                            grad_output=grad_output,
+                            sender_url=request.sender_url,
+                            session_id=request.session_id,
+                            request_id=request.request_id,
+                            source_shard=request.source_shard,
+                        )
+                
+                return response
             
         except Exception as e:
             logger.error(f"[PIPELINE] Error: {e}")
@@ -418,6 +465,38 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 success=False,
                 error_message=str(e)
             )
+    
+    def _submit_pipeline_proof(self, request, output, is_training: bool, is_final: bool):
+        """Submit PoNW proof for pipeline work."""
+        if not hasattr(self.model, 'ledger') or not self.model.ledger:
+            return
+        
+        try:
+            from neuroshard.core.economics.ledger import PoNWProof, sign_proof
+            import uuid
+            
+            tokens_processed = output.shape[1] if len(output.shape) > 1 else output.shape[0]
+            
+            proof = PoNWProof(
+                node_id=self.model.node_id,
+                proof_type="training" if is_training else "inference",
+                timestamp=time.time(),
+                nonce=str(uuid.uuid4()),
+                tokens_processed=tokens_processed,
+                request_id=request.request_id,
+                has_embedding=self.model.model.has_embedding,
+                has_lm_head=self.model.model.has_lm_head,
+                layers_held=len(self.model.my_layer_ids)
+            )
+            
+            signed_proof = sign_proof(proof, self.model.node_token)
+            success, reward, msg = self.model.ledger.process_proof(signed_proof)
+            
+            if success:
+                role = "VALIDATOR" if is_final else "WORKER"
+                logger.info(f"[{role}] ✅ Earned {reward:.6f} NEURO")
+        except Exception as e:
+            logger.warning(f"[PIPELINE] PoNW proof failed: {e}")
     
     def _send_gradients_to_driver(self, grad_output: torch.Tensor, sender_url: str,
                                    session_id: str, request_id: str, source_shard: int):

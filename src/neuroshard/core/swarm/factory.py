@@ -301,6 +301,10 @@ class SwarmEnabledDynamicNode:
         self.device = base_node.device
         self.available_memory_mb = base_node.available_memory_mb
         
+        # Expose training infrastructure for gRPC pipeline handlers
+        self._training_lock = base_node._training_lock
+        self.optimizer = base_node.optimizer
+        
         # Training state - sync from base node (may have been loaded from checkpoint)
         self._total_training_rounds = base_node.total_training_rounds
         # Handle None/inf loss values - default to inf for fresh start
