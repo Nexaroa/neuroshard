@@ -2370,16 +2370,32 @@ def run_node(
         pass
     
     # 5. Update P2P shard_range with actual assigned layers
+    # IMPORTANT: Only announce layer 0 if we have embedding (are actual DRIVER)
+    # Non-training nodes hold layer 0 weights for redundancy but should NOT
+    # announce it, otherwise training nodes will think a DRIVER already exists!
     layer_ids = NEURO_NODE.my_layer_ids
     if layer_ids:
-        start_layer = min(layer_ids)
-        end_layer = max(layer_ids)
+        # If we don't have embedding, skip layer 0 in announcements
+        if not NEURO_NODE.model.has_embedding and 0 in layer_ids:
+            announce_layers = [l for l in layer_ids if l > 0]
+            if announce_layers:
+                start_layer = min(announce_layers)
+                end_layer = max(announce_layers)
+            else:
+                start_layer = 1
+                end_layer = 1
+            logger.info(f"[P2P] Skipping layer 0 announcement (no embedding - redundancy only)")
+        else:
+            start_layer = min(layer_ids)
+            end_layer = max(layer_ids)
         shard_range = f"{start_layer}-{end_layer}"
     else:
         shard_range = "0-0"
+        start_layer = 0
+        end_layer = 0
     P2P.shard_range = shard_range
-    P2P.start_layer = start_layer if layer_ids else 0
-    P2P.end_layer = end_layer if layer_ids else 0
+    P2P.start_layer = start_layer
+    P2P.end_layer = end_layer
     STATE["shard_range"] = shard_range
     logger.info(f"P2P shard_range: {shard_range} (layers {layer_ids})")
     
