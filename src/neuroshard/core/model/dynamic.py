@@ -1014,6 +1014,7 @@ class DynamicNeuroNode:
                     self.model.my_layers[layer_id].load_state_dict(layer_state, strict=False)
             
             training_rounds = checkpoint.get("training_rounds", 0)
+            self.total_training_rounds = training_rounds  # Restore training counter!
             logger.info(f"Checkpoint loaded: {training_rounds} training rounds, "
                        f"{len(common_layers)}/{len(self.my_layer_ids)} layers from {checkpoint_path}")
             
@@ -1360,7 +1361,7 @@ class DynamicNeuroNode:
                 "max_seq_len": self.model.architecture.max_seq_len,
             },
             "vocab_capacity": self.model.vocab_capacity,
-            "training_rounds": getattr(self, 'training_rounds', 0),
+            "training_rounds": self.total_training_rounds,
             "timestamp": time.time()
         }
         
