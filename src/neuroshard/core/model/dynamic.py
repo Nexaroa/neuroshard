@@ -1190,18 +1190,21 @@ class DynamicNeuroNode:
         with self._training_lock:
             self.optimizer.zero_grad()
             
-            # Forward pass
+            # Forward pass - always use embed + forward_my_layers + compute_logits
+            # Do NOT use self.model(input_ids) because it already includes compute_logits
+            # when has_lm_head=True, which would cause double application
+            embeddings = self.model.embed(input_ids)
+            
             if self._use_gradient_checkpointing:
-                embeddings = self.model.embed(input_ids)
                 hidden = torch.utils.checkpoint.checkpoint(
                     self.model.forward_my_layers,
                     embeddings,
                     use_reentrant=False
                 )
             else:
-                hidden = self.model(input_ids)
+                hidden = self.model.forward_my_layers(embeddings)
             
-            logits = self.model.compute_logits(hidden) if not isinstance(hidden, tuple) else hidden
+            logits = self.model.compute_logits(hidden)
             
             # Compute loss
             logits_flat = logits.view(-1, logits.size(-1))
