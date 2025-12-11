@@ -66,6 +66,7 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
         
         # Detect if this is a DynamicNeuroNode
         self.is_dynamic_node = hasattr(model, 'my_layer_ids') and hasattr(model, 'layer_pool')
+        self.is_neuro_node = self.is_dynamic_node  # Alias for legacy compatibility
         
         # Rate limiter for gradient gossip (per-node)
         # Allows max 1 gossip per node per 60 seconds (DiLoCo sync is every ~8-10 min)
@@ -120,88 +121,6 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
         except Exception as e:
             logger.error(f"GetWeights error: {e}")
             return neuroshard_pb2.WeightResponse(weights_data=b"")
-
-    def GetTrainingStatus(self, request, context):
-        """Get training status."""
-        stats = self.model.get_stats()
-        
-        return neuroshard_pb2.TrainingStatusResponse(
-            training_enabled=self.model.enable_training,
-            total_rounds=stats.get("total_training_rounds", 0),
-            current_loss=stats.get("current_loss", float('inf')),
-            tokens_processed=stats.get("total_tokens_processed", 0),
-        )
-
-    def GetPoNWProof(self, request, context):
-        """Get Proof of Neural Work."""
-        proof = self.model.get_ponw_proof()
-        
-        return neuroshard_pb2.PoNWProofResponse(
-            node_id=proof.get("node_id", ""),
-            timestamp=proof.get("timestamp", 0),
-            tokens_processed=proof.get("tokens_processed", 0),
-            training_rounds=proof.get("training_rounds", 0),
-            signature=proof.get("signature", ""),
-        )
-
-    # ==================== LAYER-SPECIFIC FORWARD ====================
-    
-    def LayerForward(self, request, context):
-        """
-        Forward hidden states through specific layers on this node.
-        
-        This enables distributed inference:
-        1. Request comes with hidden states
-        2. We process through our assigned layers
-        3. Return processed hidden states
-        """
-        try:
-            # Deserialize input
-            input_str = request.tensor_data.decode('utf-8')
-            hidden_states = deserialize_tensor(input_str)
-            
-            # Check if we have the requested layers
-            requested_layers = list(request.layer_ids)
-            my_layers = set(self.model.my_layer_ids)
-            
-            if not all(l in my_layers for l in requested_layers):
-                missing = set(requested_layers) - my_layers
-                return neuroshard_pb2.LayerForwardResponse(
-                    success=False,
-                    error_message=f"Missing layers: {missing}"
-                )
-            
-            # Forward through requested layers
-            output = self.model.model.forward_my_layers(
-                hidden_states,
-                start_layer=min(requested_layers),
-                end_layer=max(requested_layers) + 1
-            )
-            
-            return neuroshard_pb2.LayerForwardResponse(
-                success=True,
-                tensor_data=serialize_tensor(output).encode('utf-8')
-            )
-            
-        except Exception as e:
-            logger.error(f"LayerForward error: {e}")
-            return neuroshard_pb2.LayerForwardResponse(
-                success=False,
-                error_message=str(e)
-            )
-    
-    def GetNodeInfo(self, request, context):
-        """Get information about this node's capabilities."""
-        stats = self.model.get_stats()
-        
-        return neuroshard_pb2.NodeInfoResponse(
-            node_id=self.model.node_id,
-            layer_ids=self.model.my_layer_ids,
-            has_embedding=self.model.model.has_embedding if self.model.model else False,
-            has_lm_head=self.model.model.has_lm_head if self.model.model else False,
-            available_memory_mb=int(self.model.available_memory_mb),
-            total_params=stats.get("my_params", 0),
-        )
 
     # ==================== DISTRIBUTED TRAINING RPCs ====================
     
@@ -363,132 +282,107 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
     
     def PipelineForward(self, request, context):
         """
-        PRODUCTION-READY Pipeline Forward with:
-        - Secure activation transfer (differential privacy + encryption)
-        - PoNW proof submission for marketplace rewards
-        - Full error handling and logging
+        Pipeline Forward for distributed training and inference.
         
-        Used for distributed inference: Driver → Workers → Validator
+        Flow:
+        1. DRIVER sends hidden states + labels to WORKER/VALIDATOR
+        2. Node processes through its layers
+        3. If VALIDATOR (has LM head): compute loss, send gradients back
+        4. Return response with output/loss
+        
+        Used for: Driver → Workers → Validator pipeline
         """
-        if not hasattr(self.model, 'forward_pipeline') and not hasattr(self.model, 'forward'):
-             return neuroshard_pb2.PipelineForwardResponse(
+        if not hasattr(self.model, 'forward_pipeline'):
+            return neuroshard_pb2.PipelineForwardResponse(
                 success=False,
-                error_message="Node does not support forward pass"
+                error_message="Node does not support forward_pipeline"
             )
         
         try:
             import numpy as np
             import hashlib
             
-            logger.info(f"[WORKER/VALIDATOR] Received pipeline forward for request {request.request_id[:8]}...")
+            logger.info(f"[PIPELINE] Received forward request {request.request_id[:8]}... from {request.sender_url}")
             
-            # STEP 1: Validate checksum of received activations
-            received_checksum = hashlib.sha256(request.hidden_states).hexdigest()
-            logger.info(f"[SECURITY] Received activations checksum: {received_checksum[:16]}...")
-            
-            # Deserialize hidden states (detect dtype from shape)
-            # 2D = input_ids (int64), 3D = hidden_states (float32)
-            if len(request.hidden_shape) == 2:
-                dtype = np.int64
-                logger.info(f"[WORKER] Detected input_ids (2D shape), deserializing as int64")
-            else:
-                dtype = np.float32
-            
+            # STEP 1: Deserialize hidden states
+            # 3D = hidden_states (float32), shape: [batch, seq_len, hidden_dim]
             hidden_states = torch.from_numpy(
-                np.frombuffer(request.hidden_states, dtype=dtype).copy()  # .copy() makes it writable
+                np.frombuffer(request.hidden_states, dtype=np.float32).copy()
             ).reshape(list(request.hidden_shape))
             
-            # CRITICAL: Move tensors to the same device as the model!
-            # EC2 (CPU) sends tensors, Jetson (CUDA) needs them on GPU
-            model_device = getattr(self.model, 'device', 'cpu')
-            if hasattr(self.model, 'model') and hasattr(self.model.model, 'device'):
-                model_device = self.model.model.device
+            # Move to model device
+            model_device = self.model.device if hasattr(self.model, 'device') else 'cpu'
             hidden_states = hidden_states.to(model_device)
             
-            logger.info(f"[WORKER/VALIDATOR] Loaded activations: {hidden_states.shape} {hidden_states.dtype} on {hidden_states.device}")
+            logger.info(f"[PIPELINE] Hidden states: {hidden_states.shape} on {hidden_states.device}")
             
-            # STEP 2: Process through our layers
-            # Deserialize attention mask if provided
+            # STEP 2: Deserialize attention mask (optional)
             attention_mask = None
             if request.attention_mask:
                 attention_mask = torch.from_numpy(
                     np.frombuffer(request.attention_mask, dtype=np.float32).copy()
                 ).to(model_device)
             
-            # Training Labels (if provided)
+            # STEP 3: Deserialize training labels (for training mode)
             training_labels = None
+            is_training = False
             if request.training_labels:
+                # Labels shape is [batch, seq_len]
+                batch_size = request.hidden_shape[0]
+                seq_len = request.hidden_shape[1]
                 training_labels = torch.from_numpy(
                     np.frombuffer(request.training_labels, dtype=np.int64).copy()
-                ).to(model_device)
+                ).reshape(batch_size, seq_len).to(model_device)
+                is_training = True
+                logger.info(f"[PIPELINE] Training mode: labels shape {training_labels.shape}")
             
-            # Forward through our layers
-            if hasattr(self.model, 'forward_pipeline'):
-                output, new_kv = self.model.forward_pipeline(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    training_labels=training_labels,
-                    session_id=request.session_id,
-                    sender_url=request.sender_url,
-                    use_cache=request.use_cache,
-                )
-                
-                is_final = self.model.model.has_lm_head if hasattr(self.model, 'model') else False
-            else:
-                # Legacy fallback
-                output = self.model.forward(hidden_states)
-                new_kv = None
-                is_final = True
+            # STEP 4: Forward through our layers
+            output, loss, grad_output = self.model.forward_pipeline(
+                hidden_states=hidden_states,
+                session_id=request.session_id,
+                source_layer=request.source_shard,
+                is_training=is_training,
+                labels=training_labels,
+                attention_mask=attention_mask,
+            )
             
-            logger.info(f"[WORKER/VALIDATOR] Processed through layers: output shape {output.shape}, is_final={is_final}")
+            # Determine if we're the final node (VALIDATOR with LM head)
+            is_final = self.model.model.has_lm_head
             
-            # STEP 3: Submit PoNW proof for this work (earn NEURO!)
-            if hasattr(self.model, 'ledger') and self.model.ledger and request.request_id:
+            logger.info(f"[PIPELINE] Processed: output={output.shape}, is_final={is_final}, loss={loss}")
+            
+            # STEP 5: Submit PoNW proof for this work
+            if hasattr(self.model, 'ledger') and self.model.ledger:
                 try:
                     from neuroshard.core.economics.ledger import PoNWProof, sign_proof
                     import uuid
                     
-                    # Count tokens processed
                     tokens_processed = output.shape[1] if len(output.shape) > 1 else output.shape[0]
                     
-                    # Determine our role
-                    has_embedding = self.model.model.has_embedding if hasattr(self.model, 'model') else False
-                    has_lm_head = self.model.model.has_lm_head if hasattr(self.model, 'model') else False
-                    layers_held = len(self.model.my_layer_ids) if hasattr(self.model, 'my_layer_ids') else 1
-                    
                     proof = PoNWProof(
-                        node_id=self.model.node_id if hasattr(self.model, 'node_id') else "unknown",
-                        proof_type="inference",
+                        node_id=self.model.node_id,
+                        proof_type="training" if is_training else "inference",
                         timestamp=time.time(),
                         nonce=str(uuid.uuid4()),
                         tokens_processed=tokens_processed,
                         request_id=request.request_id,
-                        has_embedding=has_embedding,
-                        has_lm_head=has_lm_head,
-                        layers_held=layers_held
+                        has_embedding=self.model.model.has_embedding,
+                        has_lm_head=self.model.model.has_lm_head,
+                        layers_held=len(self.model.my_layer_ids)
                     )
                     
-                    # Sign and submit
-                    signed_proof = sign_proof(proof, self.model.node_token if hasattr(self.model, 'node_token') else "")
+                    signed_proof = sign_proof(proof, self.model.node_token)
                     success, reward, msg = self.model.ledger.process_proof(signed_proof)
                     
                     if success:
-                        role = "VALIDATOR" if has_lm_head else ("DRIVER" if has_embedding else "WORKER")
-                        pct = "15%" if (has_lm_head or has_embedding) else "70%"
-                        logger.info(f"[{role}] ✅ Proof submitted, earned {reward:.6f} NEURO ({pct} of pool)")
-                    else:
-                        logger.warning(f"[WORKER/VALIDATOR] ⚠️ Proof rejected: {msg}")
-                        
+                        role = "VALIDATOR" if is_final else "WORKER"
+                        logger.info(f"[{role}] ✅ Earned {reward:.6f} NEURO")
                 except Exception as e:
-                    logger.error(f"[WORKER/VALIDATOR] Failed to submit proof: {e}")
+                    logger.warning(f"[PIPELINE] PoNW proof failed: {e}")
             
-            # STEP 4: Serialize output and calculate checksum
-            output_bytes = output.detach().cpu().numpy().tobytes()
+            # STEP 6: Build response
+            output_bytes = output.detach().cpu().numpy().astype(np.float32).tobytes()
             output_shape = list(output.shape)
-            
-            # Calculate checksum for integrity verification
-            output_checksum = hashlib.sha256(output_bytes).hexdigest()
-            logger.info(f"[SECURITY] Sending output with checksum: {output_checksum[:16]}...")
             
             response = neuroshard_pb2.PipelineForwardResponse(
                 request_id=request.request_id,
@@ -498,20 +392,25 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 is_final=is_final,
             )
             
-            # If final (validator), return logits
-            if is_final:
-                response.logits = output_bytes
-                response.logits_shape = output_shape
+            # If VALIDATOR, include loss and send gradients back to DRIVER
+            if is_final and loss is not None:
+                response.loss = loss
+                logger.info(f"[VALIDATOR] ✅ Loss: {loss:.4f}")
                 
-                if hasattr(self.model, 'current_loss'):
-                    response.loss = self.model.current_loss
-                
-                logger.info(f"[VALIDATOR] ✅ Final output generated, returning logits")
+                # Send gradients back to DRIVER for backpropagation
+                if is_training and grad_output is not None and request.sender_url:
+                    self._send_gradients_to_driver(
+                        grad_output=grad_output,
+                        sender_url=request.sender_url,
+                        session_id=request.session_id,
+                        request_id=request.request_id,
+                        source_shard=request.source_shard,
+                    )
             
             return response
             
         except Exception as e:
-            logger.error(f"[WORKER/VALIDATOR] Pipeline error: {e}")
+            logger.error(f"[PIPELINE] Error: {e}")
             import traceback
             traceback.print_exc()
             return neuroshard_pb2.PipelineForwardResponse(
@@ -519,6 +418,48 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 success=False,
                 error_message=str(e)
             )
+    
+    def _send_gradients_to_driver(self, grad_output: torch.Tensor, sender_url: str,
+                                   session_id: str, request_id: str, source_shard: int):
+        """Send gradients back to DRIVER for distributed backpropagation."""
+        try:
+            import numpy as np
+            from neuroshard.core.network.connection_pool import get_channel
+            from urllib.parse import urlparse
+            
+            # Parse sender URL and derive gRPC address
+            parsed = urlparse(sender_url)
+            sender_http_port = parsed.port or 8000
+            sender_grpc_port = sender_http_port + 1000
+            sender_grpc_addr = f"{parsed.hostname}:{sender_grpc_port}"
+            
+            logger.info(f"[VALIDATOR] Sending gradients to DRIVER at {sender_grpc_addr}")
+            
+            # Serialize gradient
+            grad_bytes = grad_output.detach().cpu().numpy().astype(np.float32).tobytes()
+            grad_shape = list(grad_output.shape)
+            
+            # Send PipelineBackward request
+            channel = get_channel(sender_grpc_addr)
+            stub = neuroshard_pb2_grpc.NeuroShardServiceStub(channel)
+            
+            backward_request = neuroshard_pb2.PipelineBackwardRequest(
+                session_id=session_id,
+                request_id=request_id,
+                grad_output=grad_bytes,
+                grad_shape=grad_shape,
+                target_shard=source_shard,
+            )
+            
+            backward_response = stub.PipelineBackward(backward_request, timeout=30)
+            
+            if backward_response.success:
+                logger.info(f"[VALIDATOR] ✅ Gradients sent to DRIVER successfully")
+            else:
+                logger.warning(f"[VALIDATOR] ⚠️ DRIVER rejected gradients: {backward_response.error_message}")
+                
+        except Exception as e:
+            logger.warning(f"[VALIDATOR] Failed to send gradients to DRIVER: {e}")
 
     def PipelineBackward(self, request, context):
         """
@@ -583,84 +524,29 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             )
     
     def GetShardInfo(self, request, context):
-        """Get shard information from this node."""
-        if not self.is_neuro_node:
-            return neuroshard_pb2.GetShardInfoResponse()
-        
+        """Get shard/layer information from this node."""
         try:
-            if hasattr(self.model, 'get_shard_info'):
-                info = self.model.get_shard_info()
-            else:
-                # Regular NeuroNode - full model
-                info = {
-                    "shard_id": 0,
-                    "total_shards": 1,
-                    "start_layer": 0,
-                    "end_layer": self.model.model.config.num_layers if self.model.model else 12,
-                    "has_embedding": True,
-                    "has_lm_head": True,
-                    "version": self.model.total_training_rounds,
-                    "model_hash": self.model._get_model_hash() if hasattr(self.model, '_get_model_hash') else "",
-                }
+            # Get layer range
+            layer_ids = self.model.my_layer_ids if hasattr(self.model, 'my_layer_ids') else []
+            start_layer = min(layer_ids) if layer_ids else 0
+            end_layer = max(layer_ids) + 1 if layer_ids else 0
             
             return neuroshard_pb2.GetShardInfoResponse(
-                shard_id=info.get("shard_id", 0),
-                total_shards=info.get("total_shards", 1),
-                start_layer=info.get("start_layer", 0),
-                end_layer=info.get("end_layer", 12),
-                has_embedding=info.get("has_embedding", True),
-                has_lm_head=info.get("has_lm_head", True),
-                version=info.get("version", 0),
-                model_hash=info.get("model_hash", ""),
-                available_memory_mb=info.get("available_memory_mb", 0),
-                current_load=info.get("current_load", 0),
+                shard_id=start_layer,  # Use start layer as shard ID
+                total_shards=self.model.model.architecture.num_layers if hasattr(self.model.model, 'architecture') else 11,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                has_embedding=self.model.model.has_embedding,
+                has_lm_head=self.model.model.has_lm_head,
+                version=getattr(self.model, 'total_training_rounds', 0),
+                model_hash=self.model._get_model_hash() if hasattr(self.model, '_get_model_hash') else "",
+                available_memory_mb=int(self.model.available_memory_mb) if hasattr(self.model, 'available_memory_mb') else 0,
+                current_load=0,
             )
             
         except Exception as e:
             logger.error(f"GetShardInfo error: {e}")
             return neuroshard_pb2.GetShardInfoResponse()
-
-    def _call_peer(self, peer_url, original_req, output_tensor):
-        """Call a peer node (legacy pipeline relay)."""
-        from urllib.parse import urlparse
-        from neuroshard.core.network.connection_pool import get_channel
-
-        parsed = urlparse(peer_url)
-        peer_ip = parsed.hostname
-        peer_http_port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-        peer_grpc_addr = f"{peer_ip}:{peer_http_port + 1000}"
-        
-        channel = get_channel(peer_grpc_addr)
-        stub = neuroshard_pb2_grpc.NeuroShardServiceStub(channel)
-        
-        fwd_req = neuroshard_pb2.InferenceRequest(
-            session_id=original_req.session_id,
-            request_id=original_req.request_id,
-            tensor_data=serialize_tensor(output_tensor).encode('utf-8'),
-            draft_tokens=original_req.draft_tokens,
-            sender_reputation=original_req.sender_reputation,
-            source_layer=getattr(self.model, 'end', 0)
-        )
-        
-        return stub.UnaryInference(fwd_req)
-
-    def _perform_audit(self, primary_peer, original_req, output_tensor):
-        """Audit a peer by comparing with redundant peer."""
-        redundant_peer = self.p2p.get_redundant_hop(getattr(self.model, 'end', 0), primary_peer)
-        if not redundant_peer:
-            return
-            
-        logger.debug(f"AUDITING: Checking {primary_peer} against {redundant_peer}...")
-        
-        try:
-            res_redundant = self._call_peer(redundant_peer, original_req, output_tensor)
-            
-            if res_redundant.success:
-                logger.debug(f"AUDIT: Redundant peer {redundant_peer} responded successfully.")
-            else:
-                logger.warning(f"AUDIT: Redundant peer {redundant_peer} failed: {res_redundant.error_message}")
-        except Exception as e:
-            logger.warning(f"Audit error: {e}")
     
     # ==================== SWARM RPCs (Phase 4) ====================
     
@@ -701,23 +587,24 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             inbound = getattr(self.model, 'swarm_components', None)
             inbound = inbound.inbound_buffer if inbound else None
             if inbound:
-                success = inbound.put_nowait(packet)
-                if success:
+                queue_success = inbound.put_nowait(packet)
+                if queue_success:
                     return neuroshard_pb2.SwarmForwardResponse(
+                        request_id=request.request_id,
                         success=True,
-                        queued=True,
-                        queue_position=len(inbound),
-                        buffer_fill_rate=inbound.fill_rate,
+                        buffer_depth=len(inbound),
                     )
                 else:
                     # Buffer full - backpressure
                     return neuroshard_pb2.SwarmForwardResponse(
+                        request_id=request.request_id,
                         success=False,
                         error_message="Inbound buffer full (backpressure)",
-                        buffer_fill_rate=1.0,
+                        buffer_depth=inbound.capacity if hasattr(inbound, 'capacity') else 0,
                     )
             else:
                 return neuroshard_pb2.SwarmForwardResponse(
+                    request_id=request.request_id,
                     success=False,
                     error_message="Inbound buffer not initialized"
                 )
@@ -725,6 +612,7 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
         except Exception as e:
             logger.error(f"SwarmForward error: {e}")
             return neuroshard_pb2.SwarmForwardResponse(
+                request_id=request.request_id if hasattr(request, 'request_id') else "",
                 success=False,
                 error_message=str(e)
             )
@@ -800,35 +688,13 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 
                 router.update_peer_from_heartbeat(capacity)
                 
-                return neuroshard_pb2.UpdatePeerCapacityResponse(accepted=True)
+                return neuroshard_pb2.UpdatePeerCapacityResponse(success=True)
             
-            return neuroshard_pb2.UpdatePeerCapacityResponse(accepted=False)
+            return neuroshard_pb2.UpdatePeerCapacityResponse(success=False)
             
         except Exception as e:
             logger.error(f"UpdatePeerCapacity error: {e}")
-            return neuroshard_pb2.UpdatePeerCapacityResponse(accepted=False)
-    
-    def GetDiLoCoStatus(self, request, context):
-        """
-        Get DiLoCo training status.
-        
-        Returns inner step count, sync progress, etc.
-        """
-        try:
-            progress = self.model.get_diloco_progress()
-            
-            return neuroshard_pb2.DiLoCoStatusResponse(
-                enabled=progress.get("enabled", False),
-                inner_step_count=progress.get("inner_step_count", 0),
-                inner_steps_total=progress.get("inner_steps_total", 500),
-                progress=progress.get("progress", 0.0),
-                outer_step_count=progress.get("outer_step_count", 0),
-                should_sync=progress.get("should_sync", False),
-            )
-                
-        except Exception as e:
-            logger.error(f"GetDiLoCoStatus error: {e}")
-            return neuroshard_pb2.DiLoCoStatusResponse(enabled=False)
+            return neuroshard_pb2.UpdatePeerCapacityResponse(success=False, error_message=str(e))
 
 
 def serve_grpc(port: int, model, p2p: P2PManager, swap_controller=None):

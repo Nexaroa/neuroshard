@@ -1222,8 +1222,11 @@ class DynamicNeuroNode:
     def _train_step_distributed(self, input_ids: torch.Tensor, labels: torch.Tensor, 
                                 next_hop_url: str) -> Optional[float]:
         """Execute distributed training step (pipeline mode)."""
-        # Embed and forward through my layers
+        import numpy as np
+        
+        # Embed and forward through my layers (with gradient tracking for backprop)
         embeddings = self.model.embed(input_ids)
+        embeddings.requires_grad_(True)  # Enable gradient tracking
         
         if self._use_gradient_checkpointing:
             hidden = torch.utils.checkpoint.checkpoint(
@@ -1234,13 +1237,15 @@ class DynamicNeuroNode:
         else:
             hidden = self.model.forward_my_layers(embeddings)
         
+        # Keep hidden attached to computation graph for backward pass
+        hidden.retain_grad()
+        
         # Forward to next node via gRPC
         try:
             from neuroshard.core.network.connection_pool import get_channel
             from urllib.parse import urlparse
             import neuroshard.protos.neuroshard_pb2 as pb2
             import neuroshard.protos.neuroshard_pb2_grpc as pb2_grpc
-            from neuroshard.utils.serialization import serialize_tensor, deserialize_tensor
             
             # Parse HTTP URL and derive gRPC address (HTTP port + 1000)
             parsed = urlparse(next_hop_url)
@@ -1249,43 +1254,72 @@ class DynamicNeuroNode:
             grpc_addr = f"{parsed.hostname}:{grpc_port}"
             
             channel = get_channel(grpc_addr)
-            stub = pb2_grpc.NeuroShardStub(channel)
+            stub = pb2_grpc.NeuroShardServiceStub(channel)
             
-            # Serialize and send
+            # Serialize tensors as raw numpy bytes (matching gRPC handler expectations)
+            # NOTE: We detach for serialization but keep original for backward
+            hidden_np = hidden.detach().cpu().numpy()
+            hidden_bytes = hidden_np.astype(np.float32).tobytes()
+            hidden_shape = list(hidden_np.shape)
+            
+            labels_np = labels.cpu().numpy()
+            labels_bytes = labels_np.astype(np.int64).tobytes()
+            
+            # Build request with correct proto fields
             session_id = f"train_{self.node_id}_{time.time()}"
+            
+            # Get my actual URL for gradient routing (DRIVER's address)
+            my_ip = "localhost"  # Will be resolved by peer
+            if hasattr(self, 'p2p_manager') and self.p2p_manager:
+                my_ip = self.p2p_manager.my_url.replace("http://", "").split(":")[0]
+            my_url = f"http://{my_ip}:{self.port}"
+            
+            # Save activation for backward pass (CRITICAL for distributed training!)
+            if not hasattr(self, '_pending_activations'):
+                self._pending_activations = {}
+            self._pending_activations[session_id] = (hidden, embeddings)
+            
+            # Clean up old activations (older than 5 minutes)
+            import time as time_module
+            stale = [k for k, v in self._pending_activations.items() 
+                    if time_module.time() - float(k.split('_')[-1]) > 300]
+            for k in stale:
+                del self._pending_activations[k]
             
             request = pb2.PipelineForwardRequest(
                 session_id=session_id,
-                hidden_states=serialize_tensor(hidden),
-                source_node_id=self.node_id,
-                source_layer=max(self.my_layer_ids),
-                is_training=True,
-                training_labels=serialize_tensor(labels)
+                request_id=f"train_{time.time()}",
+                hidden_states=hidden_bytes,
+                hidden_shape=hidden_shape,
+                source_shard=max(self.my_layer_ids),  # Correct proto field
+                training_labels=labels_bytes,
+                sender_url=my_url,  # For backward pass routing to DRIVER
             )
+            
+            logger.info(f"[DRIVER] Sending activations to VALIDATOR at {grpc_addr} (session={session_id[:20]}...)")
             
             response = stub.PipelineForward(request, timeout=60)
             
             if response.success:
-                # Get gradients and update
-                if response.grad_output:
-                    grad = deserialize_tensor(response.grad_output).to(self.device)
-                    
-                    with self._training_lock:
-                        self.optimizer.zero_grad()
-                        hidden.backward(grad)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                        self.optimizer.step()
-                    
-                    self.current_loss = response.loss if response.loss else None
+                # Get loss from response
+                # Note: Gradients will arrive asynchronously via backward_pipeline
+                if response.loss:
+                    self.current_loss = response.loss
+                    logger.info(f"[DRIVER] Distributed training step: loss={response.loss:.4f}")
                     return self.current_loss
                 
-                return response.loss if response.loss else None
+                return None
             else:
                 logger.warning(f"Pipeline forward failed: {response.error_message}")
+                # Clean up pending activation on failure
+                if session_id in self._pending_activations:
+                    del self._pending_activations[session_id]
                 return None
                 
         except Exception as e:
             logger.warning(f"Distributed training error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return None
     
     def save_checkpoint(self):
@@ -1346,6 +1380,10 @@ class DynamicNeuroNode:
         if labels is not None:
             labels = labels.to(self.device)
         
+        # Enable gradient tracking for training (needed to compute grad_output for DRIVER)
+        if is_training:
+            hidden_states = hidden_states.clone().requires_grad_(True)
+        
         # Forward through my layers
         output = self.model.forward_my_layers(hidden_states, attention_mask)
         
@@ -1377,18 +1415,60 @@ class DynamicNeuroNode:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 
-                # Return gradients for backward pass
-                grad_output = hidden_states.grad if hidden_states.requires_grad else None
+                # Return gradients for backward pass to DRIVER
+                grad_output = hidden_states.grad if hidden_states.grad is not None else None
+                
+                if grad_output is not None:
+                    logger.info(f"[VALIDATOR] Computed gradients for DRIVER (shape={grad_output.shape})")
+                else:
+                    logger.warning(f"[VALIDATOR] No gradients computed for DRIVER (requires_grad={hidden_states.requires_grad})")
+                
                 return output, loss.item(), grad_output
         
         return output, None, None
     
     def backward_pipeline(self, grad_output: torch.Tensor, session_id: str) -> Optional[torch.Tensor]:
         """
-        Handle incoming gradient for backward pass.
+        Handle incoming gradient for backward pass from VALIDATOR.
+        
+        This is called when the VALIDATOR sends gradients back to the DRIVER
+        after computing the loss. The DRIVER uses these gradients to update
+        its embedding and early layers.
         """
-        # This would be called if we're not the last node but received gradients
-        # For now, this is handled inline in forward_pipeline
+        if not hasattr(self, '_pending_activations'):
+            self._pending_activations = {}
+        
+        # Look up the saved activation for this session
+        if session_id not in self._pending_activations:
+            logger.warning(f"[DRIVER] No pending activation found for session {session_id[:16]}...")
+            return None
+        
+        saved_hidden, saved_embeddings = self._pending_activations.pop(session_id)
+        
+        try:
+            grad_output = grad_output.to(self.device)
+            
+            with self._training_lock:
+                self.optimizer.zero_grad()
+                
+                # Backward through the saved hidden states
+                # The gradients will flow back through my layers and embeddings
+                if saved_hidden.requires_grad:
+                    saved_hidden.backward(grad_output)
+                    
+                    # Clip gradients and update
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optimizer.step()
+                    
+                    logger.info(f"[DRIVER] ✅ Applied gradients from VALIDATOR (session={session_id[:16]}...)")
+                else:
+                    logger.warning(f"[DRIVER] Saved activation doesn't require grad - cannot backprop")
+                    
+        except Exception as e:
+            logger.error(f"[DRIVER] Backward pipeline error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        
         return None
     
     def stop(self):
