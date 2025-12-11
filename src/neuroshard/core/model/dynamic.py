@@ -1123,22 +1123,16 @@ class DynamicNeuroNode:
         3. VALIDATOR: Receive → forward → loss → backward → send grads
         4. Everyone updates their weights
         
-        SPECIAL CASE: If DRIVER has LM head (temporary or permanent), train locally.
-        This handles the case where the DRIVER is the only training node in the network.
+        KEY DESIGN: Check for next_hop FIRST before deciding to train locally.
+        If another node has layers after ours, use distributed training.
+        Only train locally if we're truly a full node (no next_hop exists).
         """
         if not self.enable_training or not self.model:
             return None
         
         try:
-            # If we have both embedding AND LM head, we can train locally
-            # This is the "full node" or "solo driver" case
-            if self.model.has_embedding and self.model.has_lm_head:
-                input_ids, labels = self._get_training_batch()
-                if input_ids is None:
-                    return None
-                return self._train_step_local(input_ids, labels)
-            
-            # Check if there's a next hop (another node with higher layers)
+            # STEP 1: Check if there's a next hop (another node with higher layers)
+            # This is the KEY check - if someone else has layers after us, use pipeline!
             my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
             next_layer = my_last_layer + 1
             
@@ -1148,23 +1142,35 @@ class DynamicNeuroNode:
                 next_hop_url = self.p2p_manager.get_next_hop(next_layer)
                 if next_hop_url:
                     has_next_hop = True
+                    logger.debug(f"[PIPELINE] Found next hop for layer {next_layer}: {next_hop_url}")
             
-            if self.model.has_embedding:
-                # I am DRIVER without LM head - need to forward to Validator
+            # STEP 2: Decide training mode based on role and network state
+            if not self.model.has_embedding:
+                # WORKER: No embedding = wait for activations via gRPC
+                # Training happens reactively in forward_pipeline/backward_pipeline
+                return None
+            
+            # I am DRIVER (has embedding)
+            if has_next_hop:
+                # DISTRIBUTED TRAINING: Another node has layers after mine
+                # Forward to them, even if I have a temporary LM head!
                 input_ids, labels = self._get_training_batch()
                 if input_ids is None:
                     return None
-                
-                if has_next_hop:
-                    # Distributed training - forward to next node
-                    return self._train_step_distributed(input_ids, labels, next_hop_url)
-                else:
-                    # No next hop and no LM head - can't train yet
-                    logger.debug("DRIVER has no LM head and no next hop - waiting for Validator")
+                logger.debug(f"[PIPELINE] DRIVER forwarding to {next_hop_url} (distributed mode)")
+                return self._train_step_distributed(input_ids, labels, next_hop_url)
+            
+            elif self.model.has_lm_head:
+                # LOCAL TRAINING: I have embedding + LM head AND no next hop
+                # This means I'm truly a full node (solo or no other nodes have higher layers)
+                input_ids, labels = self._get_training_batch()
+                if input_ids is None:
                     return None
+                return self._train_step_local(input_ids, labels)
+            
             else:
-                # I am WORKER/VALIDATOR - wait for data via gRPC
-                # Training happens when PipelineForward is called
+                # DRIVER with no LM head and no next hop - can't train yet
+                logger.debug("DRIVER has no LM head and no next hop - waiting for Validator")
                 return None
                 
         except Exception as e:

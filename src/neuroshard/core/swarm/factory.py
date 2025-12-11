@@ -641,9 +641,12 @@ class SwarmEnabledDynamicNode:
         Execute a training step with DiLoCo lazy gradient sync.
         
         Supports both local and distributed training:
-        - Full nodes (embedding + LM head): Train locally with DiLoCo
-        - Partial nodes (embedding only): Use pipeline training to Validator
+        - Full nodes (embedding + LM head + NO next_hop): Train locally with DiLoCo
+        - DRIVER with next_hop: Use pipeline training (forward to next node)
         - Workers (no embedding): Wait for activations via gRPC
+        
+        KEY DESIGN: Check for next_hop FIRST before deciding to train locally.
+        If another node has layers after ours, use distributed training.
         
         Returns loss value or None if no data available.
         """
@@ -654,27 +657,40 @@ class SwarmEnabledDynamicNode:
         if not hasattr(self, '_global_tracker') or self._global_tracker is None:
             self._init_global_tracker()
         
-        # Check if we can do LOCAL training (need embedding + LM head)
-        # DYNAMIC CHECK: Use layer_pool to get CURRENT lm_head_holder
-        # This handles the case where a new Validator joined and took over the LM head
-        am_current_validator = self.model.has_lm_head
-        if hasattr(self.base_node, 'layer_pool') and self.base_node.layer_pool:
-            am_current_validator = (self.base_node.layer_pool.lm_head_holder == self.base_node.node_id)
+        # STEP 1: Check if there's a next hop (another node with higher layers)
+        # This is THE KEY check - if someone else has layers after us, use pipeline!
+        my_last_layer = max(self.base_node.my_layer_ids) if self.base_node.my_layer_ids else 0
+        next_layer = my_last_layer + 1
         
-        is_full_node = self.model.has_embedding and am_current_validator
+        has_next_hop = False
+        if hasattr(self.base_node, 'p2p_manager') and self.base_node.p2p_manager:
+            next_hop_url = self.base_node.p2p_manager.get_next_hop(next_layer)
+            if next_hop_url:
+                has_next_hop = True
+                logger.debug(f"[SWARM] Found next hop for layer {next_layer}: {next_hop_url}")
         
+        # STEP 2: Decide training mode based on role and network state
         if not self.model.has_embedding:
             # WORKER: No embedding = wait for activations via gRPC
             # Training happens reactively in forward_pipeline/backward_pipeline
             return None
         
-        if not is_full_node:
-            # DISTRIBUTED TRAINING: Has embedding but no LM head
-            # OR: We WERE a full node but new Validator took over → use pipeline!
-            # Use pipeline training - forward to Validator, receive gradients back
+        # I am DRIVER (has embedding)
+        if has_next_hop:
+            # DISTRIBUTED TRAINING: Another node has layers after mine
+            # Forward to them via base_node.train_step() which handles the pipeline
+            # Even if I have a temporary LM head, use distributed mode!
+            logger.debug(f"[SWARM] DRIVER using distributed training (next_hop exists)")
             return self.base_node.train_step()
         
-        # LOCAL TRAINING: Full node with embedding + LM head
+        # No next_hop - check if we can do local training
+        if not self.model.has_lm_head:
+            # DRIVER with no next_hop and no LM head - can't train yet
+            logger.debug("[SWARM] DRIVER has no LM head and no next hop - waiting for Validator")
+            return None
+        
+        # LOCAL TRAINING: Full node with embedding + LM head + NO next_hop
+        # This means we're truly solo (no other nodes have layers after us)
         diloco = self.swarm_components.diloco_trainer
         
         # Get training data
