@@ -303,7 +303,7 @@ class SwarmEnabledDynamicNode:
         
         # Expose training infrastructure for gRPC pipeline handlers
         self._training_lock = base_node._training_lock
-        self.optimizer = base_node.optimizer
+        # NOTE: optimizer is accessed via @property (line ~1144) which returns base_node.optimizer
         
         # Training state - sync from base node (may have been loaded from checkpoint)
         self._total_training_rounds = base_node.total_training_rounds
