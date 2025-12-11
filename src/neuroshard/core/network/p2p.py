@@ -28,11 +28,12 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 class P2PManager:
-    def __init__(self, my_url: str, shard_range: str, tracker_url: str = "http://localhost:3000", node_token: Optional[str] = None):
+    def __init__(self, my_url: str, shard_range: str, tracker_url: str = "http://localhost:3000", node_token: Optional[str] = None, training_enabled: bool = True):
         self.my_url = my_url
         self.shard_range = shard_range
         self.tracker_url = tracker_url
         self.node_token = node_token
+        self.training_enabled = training_enabled  # Whether this node participates in training pipeline
         self.known_peers: Dict[str, dict] = {} # url -> info
         self.running = True
         self._stop_event = threading.Event()  # For interruptible sleeps
@@ -815,7 +816,8 @@ class P2PManager:
                 "shard_range": self.shard_range,
                 "tps": self.current_tps,
                 "latency": self.current_latency,
-                "node_token": self.node_token
+                "node_token": self.node_token,
+                "training_enabled": self.training_enabled  # Critical for pipeline routing
             }, timeout=2)
             
             # Fetch Peers for Bootstrap
@@ -855,11 +857,19 @@ class P2PManager:
         except:
             pass
 
-    def get_next_hop(self, current_end_layer: int, session_id: Optional[str] = None) -> Optional[str]:
-        """Find a peer that starts where we end."""
+    def get_next_hop(self, current_end_layer: int, session_id: Optional[str] = None, for_training: bool = False) -> Optional[str]:
+        """
+        Find a peer that can handle the next layer.
+        
+        Args:
+            current_end_layer: The layer we need a peer for
+            session_id: Optional session ID for sticky routing
+            for_training: If True, only return peers with training enabled (for pipeline training)
+        """
         candidates = []
         
         # Strategy 1: DHT Lookup (Scalable)
+        # NOTE: DHT doesn't track training_enabled yet, so for training we'll filter below
         if self.dht:
             import json
             key_str = f"layer_{current_end_layer}"
@@ -904,15 +914,37 @@ class P2PManager:
                 start, end = map(int, r.split("-"))
                 # Peer can handle layer if it's within their range
                 if start <= current_end_layer <= end:
+                    # For training pipeline, only include peers with training enabled
+                    if for_training:
+                        training_enabled = info.get("training_enabled", True)
+                        if not training_enabled:
+                            logger.debug(f"[ROUTING] Skipping {url} for training (training_enabled=False)")
+                            continue
                     if url not in candidates:  # Avoid duplicates
                         candidates.append(url)
                         logger.debug(f"[ROUTING] Local cache: {url} has layer {current_end_layer} (range {start}-{end})")
             except: continue
+        
+        # For training, filter DHT candidates against known_peers training status
+        if for_training and candidates:
+            filtered = []
+            for url in candidates:
+                # Check if we know this peer's training status
+                if url in self.known_peers:
+                    if self.known_peers[url].get("training_enabled", True):
+                        filtered.append(url)
+                    else:
+                        logger.debug(f"[ROUTING] Filtering out {url} (training_enabled=False)")
+                else:
+                    # Unknown peer - assume training enabled (will fail gracefully if not)
+                    filtered.append(url)
+            candidates = filtered
             
         if not candidates:
             # Log why we couldn't find a next hop
-            peer_ranges = {url: info.get("shard_range", "unknown") for url, info in self.known_peers.items()}
-            logger.debug(f"[ROUTING] No next hop for layer {current_end_layer}. Known peers: {peer_ranges}")
+            peer_info = {url: f"{info.get('shard_range', '?')},train={info.get('training_enabled', '?')}" 
+                        for url, info in self.known_peers.items()}
+            logger.debug(f"[ROUTING] No next hop for layer {current_end_layer} (for_training={for_training}). Known peers: {peer_info}")
             return None
         
         if session_id:

@@ -54,9 +54,15 @@ class DatabaseManager:
                     last_seen REAL,
                     tps REAL,
                     latency REAL,
-                    node_token TEXT
+                    node_token TEXT,
+                    training_enabled BOOLEAN DEFAULT 1
                 )
             """)
+            # Migration: add training_enabled column if missing
+            try:
+                conn.execute("ALTER TABLE peers ADD COLUMN training_enabled BOOLEAN DEFAULT 1")
+            except:
+                pass  # Column already exists
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS stakes (
                     url TEXT PRIMARY KEY,
@@ -116,9 +122,15 @@ class DatabaseManager:
                     last_seen DOUBLE PRECISION,
                     tps DOUBLE PRECISION,
                     latency DOUBLE PRECISION,
-                    node_token TEXT
+                    node_token TEXT,
+                    training_enabled BOOLEAN DEFAULT TRUE
                 )
             """)
+            # Migration: add training_enabled column if missing
+            try:
+                await conn.execute("ALTER TABLE peers ADD COLUMN training_enabled BOOLEAN DEFAULT TRUE")
+            except:
+                pass  # Column already exists
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS stakes (
                     url TEXT PRIMARY KEY,
@@ -130,12 +142,12 @@ class DatabaseManager:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_shard_range ON peers(shard_range)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_last_seen ON peers(last_seen)")
 
-    async def upsert_peer(self, url, ip, port, shard_range, start, end, is_entry, is_exit, now, tps, latency, node_token):
+    async def upsert_peer(self, url, ip, port, shard_range, start, end, is_entry, is_exit, now, tps, latency, node_token, training_enabled=True):
         if self.is_postgres:
             query = """
                 INSERT INTO peers 
-                (url, ip, port, shard_range, shard_start, shard_end, is_entry, is_exit, last_seen, tps, latency, node_token)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                (url, ip, port, shard_range, shard_start, shard_end, is_entry, is_exit, last_seen, tps, latency, node_token, training_enabled)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT (url) DO UPDATE SET
                     ip = EXCLUDED.ip,
                     port = EXCLUDED.port,
@@ -147,17 +159,18 @@ class DatabaseManager:
                     last_seen = EXCLUDED.last_seen,
                     tps = EXCLUDED.tps,
                     latency = EXCLUDED.latency,
-                    node_token = EXCLUDED.node_token
+                    node_token = EXCLUDED.node_token,
+                    training_enabled = EXCLUDED.training_enabled
             """
-            await self.pool.execute(query, url, ip, port, shard_range, start, end, is_entry, is_exit, now, tps, latency, node_token)
+            await self.pool.execute(query, url, ip, port, shard_range, start, end, is_entry, is_exit, now, tps, latency, node_token, training_enabled)
         else:
             import sqlite3
             with sqlite3.connect(self._sqlite_path) as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO peers 
-                    (url, ip, port, shard_range, shard_start, shard_end, is_entry, is_exit, last_seen, tps, latency, node_token)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (url, ip, port, shard_range, start, end, is_entry, is_exit, now, tps, latency, node_token))
+                    (url, ip, port, shard_range, shard_start, shard_end, is_entry, is_exit, last_seen, tps, latency, node_token, training_enabled)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (url, ip, port, shard_range, start, end, is_entry, is_exit, now, tps, latency, node_token, training_enabled))
 
     async def get_slashed_status(self, url):
         if self.is_postgres:
@@ -217,47 +230,53 @@ class DatabaseManager:
             with sqlite3.connect(self._sqlite_path) as conn:
                 return conn.execute("SELECT 1 FROM peers WHERE node_token = ? AND last_seen > ?", (token, now - 60)).fetchone()
 
-    async def get_peers(self, layer_needed, shard_range, limit, now):
+    async def get_peers(self, layer_needed, shard_range, limit, now, training_only=False):
         if self.is_postgres:
-            query = "SELECT url, shard_range, last_seen, tps, latency, node_token FROM peers WHERE last_seen > $1"
+            query = "SELECT url, shard_range, last_seen, tps, latency, node_token, training_enabled FROM peers WHERE last_seen > $1"
             params = [now - 60]
-            
+
             idx = 2
             if layer_needed is not None:
                 query += f" AND shard_start <= ${idx} AND shard_end > ${idx+1}"
                 params.extend([layer_needed, layer_needed])
                 idx += 2
-            
+
             if shard_range is not None:
                 query += f" AND shard_range = ${idx}"
                 params.append(shard_range)
                 idx += 1
-                
+
+            if training_only:
+                query += f" AND training_enabled = TRUE"
+
             query += f" ORDER BY RANDOM() LIMIT ${idx}"
             params.append(limit)
-            
+
             rows = await self.pool.fetch(query, *params)
             return [dict(row) for row in rows]
         else:
             import sqlite3
-            query = "SELECT url, shard_range, last_seen, tps, latency, node_token FROM peers WHERE last_seen > ?"
+            query = "SELECT url, shard_range, last_seen, tps, latency, node_token, training_enabled FROM peers WHERE last_seen > ?"
             params = [now - 60]
-            
+
             if layer_needed is not None:
                 query += " AND shard_start <= ? AND shard_end > ?"
                 params.extend([layer_needed, layer_needed])
-            
+
             if shard_range is not None:
                 query += " AND shard_range = ?"
                 params.append(shard_range)
-                
+
+            if training_only:
+                query += " AND training_enabled = 1"
+
             query += " ORDER BY RANDOM() LIMIT ?"
             params.append(limit)
-            
+
             with sqlite3.connect(self._sqlite_path) as conn:
                 cursor = conn.execute(query, params)
                 return [
-                    {"url": r[0], "shard_range": r[1], "last_seen": r[2], "tps": r[3], "latency": r[4], "node_token": r[5]}
+                    {"url": r[0], "shard_range": r[1], "last_seen": r[2], "tps": r[3], "latency": r[4], "node_token": r[5], "training_enabled": bool(r[6]) if r[6] is not None else True}
                     for r in cursor
                 ]
 
@@ -330,6 +349,7 @@ class NodeAnnouncement(BaseModel):
     tps: float = 0.0
     latency: float = 0.0
     node_token: Optional[str] = None
+    training_enabled: bool = True  # Whether node can participate in training pipeline
 
 class PeerInfo(BaseModel):
     url: str
@@ -337,6 +357,7 @@ class PeerInfo(BaseModel):
     last_seen: float
     tps: float
     latency: float
+    training_enabled: bool = True  # Whether node can participate in training pipeline
     node_token: Optional[str] = None
 
 @app.post("/announce")
@@ -370,8 +391,8 @@ async def announce(node: NodeAnnouncement, request: Request):
     if await db.get_slashed_status(url):
          raise HTTPException(status_code=403, detail="Node is banned (slashed).")
 
-    # UPSERT Peer
-    await db.upsert_peer(url, client_ip, node.port, node.shard_range, start, end, node.is_entry, node.is_exit, now, node.tps, node.latency, node.node_token)
+    # UPSERT Peer (include training_enabled for pipeline routing)
+    await db.upsert_peer(url, client_ip, node.port, node.shard_range, start, end, node.is_entry, node.is_exit, now, node.tps, node.latency, node.node_token, node.training_enabled)
     
     # REMOVED: Grant initial free stake for PoC if new
     # This was a development feature - nodes should earn or stake their own NEURO
@@ -392,12 +413,22 @@ async def check_active(token: str):
 
 @app.get("/peers")
 async def get_peers(
-    layer_needed: Optional[int] = None, 
+    layer_needed: Optional[int] = None,
     shard_range: Optional[str] = None,
-    limit: int = 50
+    limit: int = 50,
+    training_only: bool = False
 ):
+    """
+    Get list of active peers.
+    
+    Args:
+        layer_needed: Filter to peers that have this layer
+        shard_range: Filter to peers with matching shard range
+        limit: Max number of peers to return
+        training_only: If True, only return peers with training enabled (for pipeline routing)
+    """
     now = time.time()
-    peers = await db.get_peers(layer_needed, shard_range, limit, now)
+    peers = await db.get_peers(layer_needed, shard_range, limit, now, training_only)
     return peers
 
 @app.get("/active_tokens")

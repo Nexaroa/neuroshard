@@ -1133,16 +1133,18 @@ class DynamicNeuroNode:
         try:
             # STEP 1: Check if there's a next hop (another node with higher layers)
             # This is the KEY check - if someone else has layers after us, use pipeline!
+            # IMPORTANT: Use for_training=True to only find training-capable peers!
             my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
             next_layer = my_last_layer + 1
             
             has_next_hop = False
             next_hop_url = None
             if self.p2p_manager:
-                next_hop_url = self.p2p_manager.get_next_hop(next_layer)
+                # Only find peers that can participate in training (not observers)
+                next_hop_url = self.p2p_manager.get_next_hop(next_layer, for_training=True)
                 if next_hop_url:
                     has_next_hop = True
-                    logger.debug(f"[PIPELINE] Found next hop for layer {next_layer}: {next_hop_url}")
+                    logger.debug(f"[PIPELINE] Found training-capable next hop for layer {next_layer}: {next_hop_url}")
             
             # STEP 2: Decide training mode based on role and network state
             if not self.model.has_embedding:

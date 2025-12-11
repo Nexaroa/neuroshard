@@ -2283,7 +2283,8 @@ def run_node(
     # 2. Initialize P2P BEFORE creating the node
     # Use temporary shard_range "unassigned" - will be updated after layer assignment
     # This prevents premature announcement of layer 0 while keeping DHT available for discovery!
-    P2P = P2PManager(my_url, "unassigned", tracker, node_token=node_token)
+    # Pass training_enabled so peers know if we can participate in training pipeline
+    P2P = P2PManager(my_url, "unassigned", tracker, node_token=node_token, training_enabled=enable_training)
     P2P.state_ref = STATE
     
     # CRITICAL: Synchronously fetch peers and populate routing table BEFORE node creation!
