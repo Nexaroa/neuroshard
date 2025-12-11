@@ -2874,8 +2874,8 @@ def run_node(
                 # Cleanup stale layer assignments (every 60 seconds)
                 if int(now) % 60 == 0:
                     removed = NEURO_NODE.layer_pool.cleanup_stale_assignments()
-                    if removed > 0:
-                        logger.info(f"[LAYER_POOL] Cleaned up {removed} stale layer assignments")
+                    if removed:
+                        logger.info(f"[LAYER_POOL] Cleaned up {len(removed)} stale layer assignments")
             
             # TOKENIZER AUTO-REFRESH: Check for vocab updates every 10 minutes
             # Synced with MANIFEST_REFRESH_INTERVAL (600s) in GenesisDataLoader

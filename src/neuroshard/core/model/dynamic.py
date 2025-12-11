@@ -641,6 +641,67 @@ class DynamicNeuroLLM(nn.Module):
         for layer_id, layer in self.my_layers.items():
             for name, param in layer.named_parameters(f"layer_{layer_id}", recurse):
                 yield name, param
+    
+    def get_num_params(self) -> int:
+        """Get total number of parameters."""
+        return sum(p.numel() for p in self.parameters())
+    
+    @property
+    def hidden_dim(self) -> int:
+        """Get hidden dimension (for compatibility)."""
+        return self.architecture.hidden_dim if self.architecture else 512
+    
+    @property
+    def num_heads(self) -> int:
+        """Get number of attention heads (for compatibility)."""
+        return self.architecture.num_heads if self.architecture else 8
+    
+    def initialize_lm_head(self) -> bool:
+        """Initialize LM head for validator upgrade."""
+        if self.has_lm_head:
+            return False  # Already has LM head
+        
+        try:
+            from neuroshard.core.model.llm import RMSNorm
+            self.lm_head = nn.Linear(self.architecture.hidden_dim, self.vocab_capacity, bias=False)
+            self.final_norm = RMSNorm(self.architecture.hidden_dim)
+            self.lm_head.to(self.device)
+            self.final_norm.to(self.device)
+            self.has_lm_head = True
+            self.layer_pool.lm_head_holder = self.node_id
+            logger.info(f"[VALIDATOR] Initialized LM head: {self.vocab_capacity} outputs")
+            return True
+        except Exception as e:
+            logger.error(f"[VALIDATOR] Failed to initialize LM head: {e}")
+            return False
+    
+    def disable_lm_head(self) -> bool:
+        """Disable LM head for validator demotion."""
+        if not self.has_lm_head:
+            return False  # Already disabled
+        
+        try:
+            self.lm_head = None
+            self.final_norm = None
+            self.has_lm_head = False
+            if self.layer_pool.lm_head_holder == self.node_id:
+                self.layer_pool.lm_head_holder = None
+            logger.info("[VALIDATOR] LM head disabled (demoted from validator)")
+            return True
+        except Exception as e:
+            logger.error(f"[VALIDATOR] Failed to disable LM head: {e}")
+            return False
+    
+    def get_my_contribution(self) -> Dict[str, Any]:
+        """Get this node's contribution stats."""
+        return {
+            "layers": len(self.my_layer_ids),
+            "layer_ids": self.my_layer_ids,
+            "has_embedding": self.has_embedding,
+            "has_lm_head": self.has_lm_head,
+            "parameters": self.get_num_params(),
+            "vocab_capacity": self.vocab_capacity,
+        }
 
 
 class DynamicNeuroNode:
@@ -815,18 +876,53 @@ class DynamicNeuroNode:
         return checkpoint_dir / f"dynamic_node_{self.wallet_id}.pt"
     
     def _prefetch_vocab_capacity(self):
-        """Pre-fetch vocab size for memory calculation."""
+        """Pre-fetch vocab size from CDN tokenizer for memory calculation."""
         try:
-            from neuroshard.core.model.tokenizer import get_neuro_tokenizer
-            tokenizer = get_neuro_tokenizer()
-            # Use current_vocab_size (actual learned vocab), NOT vocab_size (10M max capacity)
-            current_vocab = tokenizer.current_vocab_size
+            import os
+            import urllib.request
+            import json
+            from pathlib import Path
+            from neuroshard.core.model.tokenizer import NeuroTokenizer
+            
+            # Try to load learned tokenizer from CDN (same URL as GenesisDataLoader)
+            CDN_URL = "https://dwquwt9gkkeil.cloudfront.net"
+            cache_dir = Path(os.path.expanduser("~/.neuroshard/data_cache"))
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tokenizer_cache_path = cache_dir / "tokenizer.json"
+            
+            current_vocab = 266  # Base vocab (fallback)
+            
+            # Try downloading from CDN
+            try:
+                tokenizer_url = f"{CDN_URL}/tokenizer.json"
+                req = urllib.request.Request(tokenizer_url, headers={"User-Agent": "NeuroShard/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    remote_data = json.loads(resp.read().decode('utf-8'))
+                    current_vocab = remote_data.get("next_merge_id", 266)
+                    
+                    # Cache for offline use
+                    with open(tokenizer_cache_path, 'w') as f:
+                        json.dump(remote_data, f)
+                    
+                    logger.info(f"[VOCAB] Downloaded tokenizer from CDN: {current_vocab:,} tokens")
+            except Exception as e:
+                # Try cached version
+                if tokenizer_cache_path.exists():
+                    try:
+                        with open(tokenizer_cache_path) as f:
+                            cached_data = json.load(f)
+                        current_vocab = cached_data.get("next_merge_id", 266)
+                        logger.info(f"[VOCAB] Using cached tokenizer: {current_vocab:,} tokens")
+                    except:
+                        pass
+                else:
+                    logger.debug(f"[VOCAB] Could not fetch tokenizer from CDN: {e}")
 
             # Allocate for current vocab + growth headroom
             VOCAB_GROWTH_CHUNK = 32000
             capacity = ((current_vocab // VOCAB_GROWTH_CHUNK) + 1) * VOCAB_GROWTH_CHUNK
             capacity = min(capacity, MAX_VOCAB_SIZE)
-            
+
             self.layer_pool.vocab_capacity = capacity
             logger.info(f"[VOCAB] Pre-fetched tokenizer: {current_vocab:,} tokens (for memory calculation)")
             logger.info(f"[VOCAB] Layer pool vocab_capacity set to {capacity:,} (current vocab: {current_vocab:,})")
