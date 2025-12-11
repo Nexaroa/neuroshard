@@ -1171,6 +1171,8 @@ class DynamicNeuroNode:
         
         try:
             input_ids, labels = self.genesis_loader.get_batch(batch_size=self._training_batch_size)
+            if input_ids is None or labels is None:
+                return None, None
             return input_ids.to(self.device), labels.to(self.device)
         except Exception as e:
             logger.warning(f"[GENESIS] Failed to get batch: {e}")

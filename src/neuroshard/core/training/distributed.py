@@ -1373,6 +1373,39 @@ class GenesisDataLoader:
         # Prepare batch
         exact_len = batch_size * seq_len
         
+        # Check if chunk is large enough (might be end of shard)
+        if len(chunk) < exact_len + 1:
+            # Not enough data for a full batch + label shift
+            # Force rotation to the next shard so we don't get stuck here
+            logger.info(f"[GENESIS] Reached end of shard (partial batch: {len(chunk)} < {exact_len + 1}), rotating...")
+            
+            # Reset loss tracking
+            self._loss_history.clear()
+            self._steps_on_current_shard = 0
+            
+            # Move to next shard
+            self.current_shard_idx += 1
+            if self.current_shard_idx >= len(self.assigned_shard_ids):
+                self.rotate_shards()
+            
+            # Switch to next shard immediately
+            next_shard_id = self.assigned_shard_ids[self.current_shard_idx % len(self.assigned_shard_ids)]
+            with self._shard_lock:
+                if next_shard_id in self._prefetch_ready:
+                    self.current_dataset = self._prefetch_ready.pop(next_shard_id)
+                    self.loaded_shards[next_shard_id] = self.current_dataset
+                elif next_shard_id in self.loaded_shards:
+                    self.current_dataset = self.loaded_shards[next_shard_id]
+                else:
+                    self.current_dataset = None  # Force wait for new data
+                    self.ensure_shard_loaded(next_shard_id) # Triggers background load
+            
+            self.dataset_iterator = 0
+            self._start_prefetch_next()
+            
+            # Return None to skip this step (will pick up new shard next time)
+            return None, None
+
         inputs = chunk[:exact_len].view(batch_size, seq_len)
         labels = chunk[1:exact_len+1].view(batch_size, seq_len)
         
