@@ -429,16 +429,37 @@ class DynamicLayerPool:
             return False
     
     def validate_all_validators(self, get_stake_fn) -> List[str]:
-        """Validate all validators meet stake requirements."""
+        """Validate all validators meet stake requirements.
+        
+        Uses DYNAMIC stake tiers from constants.py:
+        - 0-2 validators: FREE (0 NEURO) - bootstrap phase
+        - 3-10 validators: 100 NEURO
+        - 11-50 validators: 250 NEURO
+        - etc.
+        
+        This allows the network to bootstrap without stake requirements,
+        then progressively requires more stake as the network grows.
+        """
+        from neuroshard.core.economics.constants import get_dynamic_validator_stake
+        
         demoted = []
         with self.lock:
             if self.lm_head_holder:
+                # Count current validators (nodes holding the last layer)
+                last_layer = max(0, self.current_num_layers - 1)
+                num_validators = len(self.layer_assignments.get(last_layer, []))
+                
+                # Get dynamic stake requirement based on network size
+                required_stake = get_dynamic_validator_stake(num_validators)
+                
                 try:
                     stake = get_stake_fn(self.lm_head_holder)
-                    # Require minimum stake for validator
-                    if stake < 100.0:  # VALIDATOR_STAKE_REQUIRED
+                    # Only demote if stake is below DYNAMIC requirement
+                    if stake < required_stake:
+                        node_id = self.lm_head_holder  # Save before clearing
                         self.lm_head_holder = None
-                        demoted.append(self.lm_head_holder)
+                        demoted.append(node_id)
+                        logger.info(f"Validator {node_id[:8]}... demoted: stake {stake:.2f} < {required_stake:.2f} required ({num_validators} validators)")
                 except:
                     pass
         return demoted
