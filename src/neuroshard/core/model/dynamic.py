@@ -297,6 +297,11 @@ class DynamicLayerPool:
             else:  # WORKER
                 # Find where the current pipeline ends
                 frontier = self._find_frontier_layer()
+
+                # WORKER cannot hold Layer 0 (reserved for DRIVER with embedding)
+                if frontier == 0:
+                    logger.info("WORKER cannot hold Layer 0 (reserved for DRIVER) - starting from Layer 1")
+                    frontier = 1
                 
                 if frontier >= arch_layers:
                     # All layers are covered - provide redundancy on last layers
