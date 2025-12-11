@@ -2281,9 +2281,9 @@ def run_node(
     my_url = f"http://{ip_addr}:{final_announce_port}"
     
     # 2. Initialize P2P BEFORE creating the node
-    # Use temporary shard_range "0-0" - will be updated after layer assignment
-    # This allows DHT to be available for network discovery during layer assignment!
-    P2P = P2PManager(my_url, "0-0", tracker, node_token=node_token)
+    # Use temporary shard_range "unassigned" - will be updated after layer assignment
+    # This prevents premature announcement of layer 0 while keeping DHT available for discovery!
+    P2P = P2PManager(my_url, "unassigned", tracker, node_token=node_token)
     P2P.state_ref = STATE
     
     # CRITICAL: Synchronously fetch peers and populate routing table BEFORE node creation!
@@ -2390,9 +2390,9 @@ def run_node(
             end_layer = max(layer_ids)
         shard_range = f"{start_layer}-{end_layer}"
     else:
-        shard_range = "0-0"
-        start_layer = 0
-        end_layer = 0
+        shard_range = "unassigned"
+        start_layer = -1
+        end_layer = -1
     P2P.shard_range = shard_range
     P2P.start_layer = start_layer
     P2P.end_layer = end_layer

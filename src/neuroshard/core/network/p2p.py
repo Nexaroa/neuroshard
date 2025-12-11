@@ -41,7 +41,8 @@ class P2PManager:
         try:
             self.start_layer, self.end_layer = map(int, shard_range.split("-"))
         except:
-            self.start_layer, self.end_layer = 0, 0
+            # Default to -1 (unassigned) instead of 0-0 to prevent premature announcement
+            self.start_layer, self.end_layer = -1, -1
 
         # Metrics
         self.current_tps = 0.0
@@ -772,6 +773,12 @@ class P2PManager:
         # 1. DHT Announce (Primary)
         # Announces all layers so peers can find us for pipeline routing
         if self.dht:
+            # Skip announcement if layers are not yet assigned
+            if self.start_layer < 0:
+                if verbose:
+                    logger.info("[P2P] Skipping DHT announcement (layers not assigned yet)")
+                return
+
             try:
                 num_layers = self.end_layer - self.start_layer + 1
                 success_count = 0
