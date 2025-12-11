@@ -1137,14 +1137,30 @@ class DynamicNeuroNode:
             my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
             next_layer = my_last_layer + 1
             
+            # Track peer failures to avoid hammering unreachable peers
+            if not hasattr(self, '_peer_failures'):
+                self._peer_failures = {}  # url -> (fail_count, last_fail_time)
+            
             has_next_hop = False
             next_hop_url = None
             if self.p2p_manager:
                 # Only find peers that can participate in training (not observers)
                 next_hop_url = self.p2p_manager.get_next_hop(next_layer, for_training=True)
                 if next_hop_url:
-                    has_next_hop = True
-                    logger.debug(f"[PIPELINE] Found training-capable next hop for layer {next_layer}: {next_hop_url}")
+                    # Check if peer is in cooldown (failed recently)
+                    if next_hop_url in self._peer_failures:
+                        fail_count, last_fail = self._peer_failures[next_hop_url]
+                        cooldown = min(30, 5 * fail_count)  # 5s, 10s, 15s... max 30s
+                        if time.time() - last_fail < cooldown:
+                            logger.debug(f"[PIPELINE] Peer {next_hop_url} in cooldown ({cooldown}s)")
+                            next_hop_url = None  # Skip this peer for now
+                        else:
+                            has_next_hop = True
+                    else:
+                        has_next_hop = True
+                    
+                    if has_next_hop:
+                        logger.debug(f"[PIPELINE] Found training-capable next hop for layer {next_layer}: {next_hop_url}")
             
             # STEP 2: Decide training mode based on role and network state
             if not self.model.has_embedding:
@@ -1160,7 +1176,19 @@ class DynamicNeuroNode:
                 if input_ids is None:
                     return None
                 logger.debug(f"[PIPELINE] DRIVER forwarding to {next_hop_url} (distributed mode)")
-                return self._train_step_distributed(input_ids, labels, next_hop_url)
+                result = self._train_step_distributed(input_ids, labels, next_hop_url)
+                
+                # Track success/failure for cooldown logic
+                if result is not None:
+                    # Success - clear failure count
+                    if next_hop_url in self._peer_failures:
+                        del self._peer_failures[next_hop_url]
+                else:
+                    # Failure - increment count
+                    fail_count, _ = self._peer_failures.get(next_hop_url, (0, 0))
+                    self._peer_failures[next_hop_url] = (fail_count + 1, time.time())
+                
+                return result
             
             elif self.model.has_lm_head:
                 # LOCAL TRAINING: I have embedding + LM head AND no next hop
@@ -1328,9 +1356,24 @@ class DynamicNeuroNode:
             
             logger.info(f"[DRIVER] Sending activations to VALIDATOR at {grpc_addr} (session={session_id[:20]}...)")
             
-            response = stub.PipelineForward(request, timeout=60)
+            # Retry with exponential backoff for transient connection issues
+            max_retries = 3
+            response = None
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    response = stub.PipelineForward(request, timeout=30)
+                    break  # Success!
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        backoff = 2 ** attempt  # 1s, 2s, 4s
+                        logger.debug(f"[DRIVER] Connection attempt {attempt+1} failed, retrying in {backoff}s...")
+                        time.sleep(backoff)
+                    else:
+                        raise  # Re-raise on final attempt
             
-            if response.success:
+            if response and response.success:
                 # Get loss from response
                 # Note: Gradients will arrive asynchronously via backward_pipeline
                 if response.loss:
@@ -1347,9 +1390,14 @@ class DynamicNeuroNode:
                 return None
                 
         except Exception as e:
-            logger.warning(f"Distributed training error: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
+            # Only log connection errors once (not every retry)
+            error_str = str(e)
+            if "UNAVAILABLE" in error_str or "Connection" in error_str:
+                logger.warning(f"[DRIVER] Failed to reach VALIDATOR after retries: {next_hop_url}")
+            else:
+                logger.warning(f"Distributed training error: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
             return None
     
     def save_checkpoint(self):
