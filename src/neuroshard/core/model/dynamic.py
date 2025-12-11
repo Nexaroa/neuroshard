@@ -1592,6 +1592,24 @@ class DynamicNeuroNode:
             return 0
         return sum(p.numel() for p in self.model.parameters())
     
+    def get_stats(self) -> Dict[str, Any]:
+        """Get node statistics for display and monitoring."""
+        return {
+            "node_id": self.node_id,
+            "my_layers": self.my_layer_ids,
+            "my_params": self.get_num_params(),
+            "has_embedding": self.model.has_embedding if self.model else False,
+            "has_lm_head": self.model.has_lm_head if self.model else False,
+            "total_training_rounds": self.total_training_rounds,
+            "total_tokens_processed": self.total_tokens_processed,
+            "current_loss": self.current_loss if self.current_loss is not None else 0.0,
+            "training_enabled": self.enable_training,
+            "available_memory_mb": self.available_memory_mb,
+            "device": self.device,
+            "network_layers": self.layer_pool.current_num_layers if self.layer_pool else 0,
+            "network_nodes": len(self.layer_pool.node_capacities) if self.layer_pool else 0,
+        }
+    
     def _save_checkpoint(self, async_save: bool = True):
         """Save checkpoint (alias for save_checkpoint)."""
         self.save_checkpoint()
