@@ -262,13 +262,16 @@ class DynamicLayerPool:
                 logger.info(f"Another node is DRIVER ({layer_0_holders[0]}) - becoming WORKER")
             
             # STEP 2: Calculate how many layers I can hold
+            # COMPUTE-BALANCED: Include device type so CPU nodes get fewer layers
+            # This prevents slow CPU nodes from becoming pipeline bottlenecks
             max_layers = calculate_layer_assignment(
                 available_memory_mb=available_memory_mb,
                 arch=self.current_architecture,
                 safety_factor=safety_factor,
                 vocab_capacity=self.vocab_capacity,
                 training_mode=True,
-                needs_embedding=needs_embedding
+                needs_embedding=needs_embedding,
+                device_type=device_type
             )
             
             logger.info(f"Layer calculation ({role}): {available_memory_mb:.0f}MB × {safety_factor} safety = {max_layers} layers")
@@ -305,15 +308,43 @@ class DynamicLayerPool:
                 
                 if frontier >= arch_layers:
                     # All layers are covered - provide redundancy on last layers
+                    # Use compute-balanced layer count for redundancy
                     frontier = max(1, arch_layers - max_layers)
                     logger.info(f"Network fully covered - providing redundancy from layer {frontier}")
+                    
+                    # Take layers from frontier to end (or capacity)
+                    for layer_id in range(frontier, min(frontier + max_layers, arch_layers)):
+                        self._assign_layer(layer_id, node_id, node_url, grpc_addr)
+                        assigned_layers.append(layer_id)
                 else:
-                    logger.info(f"Pipeline frontier at layer {frontier}")
-                
-                # Take layers from frontier to end (or capacity)
-                for layer_id in range(frontier, min(frontier + max_layers, arch_layers)):
-                    self._assign_layer(layer_id, node_id, node_url, grpc_addr)
-                    assigned_layers.append(layer_id)
+                    # Pipeline is incomplete - we MUST extend it to cover all layers
+                    # If compute-balanced cap isn't enough, use full memory capacity
+                    # A slow complete pipeline is better than a fast incomplete one!
+                    layers_needed = arch_layers - frontier
+                    
+                    if max_layers >= layers_needed:
+                        # Compute-balanced capacity is enough
+                        layers_to_take = layers_needed
+                        logger.info(f"Pipeline frontier at layer {frontier} - extending with {layers_to_take} layers")
+                    else:
+                        # Need more than compute-balanced allows - use memory-based max
+                        # Recalculate without compute cap for pipeline completion
+                        memory_max = calculate_layer_assignment(
+                            available_memory_mb=available_memory_mb,
+                            arch=self.current_architecture,
+                            safety_factor=safety_factor,
+                            vocab_capacity=self.vocab_capacity,
+                            training_mode=True,
+                            needs_embedding=False,
+                            device_type="cuda"  # Use GPU calculation to get memory-based max
+                        )
+                        layers_to_take = min(layers_needed, memory_max)
+                        logger.info(f"Pipeline frontier at layer {frontier} - COMPLETING pipeline with {layers_to_take} layers (overriding compute cap)")
+                    
+                    # Take layers to extend/complete the pipeline
+                    for layer_id in range(frontier, min(frontier + layers_to_take, arch_layers)):
+                        self._assign_layer(layer_id, node_id, node_url, grpc_addr)
+                        assigned_layers.append(layer_id)
                 
                 if assigned_layers:
                     logger.info(f"WORKER: Assigned layers {min(assigned_layers)}-{max(assigned_layers)}")
@@ -1356,13 +1387,30 @@ class DynamicNeuroNode:
             
             logger.info(f"[DRIVER] Sending activations to VALIDATOR at {grpc_addr} (session={session_id[:20]}...)")
             
+            # Dynamic timeout based on expected peer speed
+            # CPU nodes are 10-50x slower than GPU - allow enough time
+            # Check if we know the peer's device type from known_peers
+            peer_timeout = 30  # Default for GPU peers
+            if hasattr(self, 'p2p_manager') and self.p2p_manager:
+                peer_info = self.p2p_manager.known_peers.get(next_hop_url, {})
+                # If peer isn't using GPU, give it more time
+                peer_shard_range = peer_info.get("shard_range", "0-0")
+                try:
+                    start, end = map(int, peer_shard_range.split("-"))
+                    peer_layers = end - start + 1
+                    # More layers = more time needed (10s per 4 layers for CPU)
+                    if peer_layers > 4:
+                        peer_timeout = 60  # Likely CPU with more layers
+                except:
+                    pass
+            
             # Retry with exponential backoff for transient connection issues
-            max_retries = 3
+            max_retries = 2  # Reduce retries for faster failure detection
             response = None
             last_error = None
             for attempt in range(max_retries):
                 try:
-                    response = stub.PipelineForward(request, timeout=30)
+                    response = stub.PipelineForward(request, timeout=peer_timeout)
                     break  # Success!
                 except Exception as e:
                     last_error = e

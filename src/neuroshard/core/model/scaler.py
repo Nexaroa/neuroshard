@@ -322,22 +322,30 @@ def calculate_layer_assignment(
     safety_factor: float = 0.6,
     vocab_capacity: int = 32000,
     training_mode: bool = True,
-    needs_embedding: bool = True
+    needs_embedding: bool = True,
+    device_type: str = "cpu"
 ) -> int:
     """
     Calculate how many layers a node can hold.
     
+    COMPUTE-BALANCED ASSIGNMENT:
+    We calculate based on BOTH memory AND compute throughput.
+    A GPU can process layers 10-50x faster than CPU, so we adjust accordingly.
+    
+    This ensures pipeline stages are balanced for similar processing time.
+    
     Args:
         available_memory_mb: Node's available memory
         arch: Current network architecture
-        safety_factor: Use only 60% of memory for safety (GPU) or 30% (CPU)
+        safety_factor: Use only 60% of memory for safety (GPU) or 50% (CPU)
         vocab_capacity: Current vocab capacity for embedding/LM head (dynamic!)
         training_mode: If True, reserve more memory for gradients/optimizer
         needs_embedding: If True, reserve memory for embedding/LM head (Driver/Validator only!)
                         Workers (middle layers) don't need embedding and can hold MORE layers!
+        device_type: "cuda" or "cpu" - affects compute throughput factor
     
     Returns:
-        Number of layers this node can hold
+        Number of layers this node can hold (balanced for compute throughput)
     """
     usable_memory = available_memory_mb * safety_factor
     memory_per_layer = estimate_memory_per_layer(arch)
@@ -371,7 +379,27 @@ def calculate_layer_assignment(
                       f"{embedding_memory:.0f}MB for vocab, {training_overhead:.0f}MB overhead")
         return 1
     
-    max_layers = max(1, int(usable_for_layers / memory_per_layer))
+    memory_layers = max(1, int(usable_for_layers / memory_per_layer))
+    
+    # COMPUTE-BALANCED ASSIGNMENT
+    # GPU is roughly 10-50x faster than CPU for neural network forward/backward
+    # We limit layers based on compute throughput to balance the pipeline
+    # This prevents slow nodes from becoming bottlenecks
+    if device_type == "cuda":
+        # GPU can process layers fast - use full memory capacity
+        compute_factor = 1.0
+        # But cap at a reasonable amount for pipeline balance
+        compute_max_layers = memory_layers  # GPU: memory-limited
+    else:
+        # CPU is slow - limit to just a few layers regardless of memory
+        # A CPU processing 3-4 layers takes similar time as GPU processing 30-40
+        compute_factor = 0.15  # CPU gets ~15% of its memory capacity
+        # Hard cap to prevent CPU bottleneck even if lots of memory
+        compute_max_layers = min(4, memory_layers)  # CPU: max 4 layers
+    
+    # Apply compute factor
+    compute_balanced_layers = max(1, int(memory_layers * compute_factor))
+    max_layers = min(compute_balanced_layers, compute_max_layers)
     
     # Log the calculation for transparency
     role = "Driver/Validator" if needs_embedding else "Worker"
@@ -381,7 +409,8 @@ def calculate_layer_assignment(
     else:
         logger.debug(f"[MEMORY]   - No embedding needed (Worker)")
     logger.debug(f"[MEMORY]   - Training overhead ({training_overhead_ratio*100:.0f}%): {training_overhead:.0f}MB")
-    logger.debug(f"[MEMORY]   - Available for layers: {usable_for_layers:.0f}MB → {max_layers} layers")
+    logger.debug(f"[MEMORY]   - Memory allows: {memory_layers} layers")
+    logger.debug(f"[MEMORY]   - Compute balanced ({device_type}): {max_layers} layers (factor={compute_factor})")
     
     return max_layers
 
