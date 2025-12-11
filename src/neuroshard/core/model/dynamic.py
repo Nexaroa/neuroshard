@@ -243,7 +243,7 @@ class DynamicLayerPool:
             # STEP 2: Calculate how many layers I can hold
             max_layers = calculate_layer_assignment(
                 available_memory_mb=available_memory_mb,
-                architecture=self.current_architecture,
+                arch=self.current_architecture,
                 safety_factor=safety_factor,
                 vocab_capacity=self.vocab_capacity,
                 training_mode=True,
@@ -364,6 +364,89 @@ class DynamicLayerPool:
             
             if orphaned_layers:
                 logger.warning(f"Node {node_id[:8]}... left, {len(orphaned_layers)} layers orphaned")
+    
+    def get_layer_holders(self, layer_id: int) -> List[LayerAssignment]:
+        """Get all holders of a specific layer."""
+        with self.lock:
+            return list(self.layer_assignments.get(layer_id, []))
+    
+    def get_pipeline_route(self) -> List[str]:
+        """Get the ordered list of node URLs for pipeline routing."""
+        with self.lock:
+            route = []
+            for layer_id in range(self.current_num_layers):
+                holders = self.layer_assignments.get(layer_id, [])
+                if holders:
+                    route.append(holders[0].node_url)
+            return route
+    
+    def get_network_capacity(self) -> Dict[str, Any]:
+        """Get network capacity statistics."""
+        with self.lock:
+            return {
+                "total_nodes": len(self.node_capacities),
+                "total_memory_mb": sum(self.node_capacities.values()),
+                "total_layers": self.current_num_layers,
+                "architecture": {
+                    "num_layers": self.current_architecture.num_layers if self.current_architecture else 0,
+                    "hidden_dim": self.current_architecture.hidden_dim if self.current_architecture else 0,
+                } if self.current_architecture else None
+            }
+    
+    def demote_from_validator(self, node_id: str) -> bool:
+        """Remove validator status from a node."""
+        with self.lock:
+            if self.lm_head_holder == node_id:
+                self.lm_head_holder = None
+                logger.info(f"Node {node_id[:8]}... demoted from VALIDATOR")
+                return True
+            return False
+    
+    def validate_all_validators(self, get_stake_fn) -> List[str]:
+        """Validate all validators meet stake requirements."""
+        demoted = []
+        with self.lock:
+            if self.lm_head_holder:
+                try:
+                    stake = get_stake_fn(self.lm_head_holder)
+                    # Require minimum stake for validator
+                    if stake < 100.0:  # VALIDATOR_STAKE_REQUIRED
+                        self.lm_head_holder = None
+                        demoted.append(self.lm_head_holder)
+                except:
+                    pass
+        return demoted
+    
+    def heartbeat(self, node_id: str, layer_ids: List[int]):
+        """Record heartbeat from a node."""
+        with self.lock:
+            if not hasattr(self, '_last_heartbeat'):
+                self._last_heartbeat = {}
+            self._last_heartbeat[node_id] = time.time()
+    
+    def cleanup_stale_assignments(self, timeout_seconds: float = 300) -> List[str]:
+        """Remove assignments from nodes that haven't sent heartbeats."""
+        stale_nodes = []
+        
+        # First, identify stale nodes while holding the lock
+        with self.lock:
+            if not hasattr(self, '_last_heartbeat'):
+                self._last_heartbeat = {}
+
+            now = time.time()
+            for node_id, last_seen in list(self._last_heartbeat.items()):
+                if now - last_seen > timeout_seconds:
+                    stale_nodes.append(node_id)
+        
+        # Remove nodes outside the lock to avoid deadlock
+        # (remove_node also acquires self.lock)
+        for node_id in stale_nodes:
+            self.remove_node(node_id)
+            with self.lock:
+                if node_id in self._last_heartbeat:
+                    del self._last_heartbeat[node_id]
+
+        return stale_nodes
 
 
 class DynamicNeuroLLM(nn.Module):
@@ -453,12 +536,17 @@ class DynamicNeuroLLM(nn.Module):
             raise RuntimeError("This node doesn't have the embedding layer")
         return self.embedding(input_ids)
     
-    def forward_my_layers(self, hidden_states: torch.Tensor, 
+    def forward_my_layers(self, hidden_states: torch.Tensor,
                           attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward through only my layers."""
         for layer_id in self.my_layer_ids:
             layer = self.my_layers[layer_id]
-            hidden_states = layer(hidden_states, attention_mask=attention_mask)
+            result = layer(hidden_states, attention_mask=attention_mask)
+            # Handle layers that return (hidden_states, cache) tuple
+            if isinstance(result, tuple):
+                hidden_states = result[0]
+            else:
+                hidden_states = result
         return hidden_states
     
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -565,6 +653,7 @@ class DynamicNeuroNode:
     ):
         self.node_id = node_id
         self.wallet_id = wallet_id
+        self.node_token = node_id  # Alias for compatibility with SwarmEnabledNode
         self.port = port
         self.available_memory_mb = available_memory_mb
         self.device = device
@@ -576,6 +665,7 @@ class DynamicNeuroNode:
         self.model: Optional[DynamicNeuroLLM] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.tokenizer = None
+        self.data_manager = None  # For training data management
         
         # P2P manager (set externally before start)
         self.p2p_manager = None
@@ -590,6 +680,12 @@ class DynamicNeuroNode:
         self._training_batch_size = 4
         self._use_gradient_checkpointing = False
         
+        # Training statistics (for PoNW and monitoring)
+        self.total_training_rounds = 0
+        self.total_tokens_processed = 0
+        self.training_contribution_count = 0
+        self._global_tracker = None
+        
         # Genesis data loader
         self.genesis_loader = None
         
@@ -598,8 +694,6 @@ class DynamicNeuroNode:
         
         # State
         self.is_running = False
-        
-        logger.info(f"DynamicNeuroNode initialized: memory={available_memory_mb}MB")
     
     def start(self):
         """Start the node and initialize components."""
@@ -1154,31 +1248,193 @@ class DynamicNeuroNode:
         # This would be called if we're not the last node but received gradients
         # For now, this is handled inline in forward_pipeline
         return None
+    
+    def stop(self):
+        """Stop the node."""
+        self.is_running = False
+        logger.info("DynamicNeuroNode stopped")
+    
+    def forward(self, input_ids: torch.Tensor, session_id: Optional[str] = None) -> torch.Tensor:
+        """
+        Forward pass through the model.
+        
+        For inference, returns logits if we have LM head, else hidden states.
+        """
+        if not self.model:
+            raise RuntimeError("Model not initialized")
+        
+        input_ids = input_ids.to(self.device)
+        
+        if self.model.has_embedding:
+            hidden = self.model.embed(input_ids)
+            hidden = self.model.forward_my_layers(hidden)
+            
+            if self.model.has_lm_head:
+                return self.model.compute_logits(hidden)
+            return hidden
+        else:
+            # We're a worker - just process through our layers
+            return self.model.forward_my_layers(input_ids)
+    
+    def generate(self, prompt: str, max_tokens: int = 100, temperature: float = 0.8) -> str:
+        """
+        Generate text from a prompt.
+        
+        Only works if we have both embedding and LM head (full node).
+        """
+        if not self.model or not self.model.has_embedding or not self.model.has_lm_head:
+            return "[Generation requires full node with embedding and LM head]"
+        
+        if not self.tokenizer:
+            return "[Tokenizer not loaded]"
+        
+        try:
+            # Tokenize prompt
+            input_ids = self.tokenizer.encode(prompt)
+            input_tensor = torch.tensor([input_ids], device=self.device)
+            
+            generated = list(input_ids)
+            
+            for _ in range(max_tokens):
+                with torch.no_grad():
+                    logits = self.forward(input_tensor)
+                    next_logits = logits[0, -1, :] / temperature
+                    probs = torch.softmax(next_logits, dim=-1)
+                    next_token = torch.multinomial(probs, 1).item()
+                
+                generated.append(next_token)
+                input_tensor = torch.tensor([generated], device=self.device)
+                
+                # Stop on EOS
+                if next_token == self.tokenizer.eos_token_id:
+                    break
+            
+            return self.tokenizer.decode(generated)
+        except Exception as e:
+            logger.warning(f"Generation error: {e}")
+            return f"[Generation error: {e}]"
+    
+    def contribute_training_data(self, text: str, apply_dp: bool = False) -> int:
+        """
+        Contribute training data to the node.
+        
+        Returns number of tokens added.
+        """
+        if not self.enable_training or not self.tokenizer:
+            return 0
+        
+        try:
+            tokens = self.tokenizer.encode(text)
+            self.training_contribution_count += 1
+            return len(tokens)
+        except Exception as e:
+            logger.warning(f"Data contribution error: {e}")
+            return 0
+    
+    def get_global_training_status(self) -> Dict[str, Any]:
+        """Get global training status."""
+        return {
+            "total_training_rounds": self.total_training_rounds,
+            "total_tokens_processed": self.total_tokens_processed,
+            "current_loss": self.current_loss,
+            "my_layers": self.my_layer_ids,
+            "has_embedding": self.model.has_embedding if self.model else False,
+            "has_lm_head": self.model.has_lm_head if self.model else False,
+        }
+    
+    def get_num_params(self) -> int:
+        """Get total number of parameters."""
+        if not self.model:
+            return 0
+        return sum(p.numel() for p in self.model.parameters())
+    
+    def _save_checkpoint(self, async_save: bool = True):
+        """Save checkpoint (alias for save_checkpoint)."""
+        self.save_checkpoint()
 
 
 def create_dynamic_node(
-    node_id: str,
-    wallet_id: str,
+    node_token: str,
     port: int = 8000,
-    memory_mb: float = 4000,
-    device: str = "cpu",
-    training: bool = True,
+    tracker_url: str = "http://localhost:3000",
+    available_memory_mb: Optional[float] = None,
+    enable_training: bool = True,
     max_storage_mb: int = 5000,
+    max_cpu_threads: int = 4,
+    device: str = "auto",
     p2p_manager = None
 ) -> DynamicNeuroNode:
-    """Create and start a dynamic node."""
+    """
+    Create and start a dynamic node.
+    
+    Args:
+        node_token: Authentication token (used to derive node_id and wallet_id)
+        port: HTTP port for the node
+        tracker_url: URL of the tracker server
+        available_memory_mb: Override memory detection
+        enable_training: Whether to enable training
+        max_storage_mb: Max disk space for data shards
+        max_cpu_threads: Max CPU threads to use
+        device: Device to use (auto, cpu, cuda, mps)
+        p2p_manager: Optional P2P manager for DHT
+    
+    Returns:
+        DynamicNeuroNode ready for use
+    """
+    import hashlib
+    import platform
+    
+    # Derive node_id and wallet_id from token
+    machine_id = hashlib.sha256(platform.node().encode()).hexdigest()[:16]
+    instance_id = hashlib.sha256(f"{machine_id}:{port}".encode()).hexdigest()[:16]
+    wallet_id = hashlib.sha256(node_token.encode()).hexdigest()[:16]
+    node_id = hashlib.sha256(f"{instance_id}:{node_token}".encode()).hexdigest()[:20]
+    
+    logger.info(f"Instance ID: {instance_id} (machine+port)")
+    logger.info(f"Wallet ID: {wallet_id}... (for NEURO earnings)")
+    logger.info(f"Node ID: {node_id}... (unique network identity)")
+    
+    # Auto-detect device
+    if device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+            logger.info("[NODE] Using device: cuda")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = "mps"
+            logger.info("[NODE] Using device: mps")
+        else:
+            device = "cpu"
+            logger.info("[NODE] No GPU detected, using CPU")
+    else:
+        logger.info(f"[NODE] Device manually set to: {device}")
+    
+    # Auto-detect memory if not specified
+    if available_memory_mb is None:
+        try:
+            import psutil
+            total_mem = psutil.virtual_memory().total / (1024 * 1024)
+            # Reserve some for OS
+            available_memory_mb = min(total_mem * 0.8, 32000)
+        except:
+            available_memory_mb = 4000
+    
+    logger.info(f"Using device: {device}")
+    
+    # Create node
     node = DynamicNeuroNode(
         node_id=node_id,
         wallet_id=wallet_id,
         port=port,
-        available_memory_mb=memory_mb,
+        available_memory_mb=available_memory_mb,
         device=device,
-        enable_training=training,
+        enable_training=enable_training,
         max_storage_mb=max_storage_mb
     )
     
     if p2p_manager:
         node.p2p_manager = p2p_manager
+    
+    logger.info(f"DynamicNeuroNode initialized: memory={available_memory_mb}MB")
     
     node.start()
     return node
