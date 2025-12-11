@@ -229,11 +229,22 @@ class DynamicLayerPool:
             # STEP 1: Check if layer 0 has holders (is there a DRIVER?)
             layer_0_holders = self._discover_layer_holders_from_dht(0)
             
-            if not layer_0_holders or checkpoint_has_layer_0:
+            # Calculate memory needed for embedding (weight + Adam optimizer states)
+            # DRIVER must support full tokenizer vocab - no capping!
+            # Memory = vocab × hidden × 4 bytes × 3 (weight + Adam m + Adam v)
+            embed_memory_mb = (self.vocab_capacity * self.current_architecture.hidden_dim * 4 * 3) / (1024 * 1024)
+            can_fit_vocab = available_memory_mb >= embed_memory_mb + 200  # +200MB for at least 1 layer
+            
+            if (not layer_0_holders or checkpoint_has_layer_0) and can_fit_vocab:
                 # I am DRIVER (first node or reclaiming from checkpoint)
                 role = "DRIVER"
                 needs_embedding = True
                 logger.info(f"Becoming DRIVER (layer_0 holders: {len(layer_0_holders)}, checkpoint: {checkpoint_has_layer_0})")
+            elif not layer_0_holders and not can_fit_vocab:
+                # No DRIVER exists but I can't fit vocab - wait as WORKER (redundancy mode)
+                role = "WORKER"
+                needs_embedding = False
+                logger.warning(f"No DRIVER yet but can't fit embedding ({embed_memory_mb:.0f}MB needed, {available_memory_mb:.0f}MB available) - waiting as WORKER")
             else:
                 # Another node is DRIVER - I am WORKER
                 role = "WORKER"
@@ -511,12 +522,14 @@ class DynamicNeuroLLM(nn.Module):
         self.my_layer_ids = sorted(layer_ids)
         
         # Initialize embedding if we're the holder
+        # NOTE: DRIVER must support the FULL tokenizer vocab - no capping allowed!
+        # The role assignment logic should prevent small-memory nodes from becoming DRIVER.
         if self.layer_pool.embedding_holder == self.node_id:
             self.embedding = nn.Embedding(self.vocab_capacity, self.architecture.hidden_dim)
             self.embedding.to(self.device)
             self.has_embedding = True
-            logger.info(f"Initialized embedding: {self.vocab_capacity} tokens")
-        
+            logger.info(f"Initialized embedding: {self.vocab_capacity:,} tokens")
+
         # Initialize LM head if we're the holder
         if self.layer_pool.lm_head_holder == self.node_id:
             self.lm_head = nn.Linear(self.architecture.hidden_dim, self.vocab_capacity, bias=False)
@@ -806,8 +819,9 @@ class DynamicNeuroNode:
         try:
             from neuroshard.core.model.tokenizer import get_neuro_tokenizer
             tokenizer = get_neuro_tokenizer()
-            current_vocab = tokenizer.vocab_size
-            
+            # Use current_vocab_size (actual learned vocab), NOT vocab_size (10M max capacity)
+            current_vocab = tokenizer.current_vocab_size
+
             # Allocate for current vocab + growth headroom
             VOCAB_GROWTH_CHUNK = 32000
             capacity = ((current_vocab // VOCAB_GROWTH_CHUNK) + 1) * VOCAB_GROWTH_CHUNK
@@ -839,13 +853,13 @@ class DynamicNeuroNode:
             from neuroshard.core.model.tokenizer import get_neuro_tokenizer
             self.tokenizer = get_neuro_tokenizer()
             
-            logger.info(f"[TOKENIZER] Loaded BPE tokenizer: {self.tokenizer.vocab_size} tokens, "
+            logger.info(f"[TOKENIZER] Loaded BPE tokenizer: {self.tokenizer.current_vocab_size} tokens, "
                        f"{len(self.tokenizer.merges)} merges")
-            
-            # Check if vocab expansion needed
-            if self.tokenizer.vocab_size > self.model.vocab_capacity:
-                logger.info(f"[VOCAB] Tokenizer vocab ({self.tokenizer.vocab_size}) exceeds capacity ({self.model.vocab_capacity})")
-                self.model.check_and_expand_vocab_if_needed(self.tokenizer.vocab_size)
+
+            # Check if vocab expansion needed (use current_vocab_size, not max vocab_size)
+            if self.tokenizer.current_vocab_size > self.model.vocab_capacity:
+                logger.info(f"[VOCAB] Tokenizer vocab ({self.tokenizer.current_vocab_size}) exceeds capacity ({self.model.vocab_capacity})")
+                self.model.check_and_expand_vocab_if_needed(self.tokenizer.current_vocab_size)
         except Exception as e:
             logger.warning(f"[TOKENIZER] Error loading learned tokenizer: {e}")
     
