@@ -679,6 +679,10 @@ class SwarmEnabledDynamicNode:
         
         input_ids, labels = batch
         
+        # Check if data is actually ready (tuple might contain None values)
+        if input_ids is None or labels is None:
+            return None
+        
         # Forward pass
         self.model.train()
         outputs = self.model.forward_my_layers(

@@ -112,5 +112,62 @@ class TestObserverJetsonScenario(unittest.TestCase):
         
         print("\n✅ Test Passed: Observer skipped Layer 0, allowing Jetson to become Driver.")
 
+    def test_driver_with_lm_head_trains_locally(self):
+        """
+        Test that a DRIVER with LM head (temporary or permanent) trains locally,
+        even if there are other nodes in the network that hold higher layers.
+        """
+        print("\n=== Testing DRIVER with LM Head trains locally ===")
+        
+        from neuroshard.core.model.dynamic import DynamicNeuroNode
+        
+        # Create a mock node that has both embedding and LM head
+        node = DynamicNeuroNode(
+            node_id="test_driver",
+            wallet_id="test_wallet",
+            port=8000,
+            available_memory_mb=10000,
+            device="cpu",
+            enable_training=True
+        )
+        
+        # Mock the model
+        node.model = MagicMock()
+        node.model.has_embedding = True
+        node.model.has_lm_head = True  # Has LM head (temporary or permanent)
+        
+        # Mock p2p_manager that DOES find a next hop (simulating Observer with layers 4+)
+        node.p2p_manager = MagicMock()
+        node.p2p_manager.get_next_hop.return_value = "http://observer:8000"  # There IS a next hop
+        
+        # Mock _get_training_batch to return None (no data yet)
+        node._get_training_batch = MagicMock(return_value=(None, None))
+        
+        # Mock _train_step_local
+        node._train_step_local = MagicMock(return_value=0.5)
+        
+        # Mock _train_step_distributed (this should NOT be called)
+        node._train_step_distributed = MagicMock(return_value=0.3)
+        
+        # Call train_step
+        result = node.train_step()
+        
+        # Since _get_training_batch returns None, result should be None
+        self.assertIsNone(result)
+        
+        # Now simulate data being ready
+        mock_input = torch.randint(0, 1000, (4, 512))
+        mock_labels = torch.randint(0, 1000, (4, 512))
+        node._get_training_batch = MagicMock(return_value=(mock_input, mock_labels))
+        
+        # Call train_step again
+        result = node.train_step()
+        
+        # VERIFICATION: _train_step_local should be called, NOT _train_step_distributed
+        node._train_step_local.assert_called_once()
+        node._train_step_distributed.assert_not_called()
+        
+        print("✅ Test Passed: DRIVER with LM head trains locally (ignores next hop)")
+
 if __name__ == '__main__':
     unittest.main()

@@ -1100,11 +1100,22 @@ class DynamicNeuroNode:
         2. WORKER: Receive → forward → send to next
         3. VALIDATOR: Receive → forward → loss → backward → send grads
         4. Everyone updates their weights
+        
+        SPECIAL CASE: If DRIVER has LM head (temporary or permanent), train locally.
+        This handles the case where the DRIVER is the only training node in the network.
         """
         if not self.enable_training or not self.model:
             return None
         
         try:
+            # If we have both embedding AND LM head, we can train locally
+            # This is the "full node" or "solo driver" case
+            if self.model.has_embedding and self.model.has_lm_head:
+                input_ids, labels = self._get_training_batch()
+                if input_ids is None:
+                    return None
+                return self._train_step_local(input_ids, labels)
+            
             # Check if there's a next hop (another node with higher layers)
             my_last_layer = max(self.my_layer_ids) if self.my_layer_ids else 0
             next_layer = my_last_layer + 1
@@ -1116,23 +1127,19 @@ class DynamicNeuroNode:
                 if next_hop_url:
                     has_next_hop = True
             
-            # Determine if I'm a "full node" (can train independently)
-            # I'm full if: I have embedding AND (I have LM head AND no next hop)
-            am_validator = self.model.has_lm_head and not has_next_hop
-            is_full_node = self.model.has_embedding and am_validator
-            
             if self.model.has_embedding:
-                # I am DRIVER - get batch and start training
+                # I am DRIVER without LM head - need to forward to Validator
                 input_ids, labels = self._get_training_batch()
                 if input_ids is None:
                     return None
                 
-                if is_full_node:
-                    # Solo training - do everything locally
-                    return self._train_step_local(input_ids, labels)
-                else:
+                if has_next_hop:
                     # Distributed training - forward to next node
                     return self._train_step_distributed(input_ids, labels, next_hop_url)
+                else:
+                    # No next hop and no LM head - can't train yet
+                    logger.debug("DRIVER has no LM head and no next hop - waiting for Validator")
+                    return None
             else:
                 # I am WORKER/VALIDATOR - wait for data via gRPC
                 # Training happens when PipelineForward is called
@@ -1226,15 +1233,19 @@ class DynamicNeuroNode:
         
         # Forward to next node via gRPC
         try:
-            from neuroshard.core.network.connection_pool import get_connection_pool
+            from neuroshard.core.network.connection_pool import get_channel
+            from urllib.parse import urlparse
             import neuroshard.protos.neuroshard_pb2 as pb2
             import neuroshard.protos.neuroshard_pb2_grpc as pb2_grpc
             from neuroshard.utils.serialization import serialize_tensor, deserialize_tensor
             
-            # Get gRPC channel
-            pool = get_connection_pool()
-            grpc_addr = next_hop_url.replace("http://", "").replace(":8000", ":9000")
-            channel = pool.get_channel(grpc_addr)
+            # Parse HTTP URL and derive gRPC address (HTTP port + 1000)
+            parsed = urlparse(next_hop_url)
+            http_port = parsed.port or 8000
+            grpc_port = http_port + 1000
+            grpc_addr = f"{parsed.hostname}:{grpc_port}"
+            
+            channel = get_channel(grpc_addr)
             stub = pb2_grpc.NeuroShardStub(channel)
             
             # Serialize and send
