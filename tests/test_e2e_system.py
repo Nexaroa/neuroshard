@@ -109,6 +109,67 @@ class TestPipelineRouting:
         assert next_hop is not None
         print(f"✓ get_next_hop found: {next_hop}")
     
+    def test_get_next_hop_filters_non_training_peers(self):
+        """get_next_hop with for_training=True should skip non-training peers."""
+        from neuroshard.core.network.p2p import P2PManager
+        
+        # Create P2P manager
+        manager = P2PManager(
+            my_url="http://driver:8000",
+            shard_range="0-3",
+            tracker_url="http://tracker:3000",
+            node_token="test_token"
+        )
+        
+        # Add observer (training disabled) - should be skipped
+        manager.known_peers["http://observer:8000"] = {
+            "shard_range": "4-10",
+            "training_enabled": False,  # Observer with --no-training
+            "last_seen": time.time()
+        }
+        
+        # Add trainer (training enabled) - should be found
+        manager.known_peers["http://trainer:8000"] = {
+            "shard_range": "4-10",
+            "training_enabled": True,
+            "last_seen": time.time()
+        }
+        
+        # Without for_training, should find either
+        next_hop_any = manager.get_next_hop(4, for_training=False)
+        assert next_hop_any is not None
+        
+        # With for_training=True, should only find trainer
+        next_hop_training = manager.get_next_hop(4, for_training=True)
+        assert next_hop_training == "http://trainer:8000"
+        
+        print("✓ get_next_hop correctly filters non-training peers")
+    
+    def test_observer_excluded_from_training_pipeline(self):
+        """Observer nodes (--no-training) should be excluded from training pipeline."""
+        from neuroshard.core.network.p2p import P2PManager
+        
+        # Create P2P manager for driver
+        manager = P2PManager(
+            my_url="http://driver:8000",
+            shard_range="0-3",
+            tracker_url="http://tracker:3000",
+            node_token="test_token"
+        )
+        
+        # Only add observer (training disabled)
+        manager.known_peers["http://observer:8000"] = {
+            "shard_range": "4-10",
+            "training_enabled": False,
+            "last_seen": time.time()
+        }
+        
+        # With for_training=True, should NOT find the observer
+        next_hop = manager.get_next_hop(4, for_training=True)
+        
+        assert next_hop is None  # No training-capable peer found
+        print("✓ Observer correctly excluded from training pipeline")
+    
     def test_pipeline_route_ordering(self):
         """Pipeline route should be correctly ordered by layer."""
         from neuroshard.core.model.dynamic import DynamicLayerPool, LayerAssignment
@@ -338,6 +399,8 @@ if __name__ == "__main__":
     print("\n--- Pipeline Routing ---")
     t3 = TestPipelineRouting()
     t3.test_get_next_hop_finds_peer()
+    t3.test_get_next_hop_filters_non_training_peers()
+    t3.test_observer_excluded_from_training_pipeline()
     t3.test_pipeline_route_ordering()
     
     print("\n--- Gossip Proof Flow ---")
