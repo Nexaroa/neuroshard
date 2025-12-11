@@ -303,7 +303,12 @@ class SwarmEnabledDynamicNode:
         
         # Training state - sync from base node (may have been loaded from checkpoint)
         self._total_training_rounds = base_node.total_training_rounds
-        self._current_loss = base_node.current_loss if base_node.current_loss != float('inf') else float('inf')
+        # Handle None/inf loss values - default to inf for fresh start
+        base_loss = base_node.current_loss
+        if base_loss is None or (isinstance(base_loss, float) and base_loss == float('inf')):
+            self._current_loss = float('inf')
+        else:
+            self._current_loss = base_loss
         
         # Initialize swarm components (router, heartbeat, compute, etc.)
         # NOTE: Named swarm_components to avoid conflict with base_node.swarm (DataSwarm)

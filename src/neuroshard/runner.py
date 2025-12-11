@@ -734,9 +734,9 @@ async def get_api_stats():
         loop = asyncio.get_event_loop()
         node_stats = await loop.run_in_executor(None, NEURO_NODE.get_stats)
         
-        # Handle infinity values (not JSON serializable)
-        current_loss = node_stats.get("current_loss", float('inf'))
-        if math.isinf(current_loss) or math.isnan(current_loss):
+        # Handle infinity/None values (not JSON serializable)
+        current_loss = node_stats.get("current_loss")
+        if current_loss is None or (isinstance(current_loss, float) and (math.isinf(current_loss) or math.isnan(current_loss))):
             current_loss = None  # Use None for JSON compatibility
         
         # Determine role string for display
