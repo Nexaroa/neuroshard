@@ -1097,7 +1097,8 @@ def serve_grpc(port: int, model, p2p: P2PManager, swap_controller=None):
     )
     
     grpc_port = port + 1000
-    server.add_insecure_port(f'[::]:{grpc_port}')
+    # Bind to 0.0.0.0 for IPv4 compatibility ([::]  may not work on all systems)
+    server.add_insecure_port(f'0.0.0.0:{grpc_port}')
     server.start()
     GRPC_SERVER = server
     
