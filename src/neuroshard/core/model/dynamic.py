@@ -185,16 +185,20 @@ class DynamicLayerPool:
         node_url: str,
         grpc_addr: str,
         available_memory_mb: float,
-        staked_amount: float = 0.0
+        staked_amount: float = 0.0,
+        enable_training: bool = True
     ) -> List[int]:
         """
         Register a node and assign layers.
         
         SIMPLE PROTOCOL:
         1. Query DHT for layer_0 holders
-        2. If no holders → I am DRIVER (first node)
-        3. If holders exist → I am WORKER, take NEXT available layers
+        2. If no holders AND training enabled → I am DRIVER (first node)
+        3. If holders exist OR training disabled → I am WORKER
         4. Last node in pipeline becomes VALIDATOR (has LM head)
+        
+        NOTE: Non-training nodes (--no-training) cannot become DRIVER because
+        they can't drive the training pipeline. They provide redundancy only.
         """
         from neuroshard.core.economics.constants import VALIDATOR_MIN_MEMORY_MB
         
@@ -235,11 +239,17 @@ class DynamicLayerPool:
             embed_memory_mb = (self.vocab_capacity * self.current_architecture.hidden_dim * 4 * 3) / (1024 * 1024)
             can_fit_vocab = available_memory_mb >= embed_memory_mb + 200  # +200MB for at least 1 layer
             
-            if (not layer_0_holders or checkpoint_has_layer_0) and can_fit_vocab:
+            if (not layer_0_holders or checkpoint_has_layer_0) and can_fit_vocab and enable_training:
                 # I am DRIVER (first node or reclaiming from checkpoint)
+                # NOTE: Must have training enabled to be DRIVER (to drive the pipeline)
                 role = "DRIVER"
                 needs_embedding = True
                 logger.info(f"Becoming DRIVER (layer_0 holders: {len(layer_0_holders)}, checkpoint: {checkpoint_has_layer_0})")
+            elif not layer_0_holders and not enable_training:
+                # No DRIVER exists but training disabled - wait as WORKER (can't drive pipeline)
+                role = "WORKER"
+                needs_embedding = False
+                logger.info(f"No DRIVER yet but training disabled - waiting as WORKER (redundancy only)")
             elif not layer_0_holders and not can_fit_vocab:
                 # No DRIVER exists but I can't fit vocab - wait as WORKER (redundancy mode)
                 role = "WORKER"
@@ -797,7 +807,8 @@ class DynamicNeuroNode:
             node_url=f"http://localhost:{self.port}",
             grpc_addr=f"localhost:{self.port + 1000}",
             available_memory_mb=self.available_memory_mb,
-            staked_amount=staked_amount
+            staked_amount=staked_amount,
+            enable_training=self.enable_training
         )
         
         logger.info(f"Assigned {len(self.my_layer_ids)} layers: {self.my_layer_ids}")
