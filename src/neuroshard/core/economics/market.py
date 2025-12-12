@@ -518,7 +518,7 @@ class InferenceMarket:
                 self._update_market_price()
                 
                 logger.info(f"Request {request_id[:8]}... COMPLETE: "
-                           f"driver + {len(request.worker_proofs_received)} workers + validator")
+                           f"initiator + {len(request.processor_proofs_received)} processors + finisher")
                 
                 return True, ""
             

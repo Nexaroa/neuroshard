@@ -636,6 +636,17 @@ class QuorumRegistry:
         
         return quorums
     
+    def discover_quorums(self) -> List[Quorum]:
+        """
+        Discover all active quorums in the network.
+        
+        Alias for get_active_quorums() for API compatibility.
+        
+        Returns:
+            List of active quorums
+        """
+        return self.get_active_quorums()
+    
     def find_quorums_by_speed_tier(self, speed_tier: str) -> List[Quorum]:
         """
         Find quorums matching a speed tier.

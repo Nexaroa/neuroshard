@@ -38,17 +38,29 @@ from neuroshard.core.model.dynamic import DynamicNeuroNode, create_dynamic_node
 from neuroshard.core.model.tokenizer import get_neuro_tokenizer
 from neuroshard.core.network.p2p import P2PManager
 
-# Swarm Architecture Imports (Phase 4)
-try:
-    from neuroshard.core.swarm.factory import (
-        SwarmEnabledDynamicNode,
-        SwarmNodeConfig,
-        create_swarm_node,
-        create_swarm_node_with_p2p,
-    )
-    SWARM_AVAILABLE = True
-except ImportError:
-    SWARM_AVAILABLE = False
+# Swarm Architecture V2 Imports
+from neuroshard.core.swarm.factory import (
+    SwarmEnabledDynamicNode,
+    SwarmNodeConfig,
+    create_swarm_node,
+    create_swarm_node_with_p2p,
+)
+from neuroshard.core.swarm.quorum import (
+    Quorum,
+    QuorumMember,
+    QuorumLifecycle,
+    QuorumRole,
+    QuorumRegistry,
+    QuorumFormationService,
+    QuorumTrainer,
+    QuorumInferenceRouter,
+)
+from neuroshard.core.consensus.verifier import (
+    ProofVerifier,
+    PipelineProof,
+    CohortSyncProof,
+)
+from neuroshard.core.network.dht_protocol import DHTProtocol
 from neuroshard.core.economics.constants import (
     is_valid_stake_amount,
     is_valid_stake_duration,
@@ -81,9 +93,27 @@ _UVICORN_SERVER = None  # Global reference to uvicorn server for shutdown
 
 def request_shutdown():
     """Request graceful shutdown of the node. Called from GUI when stopping."""
-    global _UVICORN_SERVER, NEURO_NODE, P2P
+    global _UVICORN_SERVER, NEURO_NODE, P2P, QUORUM_TRAINER, CURRENT_QUORUM
     logger.info("[NODE] Shutdown requested...")
     _SHUTDOWN_REQUESTED.set()
+    
+    # Stop V2 QuorumTrainer first (cleanly exit training loop)
+    if QUORUM_TRAINER:
+        try:
+            logger.info("[NODE] Stopping QuorumTrainer...")
+            QUORUM_TRAINER.stop()
+            logger.info("[NODE] QuorumTrainer stopped.")
+        except Exception as e:
+            logger.error(f"[NODE] QuorumTrainer shutdown error: {e}")
+    
+    # Leave current quorum gracefully
+    if CURRENT_QUORUM and QUORUM_REGISTRY:
+        try:
+            logger.info(f"[NODE] Leaving quorum {CURRENT_QUORUM.quorum_id[:8]}...")
+            # Leave quorum will be handled by registry
+            QUORUM_REGISTRY.leave_quorum(CURRENT_QUORUM.quorum_id, NEURO_NODE.node_id if NEURO_NODE else "")
+        except Exception as e:
+            logger.error(f"[NODE] Quorum leave error: {e}")
     
     # Stop gRPC server first (releases port)
     try:
@@ -319,6 +349,15 @@ async def serve_dashboard(request: Request):
 NEURO_NODE: Optional[DynamicNeuroNode] = None
 P2P: Optional[P2PManager] = None
 SESSION_TIMESTAMPS = {}
+
+# V2 Architecture Components
+QUORUM_REGISTRY: Optional[QuorumRegistry] = None
+QUORUM_FORMATION: Optional[QuorumFormationService] = None
+QUORUM_TRAINER: Optional[QuorumTrainer] = None
+QUORUM_INFERENCE_ROUTER: Optional[QuorumInferenceRouter] = None
+PROOF_VERIFIER: Optional[ProofVerifier] = None
+DHT_PROTOCOL: Optional[DHTProtocol] = None
+CURRENT_QUORUM: Optional[Quorum] = None
 
 def get_app():
     return node_app
@@ -1074,6 +1113,93 @@ async def get_ponw_proof():
     return NEURO_NODE.get_ponw_proof()
 
 
+# =============================================================================
+# V2 API: Pipeline Proofs (PoNW)
+# =============================================================================
+
+@node_app.get("/api/v2/ponw")
+async def get_ponw_proof_v2():
+    """
+    V2: Get Proof of Neural Work with quorum context.
+    
+    Returns a PipelineProof that includes:
+    - Quorum membership information
+    - Pipeline position and layers processed
+    - DiLoCo sync round for cross-quorum verification
+    - Signed proof for cryptographic verification
+    """
+    if not NEURO_NODE:
+        raise HTTPException(status_code=503, detail="Node not ready")
+    
+    # Get base proof from node
+    base_proof = NEURO_NODE.get_ponw_proof()
+    
+    # Add V2 quorum context
+    v2_proof = {
+        **base_proof,
+        "version": 2,
+        "quorum_id": CURRENT_QUORUM.quorum_id if CURRENT_QUORUM else None,
+        "quorum_lifecycle": CURRENT_QUORUM.lifecycle.value if CURRENT_QUORUM else None,
+        "training_mode": STATE.get("training_mode", "unknown"),
+    }
+    
+    # Add QuorumTrainer stats if active
+    if QUORUM_TRAINER:
+        v2_proof["quorum_batches"] = QUORUM_TRAINER.total_batches
+        v2_proof["quorum_sync_round"] = QUORUM_TRAINER.sync_round
+        v2_proof["quorum_loss"] = QUORUM_TRAINER.current_loss
+    
+    # Add role information from quorum
+    if CURRENT_QUORUM and NEURO_NODE:
+        member = CURRENT_QUORUM.get_member(NEURO_NODE.node_id)
+        if member:
+            v2_proof["quorum_role"] = member.role.value
+            v2_proof["member_batches"] = member.batches_processed
+            v2_proof["member_reputation"] = member.reputation
+    
+    return v2_proof
+
+
+@node_app.post("/api/v2/ponw/verify")
+async def verify_ponw_proof_v2(proof: dict):
+    """
+    V2: Verify a PoNW proof using the ProofVerifier.
+    
+    Supports optimistic verification with challenge mechanism.
+    """
+    if not PROOF_VERIFIER:
+        raise HTTPException(status_code=503, detail="Proof verifier not initialized")
+    
+    try:
+        # Create PipelineProof from the submitted data
+        pipeline_proof = PipelineProof(
+            proof_id=proof.get("proof_id", ""),
+            node_id=proof.get("node_id", ""),
+            quorum_id=proof.get("quorum_id", ""),
+            micro_batch_id=proof.get("micro_batch_id", ""),
+            layer_range=(
+                proof.get("layer_start", 0),
+                proof.get("layer_end", 1),
+            ),
+            activation_hash=proof.get("activation_hash", ""),
+            gradient_hash=proof.get("gradient_hash", ""),
+            timestamp=proof.get("timestamp", time.time()),
+        )
+        
+        # Use optimistic acceptance
+        accepted, reason = PROOF_VERIFIER.accept_proof_optimistic(pipeline_proof)
+        
+        return {
+            "accepted": accepted,
+            "reason": reason,
+            "proof_id": pipeline_proof.proof_id,
+            "verification_mode": "optimistic",
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid proof: {e}")
+
+
 @node_app.get("/api/neuro")
 async def get_neuro_balance():
     """
@@ -1822,6 +1948,163 @@ async def inference_v1(req: InferenceV1Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =============================================================================
+# V2 API: Quorum-Based Inference
+# =============================================================================
+
+@node_app.get("/api/v2/inference/quorums")
+async def discover_inference_quorums():
+    """
+    V2: Discover available inference quorums.
+    
+    Returns a list of quorums that can handle inference requests,
+    sorted by score (latency, price, reputation).
+    """
+    if not QUORUM_INFERENCE_ROUTER:
+        raise HTTPException(status_code=503, detail="Quorum inference router not initialized")
+    
+    try:
+        quorums = QUORUM_INFERENCE_ROUTER.discover_quorums()
+        
+        return {
+            "quorums": [
+                {
+                    "quorum_id": q.quorum_id,
+                    "speed_tier": q.speed_tier,
+                    "initiator_endpoint": q.initiator_endpoint,
+                    "estimated_latency_ms": q.estimated_latency_ms,
+                    "price_per_token": q.price_per_token,
+                    "available_capacity": q.available_capacity,
+                }
+                for q in quorums
+            ],
+            "total": len(quorums),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class QuorumInferenceRequest(BaseModel):
+    """Request for V2 quorum-based inference."""
+    prompt: str
+    max_tokens: int = 256
+    temperature: float = 0.7
+    quorum_id: Optional[str] = None  # Optional: specific quorum to use
+
+
+@node_app.post("/api/v2/inference")
+async def inference_v2(req: QuorumInferenceRequest):
+    """
+    V2: Run inference through the quorum system.
+    
+    If quorum_id is specified, routes to that quorum's initiator.
+    Otherwise, discovers available quorums and selects the best one.
+    
+    For local inference (when this node is part of a quorum), uses
+    the local model directly.
+    """
+    import uuid
+    
+    if not NEURO_NODE:
+        raise HTTPException(status_code=503, detail="Node not ready")
+    
+    start_time = time.time()
+    request_id = f"v2_{uuid.uuid4().hex[:12]}"
+    
+    # Check if we should route to another quorum or handle locally
+    if QUORUM_INFERENCE_ROUTER and CURRENT_QUORUM:
+        # We're part of a quorum - check if we can handle it
+        if CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE:
+            # Route to quorum initiator (may be us)
+            member = CURRENT_QUORUM.get_member(NEURO_NODE.node_id)
+            if member and member.role == QuorumRole.INITIATOR:
+                # We are the initiator - handle locally
+                pass
+            elif req.quorum_id and req.quorum_id != CURRENT_QUORUM.quorum_id:
+                # User requested a different quorum
+                quorums = QUORUM_INFERENCE_ROUTER.discover_quorums()
+                target = next((q for q in quorums if q.quorum_id == req.quorum_id), None)
+                if target:
+                    return {
+                        "id": request_id,
+                        "redirect": True,
+                        "target_endpoint": target.initiator_endpoint,
+                        "message": f"Route to quorum {req.quorum_id[:8]}...",
+                    }
+    
+    # Handle inference locally
+    try:
+        text = NEURO_NODE.generate(
+            prompt=req.prompt,
+            max_new_tokens=req.max_tokens,
+            temperature=req.temperature,
+        )
+        
+        end_time = time.time()
+        inference_ms = (end_time - start_time) * 1000
+        
+        prompt_tokens = len(req.prompt.split())
+        completion_tokens = len(text.split())
+        
+        STATE["processed_count"] = STATE.get("processed_count", 0) + 1
+        
+        return {
+            "id": request_id,
+            "text": text,
+            "quorum_id": CURRENT_QUORUM.quorum_id if CURRENT_QUORUM else None,
+            "tokens_generated": completion_tokens,
+            "finish_reason": "stop",
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+            "cost": {
+                "amount": completion_tokens * 0.000001,
+                "currency": "NEURO",
+            },
+            "timing": {
+                "queue_ms": 0,
+                "inference_ms": inference_ms,
+                "total_ms": inference_ms,
+            },
+            "version": "v2",
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@node_app.get("/api/v2/quorum/status")
+async def get_quorum_status():
+    """
+    V2: Get current quorum status for this node.
+    """
+    if not CURRENT_QUORUM:
+        return {
+            "in_quorum": False,
+            "training_mode": STATE.get("training_mode", "unknown"),
+        }
+    
+    member = CURRENT_QUORUM.get_member(NEURO_NODE.node_id) if NEURO_NODE else None
+    
+    return {
+        "in_quorum": True,
+        "quorum_id": CURRENT_QUORUM.quorum_id,
+        "lifecycle": CURRENT_QUORUM.lifecycle.value,
+        "speed_tier": CURRENT_QUORUM.speed_tier,
+        "members": len(CURRENT_QUORUM.members),
+        "is_complete": CURRENT_QUORUM.is_complete,
+        "my_role": member.role.value if member else None,
+        "my_layers": list(member.layer_range) if member else None,
+        "total_batches": CURRENT_QUORUM.total_batches,
+        "session_remaining_seconds": max(0, CURRENT_QUORUM.session_end - time.time()),
+        "training_mode": STATE.get("training_mode", "unknown"),
+        "quorum_batches": STATE.get("quorum_batches", 0),
+        "quorum_loss": STATE.get("quorum_loss"),
+    }
+
+
 @node_app.get("/api/v1/wallet/balance")
 async def get_wallet_balance_v1():
     """Get wallet balance (SDK compatible)."""
@@ -2142,6 +2425,61 @@ def get_local_ip():
     finally:
         s.close()
     return IP
+
+
+def _get_speed_tier(node) -> str:
+    """
+    Determine the speed tier for a node based on hardware capabilities.
+    
+    Speed tiers match training throughput for efficient quorum formation:
+    - tier1: Enterprise GPUs (H100, A100) - fastest
+    - tier2: Consumer GPUs (RTX 4090, 3090)
+    - tier3: Mid-range GPUs (RTX 3080, 4070)
+    - tier4: Entry GPUs or fast CPU (RTX 3060, Apple M2)
+    - tier5: CPU-only or low-memory - slowest
+    
+    Returns:
+        Speed tier string (e.g., "tier2")
+    """
+    try:
+        device = getattr(node, 'device', 'cpu')
+        memory_mb = getattr(node, 'memory_limit_mb', 4096)
+        
+        if device == 'cuda':
+            # Check GPU type and memory
+            import torch
+            gpu_name = torch.cuda.get_device_name(0).lower() if torch.cuda.is_available() else ""
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0
+            
+            # Enterprise tier
+            if any(x in gpu_name for x in ['h100', 'a100', 'h200', 'a6000']):
+                return "tier1"
+            # High-end consumer
+            elif any(x in gpu_name for x in ['4090', '3090', 'a5000']) or gpu_memory >= 20:
+                return "tier2"
+            # Mid-range
+            elif any(x in gpu_name for x in ['4080', '3080', '4070', 'a4000']) or gpu_memory >= 10:
+                return "tier3"
+            # Entry-level GPU
+            else:
+                return "tier4"
+        
+        elif device == 'mps':
+            # Apple Silicon - tier based on memory
+            if memory_mb >= 32768:  # 32GB+ unified memory
+                return "tier3"
+            elif memory_mb >= 16384:  # 16GB
+                return "tier4"
+            else:
+                return "tier5"
+        
+        else:
+            # CPU-only
+            return "tier5"
+            
+    except Exception as e:
+        logger.warning(f"Could not determine speed tier: {e}")
+        return "tier5"  # Conservative default
 
 
 def run_node(
@@ -2510,436 +2848,368 @@ def run_node(
         NEURO_NODE.start_swarm_sync()
         logger.info("[SWARM] Swarm components started")
     
+    # =========================================================================
+    # V2 ARCHITECTURE: Initialize Quorum-Based Training System
+    # =========================================================================
+    global QUORUM_REGISTRY, QUORUM_FORMATION, QUORUM_TRAINER, QUORUM_INFERENCE_ROUTER
+    global PROOF_VERIFIER, DHT_PROTOCOL, CURRENT_QUORUM
+    
+    logger.info("[V2] Initializing quorum system...")
+    
+    # Initialize DHT Protocol for peer discovery
+    try:
+        DHT_PROTOCOL = DHTProtocol(
+            node_id=NEURO_NODE.node_id,
+            dht=P2P.routing_table if hasattr(P2P, 'routing_table') else None,
+        )
+        logger.info("[V2] DHT Protocol initialized")
+    except Exception as e:
+        logger.warning(f"[V2] DHT Protocol init failed: {e}, using fallback")
+        DHT_PROTOCOL = None
+    
+    # Initialize Quorum Registry (DHT-backed)
+    QUORUM_REGISTRY = QuorumRegistry(
+        dht=DHT_PROTOCOL,
+        node_id=NEURO_NODE.node_id,
+    )
+    logger.info("[V2] QuorumRegistry initialized")
+    
+    # Initialize Quorum Formation Service
+    QUORUM_FORMATION = QuorumFormationService(
+        registry=QUORUM_REGISTRY,
+        layer_pool=NEURO_NODE.layer_pool,
+        dht_protocol=DHT_PROTOCOL,
+    )
+    logger.info("[V2] QuorumFormationService initialized")
+    
+    # Initialize Quorum Inference Router
+    QUORUM_INFERENCE_ROUTER = QuorumInferenceRouter(
+        registry=QUORUM_REGISTRY,
+        dht_protocol=DHT_PROTOCOL,
+    )
+    logger.info("[V2] QuorumInferenceRouter initialized")
+    
+    # Initialize Proof Verifier for PoNW
+    PROOF_VERIFIER = ProofVerifier(
+        optimistic=True,  # Optimistic acceptance for liveness
+        network_size=len(P2P.known_peers) + 1,
+    )
+    logger.info("[V2] ProofVerifier initialized (optimistic mode)")
+    
+    # Determine speed tier from hardware
+    speed_tier = _get_speed_tier(NEURO_NODE)
+    STATE["speed_tier"] = speed_tier
+    logger.info(f"[V2] Node speed tier: {speed_tier}")
+    
+    # Form or join a quorum if training is enabled
+    if enable_training:
+        logger.info("[V2] Attempting quorum formation for training...")
+        
+        # Get gRPC endpoint
+        grpc_port = port + 1000  # Convention: gRPC is HTTP port + 1000
+        grpc_endpoint = f"{ip_addr}:{grpc_port}"
+        
+        # Total layers from model
+        total_layers = len(NEURO_NODE.my_layer_ids) if NEURO_NODE.my_layer_ids else 1
+        if NEURO_NODE.layer_pool:
+            total_layers = NEURO_NODE.layer_pool.current_num_layers
+        
+        # Form or join quorum
+        CURRENT_QUORUM = QUORUM_FORMATION.form_quorum(
+            initiator_node_id=NEURO_NODE.node_id,
+            initiator_endpoint=grpc_endpoint,
+            initiator_layers=(min(layer_ids) if layer_ids else 0, max(layer_ids) + 1 if layer_ids else 1),
+            initiator_speed_tier=speed_tier,
+            total_layers=total_layers,
+        )
+        
+        if CURRENT_QUORUM:
+            STATE["quorum_id"] = CURRENT_QUORUM.quorum_id
+            STATE["quorum_lifecycle"] = CURRENT_QUORUM.lifecycle.value
+            STATE["quorum_members"] = len(CURRENT_QUORUM.members)
+            
+            if CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE:
+                logger.info(f"[V2] Joined ACTIVE quorum {CURRENT_QUORUM.quorum_id[:8]}... "
+                           f"with {len(CURRENT_QUORUM.members)} members")
+                
+                # Initialize QuorumTrainer
+                QUORUM_TRAINER = QuorumTrainer(
+                    quorum=CURRENT_QUORUM,
+                    node_id=NEURO_NODE.node_id,
+                    model=NEURO_NODE.model,
+                    optimizer=NEURO_NODE.optimizer,
+                    genesis_loader=getattr(NEURO_NODE, 'genesis_loader', None),
+                    dht_protocol=DHT_PROTOCOL,
+                )
+                logger.info("[V2] QuorumTrainer initialized")
+            else:
+                logger.info(f"[V2] Quorum {CURRENT_QUORUM.quorum_id[:8]}... is FORMING, "
+                           "waiting for more members...")
+        else:
+            logger.info("[V2] No quorum formed yet, will retry in background...")
+    else:
+        logger.info("[V2] Training disabled, skipping quorum formation")
+    
+    logger.info("[V2] initialization complete")
+    # =========================================================================
+    
     # 5. Start gRPC Server
     start_grpc_background(port, NEURO_NODE, P2P, None)
     
-    # 5. Background tasks (runs every 1 second)
+    # 6. Background tasks - V2 Quorum-Based System (no legacy fallbacks)
     def background_tasks():
-        # CONTINUOUS TRAINING with USER-DEFINED THROTTLING
-        # Respects user's CPU AND RAM limits to allow background operation without hogging resources
-        # Settings are re-read each iteration so changes take effect immediately!
+        """
+        V2 Background Task Loop
+        
+        Training is ONLY done via QuorumTrainer:
+        - Form/join a quorum with speed-matched peers
+        - QuorumTrainer handles all training in its own thread
+        - DiLoCo sync happens across quorums automatically
+        - PoNW proofs are generated by the trainer
+        
+        This loop handles:
+        - Quorum monitoring and reformation
+        - State updates for dashboard
+        - Marketplace and housekeeping tasks
+        """
+        global QUORUM_TRAINER, CURRENT_QUORUM, QUORUM_FORMATION
         
         import psutil
         
-        # Store initial limits (can be updated via API)
+        # Store config
         STATE["config_cpu_threads"] = max_cpu_threads
         STATE["config_memory_mb"] = available_memory_mb
         STATE["config_storage_mb"] = max_storage_mb
         
-        total_cpu_cores = psutil.cpu_count() or 4
-        total_ram_mb = psutil.virtual_memory().total / (1024 * 1024)
-        last_throttle_log = 0
+        # Start QuorumTrainer if quorum is active
+        if enable_training and QUORUM_TRAINER and CURRENT_QUORUM:
+            if CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE:
+                logger.info("[V2] Starting QuorumTrainer...")
+                QUORUM_TRAINER.start()
+                STATE["training_mode"] = "quorum"
+                STATE["training_status"] = "active"
+            else:
+                STATE["training_mode"] = "forming"
+                STATE["training_status"] = "waiting_for_quorum"
+        elif enable_training:
+            STATE["training_mode"] = "forming"
+            STATE["training_status"] = "waiting_for_quorum"
+        else:
+            STATE["training_mode"] = "disabled"
+            STATE["training_status"] = "disabled"
         
-        def calculate_throttle():
-            """Calculate throttle settings from current config (allows live updates)."""
-            # Read current config (can be updated via API while running)
-            user_cpu_limit = STATE.get("config_cpu_threads") or total_cpu_cores
-            user_ram_limit = STATE.get("config_memory_mb") or (total_ram_mb * 0.7)
-            
-            cpu_ratio = min(1.0, user_cpu_limit / total_cpu_cores)
-            ram_ratio = min(1.0, user_ram_limit / total_ram_mb)
-            resource_ratio = min(cpu_ratio, ram_ratio)
-            
-            # GPU nodes can train much faster without lagging the system
-            is_gpu = NEURO_NODE.device in ["cuda", "mps"] if NEURO_NODE else False
-            
-            # Log device status occasionally to debug "why is it slow?"
-            # Use time.time() directly to avoid closure issues with 'now'
-            current_time = time.time()
-            if current_time - last_throttle_log >= 60:
-                 current_device = NEURO_NODE.device if NEURO_NODE else 'None'
-                 logger.debug(f"[NODE] Device: {current_device} (is_gpu={is_gpu})")
-            
-            base_interval = 0.01 if is_gpu else 2.0
-            
-            interval = max(base_interval, base_interval / max(0.1, resource_ratio))
-            # Allow much higher steps per minute on GPU
-            base_max_steps = 600 if is_gpu else 30
-            max_steps = max(5, int(base_max_steps * resource_ratio))
-            
-            # Store for API access
-            STATE["throttle_cpu_ratio"] = cpu_ratio
-            STATE["throttle_ram_ratio"] = ram_ratio
-            STATE["throttle_effective"] = resource_ratio
-            STATE["throttle_interval"] = interval
-            STATE["throttle_max_steps"] = max_steps
-            
-            return interval, max_steps, resource_ratio
-        
-        # Initial calculation and log
-        min_interval_between_steps, max_steps_per_minute, resource_ratio = calculate_throttle()
-        logger.info(f"[NODE] Training throttle: effective={resource_ratio*100:.0f}%, "
-              f"interval={min_interval_between_steps:.1f}s, max={max_steps_per_minute} steps/min")
-        
-        last_train_complete = 0
-        # BUGFIX: Initialize to current values (may be >0 if loaded from checkpoint)
+        # Timing
+        last_quorum_check = 0
+        last_memory_report = 0
+        last_heartbeat = 0
         last_tokens = NEURO_NODE.total_tokens_processed if NEURO_NODE else 0
         last_training_rounds = NEURO_NODE.total_training_rounds if NEURO_NODE else 0
-        training_in_progress = False
-        consecutive_data_not_ready = 0
-        steps_this_minute = 0
-        training_step_count = 0  # Track total steps for logging
-        minute_start = time.time()
-        last_memory_report = 0  # For periodic memory usage logging
-        last_training_heartbeat = 0  # For periodic training loop status
+        
+        QUORUM_CHECK_INTERVAL = 10  # Check quorum every 10 seconds
+        MEMORY_REPORT_INTERVAL = 60
+        HEARTBEAT_INTERVAL = 30
+        
+        logger.info("[V2] Background task loop started")
         
         while not _SHUTDOWN_REQUESTED.is_set():
             now = time.time()
             
-            # Reset per-minute counter
-            if now - minute_start >= 60:
-                steps_this_minute = 0
-                minute_start = now
-            
-            # RE-CALCULATE THROTTLE periodically (allows live config changes)
-            # Only recalculate every 5 seconds to avoid overhead
-            if now - last_throttle_log >= 5:
-                new_interval, new_max_steps, new_ratio = calculate_throttle()
-                # Log only if changed significantly
-                if abs(new_ratio - resource_ratio) > 0.05:
-                    logger.info(f"[NODE] Throttle updated: {new_ratio*100:.0f}% "
-                          f"(interval={new_interval:.1f}s, max={new_max_steps}/min)")
-                min_interval_between_steps = new_interval
-                max_steps_per_minute = new_max_steps
-                resource_ratio = new_ratio
-                last_throttle_log = now
-            
             # Update peer count
             STATE["peer_count"] = len(P2P.known_peers)
             
-            # TRAINING LOOP HEARTBEAT (every 30 seconds) - confirms loop is running
-            if now - last_training_heartbeat >= 30:
-                last_training_heartbeat = now
-                data_status = "unknown"
-                if hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
-                    try:
-                        loader = NEURO_NODE.genesis_loader
-                        loaded = len(loader.loaded_shards)
-                        prefetch = len(loader._prefetch_ready)
-                        data_status = f"loaded={loaded},prefetch={prefetch}"
-                    except Exception:
-                        data_status = "error"
-                logger.debug(f"[NODE] Training loop alive: status={STATE.get('training_status', '?')}, "
-                      f"steps={training_step_count}, data={data_status}")
-            
-            # PERIODIC MEMORY REPORT (every 60 seconds)
-            if now - last_memory_report >= 60:
-                try:
-                    import os
-                    process = psutil.Process(os.getpid())
-                    process_mem_mb = process.memory_info().rss / (1024 * 1024)
-                    memory_limit = STATE.get("config_memory_mb") or available_memory_mb
-                    system_mem = psutil.virtual_memory()
+            # =================================================================
+            # QUORUM MANAGEMENT (every 10 seconds)
+            # =================================================================
+            if now - last_quorum_check >= QUORUM_CHECK_INTERVAL:
+                last_quorum_check = now
+                
+                if CURRENT_QUORUM:
+                    STATE["quorum_id"] = CURRENT_QUORUM.quorum_id
+                    STATE["quorum_lifecycle"] = CURRENT_QUORUM.lifecycle.value
+                    STATE["quorum_members"] = len(CURRENT_QUORUM.members)
                     
-                    logger.info(f"[NODE] Memory: process={process_mem_mb:.0f}MB / {memory_limit or '?'}MB limit, "
-                          f"system={system_mem.percent:.0f}% ({system_mem.used/(1024**3):.1f}GB / {system_mem.total/(1024**3):.1f}GB)")
-
-                    # Show Genesis data loader stats if training
-                    if hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
-                        loader = NEURO_NODE.genesis_loader
-                        stats = loader.get_stats()
-                        num_loaded = stats.get('loaded_shards', 0)
-                        num_prefetched = stats.get('prefetch_ready', 0)
-                        shard_id = stats.get('current_shard_id', '?')
-                        shard_progress = stats.get('shard_progress_pct', 0)
-                        loss_avg = stats.get('loss_avg', 0)
+                    # Quorum became ACTIVE - start trainer
+                    if CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE:
+                        if not QUORUM_TRAINER:
+                            logger.info("[V2] Quorum ACTIVE, creating QuorumTrainer...")
+                            QUORUM_TRAINER = QuorumTrainer(
+                                quorum=CURRENT_QUORUM,
+                                node_id=NEURO_NODE.node_id,
+                                model=NEURO_NODE.model,
+                                optimizer=NEURO_NODE.optimizer,
+                                genesis_loader=getattr(NEURO_NODE, 'genesis_loader', None),
+                                dht_protocol=DHT_PROTOCOL,
+                            )
+                            QUORUM_TRAINER.start()
+                            STATE["training_mode"] = "quorum"
+                            STATE["training_status"] = "active"
+                            logger.info("[V2] QuorumTrainer started!")
+                        elif not QUORUM_TRAINER.running:
+                            QUORUM_TRAINER.start()
+                            STATE["training_status"] = "active"
+                    
+                    # Quorum dissolved - stop trainer and reform
+                    elif CURRENT_QUORUM.lifecycle in [QuorumLifecycle.DISSOLVED, QuorumLifecycle.DISSOLVING]:
+                        if QUORUM_TRAINER and QUORUM_TRAINER.running:
+                            logger.info("[V2] Quorum dissolving, stopping QuorumTrainer...")
+                            QUORUM_TRAINER.stop()
+                            QUORUM_TRAINER = None
+                            STATE["training_status"] = "reforming"
                         
-                        logger.info(f"[NODE] Genesis: shard {shard_id} ({shard_progress:.0f}% done), "
-                              f"{num_loaded} loaded + {num_prefetched} prefetched")
-                        
-                        # Show loss plateau status if loss is tracked
-                        if loss_avg > 0:
-                            loss_var = stats.get('loss_variance', 0)
-                            steps_shard = stats.get('steps_on_current_shard', 0)
-                            min_steps = 100  # Minimum steps before plateau can trigger rotation
+                        # Try to form new quorum
+                        if enable_training and QUORUM_FORMATION:
+                            logger.info("[V2] Reforming quorum...")
+                            grpc_port = port + 1000
+                            grpc_endpoint = f"{ip_addr}:{grpc_port}"
+                            layer_ids = NEURO_NODE.my_layer_ids
+                            total_layers = NEURO_NODE.layer_pool.current_num_layers if NEURO_NODE.layer_pool else 1
                             
-                            # Plateau = low variance + low loss + enough steps
-                            is_plateau = loss_var < 0.02 and loss_avg < 0.05 and steps_shard >= min_steps
-                            if is_plateau:
-                                plateau_status = "will_rotate"
-                            elif loss_var < 0.02 and loss_avg < 0.05:
-                                plateau_status = f"plateau (need {min_steps - steps_shard} more steps)"
-                            else:
-                                plateau_status = "learning"
-                            
-                            logger.info(f"[NODE] Training: loss_avg={loss_avg:.4f}, variance={loss_var:.6f}, "
-                                  f"steps_on_shard={steps_shard}, status={plateau_status}")
-
-                    last_memory_report = now
-                except Exception:
-                    pass
+                            CURRENT_QUORUM = QUORUM_FORMATION.form_quorum(
+                                initiator_node_id=NEURO_NODE.node_id,
+                                initiator_endpoint=grpc_endpoint,
+                                initiator_layers=(min(layer_ids), max(layer_ids) + 1),
+                                initiator_speed_tier=STATE.get("speed_tier", "tier5"),
+                                total_layers=total_layers,
+                            )
+                            if CURRENT_QUORUM:
+                                logger.info(f"[V2] Joined quorum {CURRENT_QUORUM.quorum_id[:8]}...")
+                
+                # No quorum yet - try to form one
+                elif enable_training and QUORUM_FORMATION:
+                    logger.debug("[V2] No quorum, attempting formation...")
+                    grpc_port = port + 1000
+                    grpc_endpoint = f"{ip_addr}:{grpc_port}"
+                    layer_ids = NEURO_NODE.my_layer_ids
+                    total_layers = NEURO_NODE.layer_pool.current_num_layers if NEURO_NODE.layer_pool else 1
+                    
+                    CURRENT_QUORUM = QUORUM_FORMATION.form_quorum(
+                        initiator_node_id=NEURO_NODE.node_id,
+                        initiator_endpoint=grpc_endpoint,
+                        initiator_layers=(min(layer_ids), max(layer_ids) + 1),
+                        initiator_speed_tier=STATE.get("speed_tier", "tier5"),
+                        total_layers=total_layers,
+                    )
+                    if CURRENT_QUORUM:
+                        logger.info(f"[V2] Formed quorum {CURRENT_QUORUM.quorum_id[:8]}...")
+                
+                # Update training stats from QuorumTrainer
+                if QUORUM_TRAINER and QUORUM_TRAINER.running:
+                    STATE["quorum_batches"] = QUORUM_TRAINER.total_batches
+                    STATE["quorum_loss"] = QUORUM_TRAINER.current_loss
+                    STATE["quorum_sync_round"] = QUORUM_TRAINER.sync_round
+                    STATE["training_batches"] = QUORUM_TRAINER.total_batches
+                    STATE["last_loss"] = QUORUM_TRAINER.current_loss
+                    STATE["current_loss"] = QUORUM_TRAINER.current_loss
             
-            # Update token count and training batches from node
+            # =================================================================
+            # STATE UPDATES
+            # =================================================================
+            # Update token/training counts from node
             current_tokens = NEURO_NODE.total_tokens_processed
             current_training = NEURO_NODE.total_training_rounds
-                
-            # Add DELTA to STATE counters (for PoNW proof calculation)
-            # NOTE: last_tokens/last_training_rounds are initialized to current values
-            # at startup to handle checkpoint loading correctly
+            
             STATE["token_count"] = STATE.get("token_count", 0) + (current_tokens - last_tokens)
-            STATE["training_batches"] = STATE.get("training_batches", 0) + (current_training - last_training_rounds)
+            STATE["total_tokens_processed"] = current_tokens
+            STATE["total_training_rounds"] = current_training
             
             last_tokens = current_tokens
             last_training_rounds = current_training
             
-            # Store totals for display
-            STATE["total_tokens_processed"] = current_tokens
-            STATE["total_training_rounds"] = current_training
+            # Update model hash
+            if NEURO_NODE.model and hasattr(NEURO_NODE, '_get_model_hash'):
+                STATE["model_hash"] = NEURO_NODE._get_model_hash()
             
-            # Update model hash for PoNW proofs
-            # IMPORTANT: Must use same hash algorithm as SwarmEnabledDynamicNode._get_model_hash()
-            # to ensure proofs verify correctly
-            if NEURO_NODE.model:
-                if hasattr(NEURO_NODE, '_get_model_hash'):
-                    # Use the swarm node's hash method for consistency
-                    STATE["model_hash"] = NEURO_NODE._get_model_hash()
-                else:
-                    # Fallback: compute architecture-based hash (same logic as factory.py)
-                    hasher = hashlib.sha256()
-                    arch_str = f"{NEURO_NODE.model.hidden_dim}:{len(NEURO_NODE.my_layer_ids)}:{getattr(NEURO_NODE.model, 'num_heads', 0)}"
-                    hasher.update(arch_str.encode())
-                    for name, param in sorted(NEURO_NODE.model.named_parameters()):
-                        hasher.update(f"{name}:{list(param.shape)}".encode())
-                    STATE["model_hash"] = hasher.hexdigest()[:16]
-        
-            # Session cleanup
-            to_remove = [sid for sid, ts in SESSION_TIMESTAMPS.items() if now - ts > 300]
-            for sid in to_remove:
-                del SESSION_TIMESTAMPS[sid]
-            
-            # Marketplace cleanup (every 60 seconds)
-            if int(now) % 60 == 0:
-                market = P2P.ledger.inference_market
-                # Cleanup stale claims
-                stale = market.cleanup_stale_claims()
-                if stale > 0:
-                    logger.info(f"[MARKET] Cleaned up {stale} stale claims")
-                # Cleanup old results
-                market.cleanup_old_results()
+            # =================================================================
+            # HEARTBEAT (every 30 seconds)
+            # =================================================================
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                last_heartbeat = now
                 
-                # VALIDATOR ELIGIBILITY CHECK
-                # Ensure validators still meet stake requirements when tier changes
-                if NEURO_NODE and NEURO_NODE.layer_pool:
-                    def get_node_stake(node_id: str) -> float:
-                        """Get stake for a node (checks local ledger)."""
-                        if node_id == NEURO_NODE.node_id:
-                            return P2P.ledger.get_account_info().get("stake", 0.0)
-                        # For remote nodes, we'd need to query their stake
-                        # For now, assume they meet requirements (trust but verify via gossip)
-                        return float('inf')
-                    
-                    # Check if any validators need demotion
-                    demoted = NEURO_NODE.layer_pool.validate_all_validators(get_node_stake)
-                    
-                    # If we were demoted, disable our LM head
-                    if NEURO_NODE.node_id in demoted and NEURO_NODE.model:
-                        NEURO_NODE.model.disable_lm_head()
-                        logger.warning("[NODE] Self-demoted from Validator due to stake tier change")
+                # Layer pool heartbeat
+                if NEURO_NODE.layer_pool:
+                    NEURO_NODE.layer_pool.heartbeat(NEURO_NODE.node_id, NEURO_NODE.my_layer_ids)
+                
+                # Log training status
+                if QUORUM_TRAINER and QUORUM_TRAINER.running:
+                    logger.info(f"[V2] Training: batches={QUORUM_TRAINER.total_batches}, "
+                               f"loss={QUORUM_TRAINER.current_loss or 'N/A'}, "
+                               f"sync_round={QUORUM_TRAINER.sync_round}")
+                elif enable_training:
+                    logger.info(f"[V2] Waiting for quorum formation...")
             
-            # CONTINUOUS TRAINING with smart throttling:
-            # 1. Training must be enabled
-            # 2. NEURO_NODE must exist  
-            # 3. No training currently in progress
-            # 4. Minimum interval since last step (for system responsiveness)
-            # 5. Haven't exceeded max steps per minute (optional throttle)
-            should_train = (
-                enable_training and 
-                not training_in_progress and
-                (now - last_train_complete) >= min_interval_between_steps and
-                steps_this_minute < max_steps_per_minute
-            )
-            
-            if should_train:
-                # MEMORY WARNING: Log if over limit (rate-limited to once per 60s)
-                # Note: This is informational only - we don't skip training because
-                # the --memory flag is a HINT for layer calculation, not a hard cap
+            # =================================================================
+            # MEMORY REPORT (every 60 seconds)
+            # =================================================================
+            if now - last_memory_report >= MEMORY_REPORT_INTERVAL:
+                last_memory_report = now
                 try:
                     import os
                     process = psutil.Process(os.getpid())
                     process_mem_mb = process.memory_info().rss / (1024 * 1024)
-                    memory_limit = STATE.get("config_memory_mb") or available_memory_mb
+                    system_mem = psutil.virtual_memory()
                     
-                    # Rate-limit warning to once per 60 seconds
-                    last_mem_warning = STATE.get("_last_mem_warning", 0)
-                    if memory_limit and process_mem_mb > memory_limit * 1.2 and (now - last_mem_warning) >= 60:
-                        STATE["_last_mem_warning"] = now
-                        system_mem = psutil.virtual_memory()
-                        logger.info(f"[NODE] Memory note: process={process_mem_mb:.0f}MB (limit={memory_limit}MB is a hint, not cap)")
-                        logger.info(f"[NODE] System has {system_mem.available / (1024**3):.1f}GB available - training continues normally")
-                        
-                        # Only clear caches if system memory is actually low (>80% used)
-                        if system_mem.percent > 80:
-                            logger.warning(f"[NODE] System memory high ({system_mem.percent}%), clearing caches...")
-                            if hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
-                                loader = NEURO_NODE.genesis_loader
-                                current_shard = loader.assigned_shard_ids[loader.current_shard_idx % len(loader.assigned_shard_ids)] if loader.assigned_shard_ids else None
-                                shards_to_remove = [sid for sid in loader.loaded_shards.keys() if sid != current_shard]
-                                for sid in shards_to_remove:
-                                    del loader.loaded_shards[sid]
-                                loader._prefetch_ready.clear()
-                            import gc
-                            gc.collect()
-                            if NEURO_NODE.device == "cuda":
-                                torch.cuda.empty_cache()
-                            elif NEURO_NODE.device == "mps":
-                                torch.mps.empty_cache()
+                    logger.info(f"[NODE] Memory: {process_mem_mb:.0f}MB, "
+                               f"System: {system_mem.percent:.0f}%")
+                    
+                    # Quorum status
+                    if CURRENT_QUORUM:
+                        logger.info(f"[V2] Quorum: {CURRENT_QUORUM.quorum_id[:8]}... "
+                                   f"({CURRENT_QUORUM.lifecycle.value}, "
+                                   f"{len(CURRENT_QUORUM.members)} members)")
                 except Exception:
                     pass
-                
-                # Check if data is ready (non-blocking)
-                data_ready = False
-                if hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
-                    try:
-                        # Use timeout to prevent lock contention from blocking training loop
-                        data_ready = NEURO_NODE.genesis_loader.is_data_ready()
-                    except Exception as e:
-                        logger.warning(f"[GENESIS] is_data_ready() error: {e}")
-                        data_ready = False
-                    
-                    # Show shard download status periodically
-                    if not data_ready and consecutive_data_not_ready % 5 == 0:
-                        try:
-                            stats = NEURO_NODE.genesis_loader.get_stats()
-                            logger.info(f"[GENESIS] Status: assigned={stats.get('assigned_shards', 0)} shards, "
-                                  f"loaded={stats.get('loaded_shards', 0)}, "
-                                  f"prefetching={stats.get('prefetch_in_progress', 0)}")
-                        except Exception:
-                            pass
-                    elif data_ready and training_step_count == 0:
-                        logger.info(f"[GENESIS] Data ready! Starting first training step...")
-                        training_step_count = 1  # Prevent repeat message
-                else:
-                    # No genesis loader yet - first training step will create it
-                    data_ready = True
-                
-                if data_ready or consecutive_data_not_ready > 3:
-                    training_in_progress = True
-                    consecutive_data_not_ready = 0
-                    step_start = time.time()
-                    
-                    STATE["training_status"] = "running"
-                    
-                    # Debug: Log why we're training
-                    if not data_ready:
-                        logger.debug(f"[NODE] Forcing training step after {consecutive_data_not_ready} waits")
-                    
-                    try:
-                        loss = NEURO_NODE.train_step()
-                        step_duration = time.time() - step_start
-                        
-                        if loss is not None:
-                            steps_this_minute += 1
-                            training_step_count += 1
-                            
-                            # Get LR from DiLoCo trainer if available
-                            lr_info = ""
-                            # Note: swarm_components contains SwarmComponents (DiLoCo, etc.)
-                            if hasattr(NEURO_NODE, 'swarm_components') and NEURO_NODE.swarm_components:
-                                diloco = getattr(NEURO_NODE.swarm_components, 'diloco_trainer', None)
-                                if diloco:
-                                    current_lr = diloco.get_current_lr()
-                                    lr_info = f", lr={current_lr:.2e}"
-                            
-                            # Log every step with timing info
-                            logger.info(f"[NODE] Training step #{NEURO_NODE.total_training_rounds}: "
-                                  f"loss={loss:.4f}{lr_info} ({step_duration:.1f}s)")
-                            STATE["training_status"] = "idle"
-                            STATE["last_loss"] = loss
-                            STATE["current_loss"] = loss  # For gossip proof creation
-                        else:
-                            # train_step returned None - log why
-                            logger.info(f"[NODE] Training step returned None (took {step_duration:.1f}s)")
-                            STATE["training_status"] = "waiting_for_data"
-                            
-                    except RuntimeError as e:
-                        error_msg = str(e).lower()
-                        if "not ready" in error_msg:
-                            if consecutive_data_not_ready == 0:
-                                logger.info(f"[NODE] Waiting for Genesis data to download...")
-                                if hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
-                                    stats = NEURO_NODE.genesis_loader.get_stats()
-                                    logger.info(f"[GENESIS] Downloading shard... "
-                                          f"(assigned: {stats.get('assigned_shards', '?')}, "
-                                          f"loaded: {stats.get('loaded_shards', 0)}, "
-                                          f"prefetching: {stats.get('prefetch_in_progress', 0)})")
-                            STATE["training_status"] = "loading_data"
-                            consecutive_data_not_ready += 1
-                        elif "genesis loader init failed" in error_msg or "manifest" in error_msg:
-                            # Genesis loader initialization error - show details
-                            logger.error(f"[GENESIS] ERROR: {e}")
-                            STATE["training_status"] = "genesis_error"
-                            # Don't spam - wait before retrying
-                            time.sleep(10)
-                        else:
-                            logger.error(f"[NODE] Training error: {e}")
-                            STATE["training_status"] = "error"
-                    except Exception as e:
-                        logger.error(f"[NODE] Training error: {e}")
-                        STATE["training_status"] = "error"
-                    
-                    training_in_progress = False
-                    last_train_complete = time.time()
-                else:
-                    consecutive_data_not_ready += 1
-                    if consecutive_data_not_ready == 1:
-                        logger.info(f"[NODE] Waiting for training data to load...")
             
-            # Heartbeat for layers (only every 10 seconds to reduce overhead)
-            if int(now) % 10 == 0 and NEURO_NODE.layer_pool:
-                NEURO_NODE.layer_pool.heartbeat(NEURO_NODE.node_id, NEURO_NODE.my_layer_ids)
+            # =================================================================
+            # HOUSEKEEPING (every 60 seconds)
+            # =================================================================
+            if int(now) % 60 == 0:
+                # Session cleanup
+                to_remove = [sid for sid, ts in SESSION_TIMESTAMPS.items() if now - ts > 300]
+                for sid in to_remove:
+                    del SESSION_TIMESTAMPS[sid]
                 
-                # Cleanup stale layer assignments (every 60 seconds)
-                if int(now) % 60 == 0:
+                # Marketplace cleanup
+                if P2P and P2P.ledger:
+                    market = P2P.ledger.inference_market
+                    stale = market.cleanup_stale_claims()
+                    if stale > 0:
+                        logger.info(f"[MARKET] Cleaned up {stale} stale claims")
+                    market.cleanup_old_results()
+                
+                # Validator eligibility check
+                if NEURO_NODE and NEURO_NODE.layer_pool:
+                    def get_node_stake(node_id: str) -> float:
+                        if node_id == NEURO_NODE.node_id:
+                            return P2P.ledger.get_account_info().get("stake", 0.0)
+                        return float('inf')
+                    
+                    demoted = NEURO_NODE.layer_pool.validate_all_validators(get_node_stake)
+                    if NEURO_NODE.node_id in demoted and NEURO_NODE.model:
+                        NEURO_NODE.model.disable_lm_head()
+                        logger.warning("[NODE] Demoted from Validator")
+                
+                # Layer pool cleanup
+                if NEURO_NODE.layer_pool:
                     removed = NEURO_NODE.layer_pool.cleanup_stale_assignments()
                     if removed:
-                        logger.info(f"[LAYER_POOL] Cleaned up {len(removed)} stale layer assignments")
+                        logger.info(f"[LAYER_POOL] Cleaned up {len(removed)} stale assignments")
             
-            # TOKENIZER AUTO-REFRESH: Check for vocab updates every 10 minutes
-            # Synced with MANIFEST_REFRESH_INTERVAL (600s) in GenesisDataLoader
-            # This ensures model embedding expands when tokenizer grows
-            if int(now) % 600 == 0:  # Every 10 minutes (matches data loader refresh)
+            # =================================================================
+            # TOKENIZER REFRESH (every 10 minutes)
+            # =================================================================
+            if int(now) % 600 == 0:
                 try:
                     if hasattr(NEURO_NODE, '_load_learned_tokenizer'):
                         old_vocab = NEURO_NODE.tokenizer.current_vocab_size if NEURO_NODE.tokenizer else 0
                         NEURO_NODE._load_learned_tokenizer()
                         new_vocab = NEURO_NODE.tokenizer.current_vocab_size if NEURO_NODE.tokenizer else 0
                         if new_vocab > old_vocab:
-                            logger.info(f"[TOKENIZER] Vocab updated: {old_vocab:,} → {new_vocab:,} tokens")
-                except Exception as e:
-                    logger.debug(f"[TOKENIZER] Refresh check failed: {e}")
+                            logger.info(f"[TOKENIZER] Vocab: {old_vocab:,} → {new_vocab:,}")
+                except Exception:
+                    pass
             
-            # RESOURCE-AWARE SLEEP: Adjust based on system load
-            # This ensures we're a good citizen when running in the background
-            try:
-                current_cpu = psutil.cpu_percent(interval=None)  # Non-blocking
-                current_mem = psutil.virtual_memory().percent
-                
-                # If system is under heavy load (not from us), back off
-                if current_cpu > 90 or current_mem > 90:
-                    time.sleep(5)  # Back off significantly if system is stressed
-                    continue
-                    
-                # Dynamic sleep based on activity and user's CPU setting
-                if training_in_progress:
-                    time.sleep(0.1)  # Fast loop during active training
-                else:
-                    # Check if data is likely ready (quick check without blocking)
-                    likely_data_ready = False
-                    if hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader:
-                        try:
-                            loader = NEURO_NODE.genesis_loader
-                            # Quick non-locking check - just look at dict sizes
-                            likely_data_ready = bool(loader._prefetch_ready or loader.loaded_shards or loader.current_dataset is not None)
-                        except Exception:
-                            pass
-                    
-                    if likely_data_ready:
-                        # Data might be ready - use shorter interval
-                        time.sleep(min_interval_between_steps * 0.5)
-                    else:
-                        time.sleep(1)  # Slower loop when idle/waiting
-            except:
-                time.sleep(1)  # Fallback if psutil fails
+            # Sleep - training happens in QuorumTrainer thread
+            time.sleep(1)
     
     threading.Thread(target=background_tasks, daemon=True).start()
     
