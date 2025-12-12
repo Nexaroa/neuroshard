@@ -176,6 +176,11 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                     success, reward, msg = ledger.process_proof(proof)
                     if success:
                         logger.info(f"[GOSSIP] ✓ Accepted proof from {request.node_id[:16]}...: {reward:.6f} NEURO")
+                        
+                        # 🔥 DECENTRALIZED: Also store proof in DHT for network-wide visibility
+                        # This ensures any node can query balances from DHT, not just local ledger
+                        self._store_received_proof_in_dht(proof, reward, request.public_key)
+                        
                         return neuroshard_pb2.GossipProofResponse(accepted=True)
                     else:
                         logger.info(f"[GOSSIP] ✗ Proof processing failed: {msg}")
@@ -190,6 +195,65 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
         except Exception as e:
             logger.error(f"GossipProof error: {e}")
             return neuroshard_pb2.GossipProofResponse(accepted=False)
+    
+    def _store_received_proof_in_dht(self, proof, reward: float, public_key: str):
+        """
+        Store a received proof in DHT for decentralized replication.
+        
+        This is called when we receive a valid proof via gossip. By storing it
+        in DHT, we ensure any node can query balances without relying on the
+        original sender's DHT availability.
+        
+        This makes the system TRULY DECENTRALIZED:
+        - Proofs are replicated across multiple DHT nodes
+        - Any node can verify balances by querying DHT
+        - No single point of failure
+        """
+        if not self.p2p or not self.p2p.dht:
+            return
+        
+        try:
+            import threading
+            from neuroshard.core.network.dht_proof_store import DHTProofStore, DHTProofRecord
+            
+            # Create DHT proof store
+            dht_store = DHTProofStore(self.p2p.dht)
+            
+            # Create proof record with all fields for verification
+            proof_record = DHTProofRecord(
+                node_id=proof.node_id,
+                timestamp=proof.timestamp,
+                proof_type=proof.proof_type.value if hasattr(proof.proof_type, 'value') else str(proof.proof_type),
+                nonce=proof.nonce,
+                reward=reward,
+                signature=proof.signature,
+                public_key=public_key or "",  # Include public key for trustless verification
+                uptime_seconds=proof.uptime_seconds,
+                tokens_processed=proof.tokens_processed,
+                training_batches=proof.training_batches,
+                data_samples=proof.data_samples,
+                model_hash=proof.model_hash,
+                layers_held=proof.layers_held,
+                has_embedding=proof.has_embedding,
+                has_lm_head=proof.has_lm_head
+            )
+            
+            # Get wallet_id (first 16 chars of node_id)
+            wallet_id = proof.node_id[:16]
+            
+            # Store in DHT (async to not block gRPC response)
+            def store_async():
+                try:
+                    success = dht_store.store_proof_in_dht(wallet_id, proof_record)
+                    if success:
+                        logger.debug(f"[DHT] Replicated proof for {wallet_id}... to DHT")
+                except Exception as e:
+                    logger.debug(f"[DHT] Replication failed: {e}")
+            
+            threading.Thread(target=store_async, daemon=True).start()
+            
+        except Exception as e:
+            logger.debug(f"DHT proof replication error: {e}")
     
     def GossipTransaction(self, request, context):
         """
