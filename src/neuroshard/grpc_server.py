@@ -140,6 +140,9 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             from neuroshard.core.economics.ledger import PoNWProof
             from neuroshard.core.crypto.ecdsa import register_public_key
             
+            # Log incoming proof for debugging
+            logger.info(f"[GOSSIP] Received proof from {request.node_id[:16]}... type={request.proof_type}")
+            
             # Register sender's public key for verification
             if request.public_key:
                 register_public_key(request.node_id, request.public_key)
@@ -172,13 +175,13 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                     # Process the proof (credits rewards)
                     success, reward, msg = ledger.process_proof(proof)
                     if success:
-                        logger.debug(f"[GOSSIP] Accepted proof from {request.node_id[:16]}...: {reward:.6f} NEURO")
+                        logger.info(f"[GOSSIP] ✓ Accepted proof from {request.node_id[:16]}...: {reward:.6f} NEURO")
                         return neuroshard_pb2.GossipProofResponse(accepted=True)
                     else:
-                        logger.debug(f"[GOSSIP] Proof processing failed: {msg}")
+                        logger.info(f"[GOSSIP] ✗ Proof processing failed: {msg}")
                         return neuroshard_pb2.GossipProofResponse(accepted=False)
                 else:
-                    logger.debug(f"[GOSSIP] Proof verification failed: {reason}")
+                    logger.info(f"[GOSSIP] ✗ Proof verification failed: {reason}")
                     return neuroshard_pb2.GossipProofResponse(accepted=False)
             
             # No ledger - just accept silently
