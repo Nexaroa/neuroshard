@@ -71,6 +71,7 @@ class DHTProofRecord:
     training_batches: int = 0
     data_samples: int = 0
     model_hash: str = ""  # 🔒 REQUIRED for canonical_payload
+    request_id: str = ""  # 🔒 REQUIRED for canonical_payload (inference proofs)
     
     # Role metadata
     layers_held: int = 0
@@ -311,12 +312,14 @@ class DHTProofStore:
                             logger.warning(f"❌ REJECTED proof {i+1}: No public key included (node {proof_record.node_id[:16]}...)")
                             continue
                         
-                        # Reconstruct canonical payload EXACTLY as in ledger.py:146-156
+                        # Reconstruct canonical payload EXACTLY as in ledger.py:176-181
                         # CRITICAL: Must match format from PoNWProof.canonical_payload()
+                        # Format: {node_id}:{proof_type}:{timestamp}:{nonce}:{uptime}:{tokens}:{batches}:{samples}:{request_id}:{model_hash}:{layers}
                         payload = (
                             f"{proof_record.node_id}:{proof_record.proof_type}:{proof_record.timestamp:.6f}:{proof_record.nonce}:"
                             f"{float(proof_record.uptime_seconds):.1f}:{proof_record.tokens_processed}:{proof_record.training_batches}:"
-                            f"{proof_record.data_samples}:{proof_record.model_hash}:{proof_record.layers_held}"
+                            f"{proof_record.data_samples}:{proof_record.request_id if proof_record.request_id else ''}:"
+                            f"{proof_record.model_hash}:{proof_record.layers_held}"
                         )
                         
                         # Verify ECDSA signature with provided public key

@@ -493,7 +493,7 @@ class P2PManager:
                 self._dht_proof_store = DHTProofStore(self.dht)
             
             # Create proof record with ALL fields for verification
-            # CRITICAL: Must include nonce, model_hash, and public_key for ECDSA verification
+            # CRITICAL: Must include nonce, model_hash, request_id, and public_key for ECDSA verification
             proof_record = DHTProofRecord(
                 node_id=proof.node_id,
                 timestamp=proof.timestamp,
@@ -507,6 +507,7 @@ class P2PManager:
                 training_batches=proof.training_batches,
                 data_samples=proof.data_samples,
                 model_hash=proof.model_hash,  # 🔒 Required for canonical_payload
+                request_id=proof.request_id if proof.request_id else "",  # 🔒 Required for canonical_payload
                 layers_held=proof.layers_held,
                 has_embedding=proof.has_embedding,
                 has_lm_head=proof.has_lm_head

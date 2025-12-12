@@ -220,6 +220,7 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             dht_store = DHTProofStore(self.p2p.dht)
             
             # Create proof record with all fields for verification
+            # CRITICAL: Must include request_id for canonical_payload to match signature
             proof_record = DHTProofRecord(
                 node_id=proof.node_id,
                 timestamp=proof.timestamp,
@@ -233,6 +234,7 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 training_batches=proof.training_batches,
                 data_samples=proof.data_samples,
                 model_hash=proof.model_hash,
+                request_id=proof.request_id if proof.request_id else "",  # 🔒 Required for signature
                 layers_held=proof.layers_held,
                 has_embedding=proof.has_embedding,
                 has_lm_head=proof.has_lm_head
