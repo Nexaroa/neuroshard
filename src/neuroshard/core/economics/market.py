@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 
 class RequestStatus(str, Enum):
     """Request lifecycle states."""
-    PENDING = "pending"              # Waiting for driver to claim
-    DRIVER_CLAIMED = "driver_claimed"  # Driver claimed, starting pipeline
+    PENDING = "pending"              # Waiting for initiator to claim
+    CLAIMED = "claimed"              # Initiator claimed, starting pipeline
     PROCESSING = "processing"        # Pipeline actively processing
     COMPLETED = "completed"          # All proofs received, done
     FAILED = "failed"                # Timeout or error
@@ -49,12 +49,12 @@ class InferenceRequest:
     """
     Marketplace request (PUBLIC metadata - NO PROMPT!).
     
-    Privacy: Prompt is sent DIRECTLY to driver node (encrypted).
+    Privacy: Prompt is sent DIRECTLY to initiator node (encrypted).
     The marketplace only orchestrates pricing and pipeline coordination.
     """
     request_id: str              # Unique ID (UUID)
     user_id: str                 # User who submitted
-    driver_node_id: str          # Which driver node will process (Layer 0)
+    initiator_node_id: str       # Which initiator node will process (Layer 0)
     
     # Pricing
     tokens_requested: int        # Max tokens to generate
@@ -69,13 +69,13 @@ class InferenceRequest:
     
     # Timestamps
     timestamp: float = 0.0       # When submitted
-    claimed_at: Optional[float] = None  # When driver claimed
+    claimed_at: Optional[float] = None  # When initiator claimed
     completed_at: Optional[float] = None # When all proofs received
     
-    # Proofs received (distributed inference)
-    driver_proof_received: bool = False
-    worker_proofs_received: List[str] = field(default_factory=list)  # Node IDs
-    validator_proof_received: bool = False
+    # Proofs received (quorum-based pipeline)
+    initiator_proof_received: bool = False
+    processor_proofs_received: List[str] = field(default_factory=list)  # Node IDs
+    finisher_proof_received: bool = False
     
     # Security
     user_signature: str = ""     # ECDSA signature authorizing payment
@@ -98,18 +98,18 @@ class NodeCapacity:
 @dataclass
 class PipelineSession:
     """
-    Tracks distributed inference pipeline across multiple nodes.
+    Tracks quorum-based inference pipeline across multiple nodes.
     
-    Privacy: Prompt is NEVER stored here - only driver knows it!
-    Workers only see activations (meaningless vectors).
+    Privacy: Prompt is NEVER stored here - only initiator knows it!
+    Processors only see activations (meaningless vectors).
     """
     session_id: str              # UUID
     request_id: str              # Links to InferenceRequest
-    driver_node_id: str          # Layer 0 (embedding)
+    initiator_node_id: str       # Layer 0 (embedding)
     
-    # Pipeline participants (discovered dynamically via DHT)
-    worker_node_ids: List[str] = field(default_factory=list)  # Layers 1-N
-    validator_node_id: Optional[str] = None  # LM Head
+    # Pipeline participants (quorum members)
+    processor_node_ids: List[str] = field(default_factory=list)  # Layers 1-N
+    finisher_node_id: Optional[str] = None  # LM Head
     
     # State tracking
     current_layer: int = 0       # Which layer is processing now
@@ -276,22 +276,22 @@ class InferenceMarket:
     def submit_request(
         self,
         user_id: str,
-        driver_node_id: str,
+        initiator_node_id: str,
         tokens_requested: int,
         max_price: float,
         user_signature: str = "",
         priority: int = 0
     ) -> Tuple[bool, str, float]:
         """
-        Submit inference request to marketplace (DISTRIBUTED INFERENCE).
+        Submit inference request to marketplace.
         
         PRIVACY: Prompt is NOT sent to marketplace!
-        User sends encrypted prompt DIRECTLY to driver node.
+        User sends encrypted prompt DIRECTLY to initiator node.
         Marketplace only handles pricing and pipeline coordination.
         
         Args:
             user_id: User submitting request
-            driver_node_id: Which driver node (Layer 0) will process
+            initiator_node_id: Which initiator node (Layer 0) will process
             tokens_requested: Max tokens to generate
             max_price: Max NEURO per 1M tokens user will pay
             user_signature: ECDSA signature authorizing payment
@@ -304,12 +304,12 @@ class InferenceMarket:
             - User signature validates authorization
             - Nonce prevents replay attacks
             - Price locked at current market rate
-            - Driver-specific (user chooses who sees prompt)
+            - Initiator-specific (user chooses who sees prompt)
         """
         try:
             # Input validation
-            if not user_id or not driver_node_id:
-                logger.warning("Invalid request: missing user_id or driver_node_id")
+            if not user_id or not initiator_node_id:
+                logger.warning("Invalid request: missing user_id or initiator_node_id")
                 return False, "", self.current_price
             
             if tokens_requested <= 0:
@@ -339,7 +339,7 @@ class InferenceMarket:
                 request = InferenceRequest(
                     request_id=request_id,
                     user_id=user_id,
-                    driver_node_id=driver_node_id,  # User chooses driver
+                    initiator_node_id=initiator_node_id,  # User chooses initiator
                     tokens_requested=tokens_requested,
                     max_price=max_price,
                     locked_price=current_price,  # LOCKED at submission time!
@@ -375,18 +375,18 @@ class InferenceMarket:
         
         DISTRIBUTED INFERENCE:
         - Only the specified driver node can claim
-        - Driver starts the pipeline (Layer 0)
-        - Workers and validators join via pipeline session
+        - Initiator starts the pipeline (Layer 0)
+        - Processors and finisher join via pipeline session
         
         Args:
-            node_id: Driver node ID attempting to claim
+            node_id: Initiator node ID attempting to claim
         
         Returns:
             InferenceRequest if claim successful, None if no requests available
         
         Security:
             - Atomic operation (thread-safe)
-            - Driver-specific (must match driver_node_id)
+            - Initiator-specific (must match initiator_node_id)
             - Priority-based selection
         """
         try:
@@ -398,14 +398,14 @@ class InferenceMarket:
                 if not self.pending_requests:
                     return None  # No requests available
                 
-                # Find requests for THIS driver only
+                # Find requests for THIS initiator only
                 my_requests = [
                     r for r in self.pending_requests.values()
-                    if r.driver_node_id == node_id
+                    if r.initiator_node_id == node_id
                 ]
                 
                 if not my_requests:
-                    return None  # No requests for this driver
+                    return None  # No requests for this initiator
                 
                 # Select best request (highest priority, oldest first)
                 sorted_requests = sorted(
@@ -418,7 +418,7 @@ class InferenceMarket:
                 # Claim the request (atomic operation)
                 request.claimed_at = time.time()
                 request.claimed_by = node_id  # Track who claimed it (for ledger verification)
-                request.status = RequestStatus.DRIVER_CLAIMED
+                request.status = RequestStatus.CLAIMED
                 
                 # Generate pipeline session ID
                 request.pipeline_session_id = str(uuid.uuid4())
@@ -427,7 +427,7 @@ class InferenceMarket:
                 self.claimed_requests[request.request_id] = request
                 del self.pending_requests[request.request_id]
                 
-                logger.info(f"Request {request.request_id[:8]}... claimed by DRIVER {node_id[:16]}... "
+                logger.info(f"Request {request.request_id[:8]}... claimed by INITIATOR {node_id[:16]}... "
                            f"(session {request.pipeline_session_id[:8]}...) at locked price {request.locked_price:.6f} NEURO/1M")
                 
                 return request
@@ -444,24 +444,24 @@ class InferenceMarket:
         self,
         request_id: str,
         node_id: str,
-        is_driver: bool,
-        is_validator: bool
+        is_initiator: bool,
+        is_finisher: bool
     ) -> Tuple[bool, str]:
         """
-        Track that a node has submitted proof for this request (DISTRIBUTED).
+        Track that a node has submitted proof for this request.
         
-        In distributed inference, multiple nodes process the same request:
-        - Driver (Layer 0)
-        - Workers (Layers 1-N)
-        - Validator (LM Head)
+        In quorum-based inference, multiple nodes process the same request:
+        - Initiator (Layer 0) - embeds input
+        - Processors (Layers 1-N) - process through layers
+        - Finisher (LM Head) - generates output
         
         Each submits their own proof. Request is complete when all proofs received.
         
         Args:
             request_id: Which request
             node_id: Which node submitted proof
-            is_driver: Has embedding layer
-            is_validator: Has LM head layer
+            is_initiator: Has embedding layer
+            is_finisher: Has LM head layer
         
         Returns:
             (is_request_complete, error_message)
@@ -482,23 +482,23 @@ class InferenceMarket:
                     return False, "Request not found"
                 
                 # Update proof tracking
-                if is_driver:
-                    request.driver_proof_received = True
-                    logger.debug(f"DRIVER proof received for {request_id[:8]}...")
-                elif is_validator:
-                    request.validator_proof_received = True
-                    logger.debug(f"VALIDATOR proof received for {request_id[:8]}...")
+                if is_initiator:
+                    request.initiator_proof_received = True
+                    logger.debug(f"INITIATOR proof received for {request_id[:8]}...")
+                elif is_finisher:
+                    request.finisher_proof_received = True
+                    logger.debug(f"FINISHER proof received for {request_id[:8]}...")
                 else:
-                    # Worker
-                    if node_id not in request.worker_proofs_received:
-                        request.worker_proofs_received.append(node_id)
-                    logger.debug(f"WORKER proof received for {request_id[:8]}... from {node_id[:16]}...")
+                    # Processor
+                    if node_id not in request.processor_proofs_received:
+                        request.processor_proofs_received.append(node_id)
+                    logger.debug(f"PROCESSOR proof received for {request_id[:8]}... from {node_id[:16]}...")
             
             # Check if all proofs received (request complete)
-            # Minimum: driver + validator (workers optional if single-node has all layers)
+            # Minimum: initiator + finisher (processors optional if single-node has all layers)
             all_proofs_received = (
-                request.driver_proof_received and
-                request.validator_proof_received
+                request.initiator_proof_received and
+                request.finisher_proof_received
             )
             
             if all_proofs_received and request.status != RequestStatus.COMPLETED:
@@ -578,18 +578,18 @@ class InferenceMarket:
         self,
         request_id: str,
         session_id: str,
-        driver_node_id: str
+        initiator_node_id: str
     ) -> bool:
         """
-        Start a distributed inference pipeline session.
+        Start a quorum-based inference pipeline session.
         
-        Called by driver node after claiming request.
-        Workers and validator will join dynamically via DHT.
+        Called by initiator node after claiming request.
+        Processors and finisher join from the quorum.
         
         Args:
             request_id: Which request this session serves
             session_id: Unique session identifier
-            driver_node_id: Driver node starting the pipeline
+            initiator_node_id: Initiator node starting the pipeline
         
         Returns:
             True if session started successfully
@@ -602,7 +602,7 @@ class InferenceMarket:
             session = PipelineSession(
                 session_id=session_id,
                 request_id=request_id,
-                driver_node_id=driver_node_id,
+                initiator_node_id=initiator_node_id,
                 started_at=time.time(),
                 last_activity=time.time()
             )
@@ -630,8 +630,8 @@ class InferenceMarket:
         self,
         session_id: str,
         node_id: str,
-        is_worker: bool = False,
-        is_validator: bool = False
+        is_processor: bool = False,
+        is_finisher: bool = False
     ):
         """Register a node as participant in the pipeline."""
         with self.lock:
@@ -640,12 +640,12 @@ class InferenceMarket:
                 logger.warning(f"Session {session_id[:8]}... not found")
                 return
             
-            if is_worker and node_id not in session.worker_node_ids:
-                session.worker_node_ids.append(node_id)
-                logger.debug(f"Worker {node_id[:16]}... joined session {session_id[:8]}...")
-            elif is_validator:
-                session.validator_node_id = node_id
-                logger.debug(f"Validator {node_id[:16]}... joined session {session_id[:8]}...")
+            if is_processor and node_id not in session.processor_node_ids:
+                session.processor_node_ids.append(node_id)
+                logger.debug(f"Processor {node_id[:16]}... joined session {session_id[:8]}...")
+            elif is_finisher:
+                session.finisher_node_id = node_id
+                logger.debug(f"Finisher {node_id[:16]}... joined session {session_id[:8]}...")
     
     def complete_pipeline_session(self, session_id: str):
         """Mark pipeline session as complete."""

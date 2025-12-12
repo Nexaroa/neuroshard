@@ -1,34 +1,50 @@
 """
 NeuroShard Consensus Module
 
-This module implements the Hybrid Validator Consensus system from the whitepaper:
+Implements Proof of Neural Work (PoNW) with optimistic verification:
 
-1. **ProofVerifier**: Universal constraints (hardware limits, format validation)
-2. **ValidatorConsensus**: Stake-weighted proof validation with 66% threshold
+1. **ProofVerifier**: Universal constraints + Optimistic Verification
+   - Physical rate limits (hardware capabilities)
+   - Format and sanity checks
+   - Optimistic accept-then-challenge model
+   - Challenge window management
 
-Architecture:
-=============
-- Validators = Nodes with Last Layer + LM Head + 100 NEURO staked
-- Multiple validators verify each proof via stake-weighted voting
-- 66% stake threshold required for consensus
-- Validators earn 0.001 NEURO per proof validated
-- Bad validators (vote against consensus) are slashed at 2x rate
+2. **Optimistic Verification Flow**:
+   - Proofs accepted IMMEDIATELY with rewards credited
+   - Challenge window (10 minutes) for verification
+   - Any node can challenge by staking NEURO
+   - Fraud detection → challenger wins, prover slashed
+   - No fraud → challenger loses stake to prover
 
-See: docs/whitepaper/neuroshard_whitepaper.tex Section 7 (Hybrid Validator System)
+3. **Proof Types**:
+   - PipelineProof: Batch-level proof in quorum training
+   - CohortSyncProof: DiLoCo sync round participation
+
+See: docs/ARCHITECTURE_V2.md Section 10 (Proof of Neural Work v2)
 """
 
-from neuroshard.core.consensus.verifier import ProofVerifier
-from neuroshard.core.consensus.validator_consensus import (
-    ValidatorConsensus,
-    ValidatorInfo,
-    ValidationVote,
-    ConsensusResult,
+from neuroshard.core.consensus.verifier import (
+    ProofVerifier,
+    PendingProof,
+    PendingProofStore,
+    ProofStatus,
+    PipelineProof,
+    CohortSyncProof,
+    CHALLENGE_WINDOW,
+    MIN_CHALLENGE_STAKE,
+    SLASH_MULTIPLIER,
+    get_verification_rate,
 )
 
 __all__ = [
     "ProofVerifier",
-    "ValidatorConsensus", 
-    "ValidatorInfo",
-    "ValidationVote",
-    "ConsensusResult",
+    "PendingProof",
+    "PendingProofStore",
+    "ProofStatus",
+    "PipelineProof",
+    "CohortSyncProof",
+    "CHALLENGE_WINDOW",
+    "MIN_CHALLENGE_STAKE",
+    "SLASH_MULTIPLIER",
+    "get_verification_rate",
 ]

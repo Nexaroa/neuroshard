@@ -143,7 +143,7 @@ class SwarmRouter:
     Integration:
     - Replaces single-hop routing in p2p.py
     - Works with SwarmHeartbeatService for capacity awareness
-    - Uses DHT for peer discovery fallback
+    - Uses DHT for decentralized peer discovery 
     """
     
     ACK_TIMEOUT_MS = 200       # Failover if no ACK in 200ms
@@ -151,22 +151,19 @@ class SwarmRouter:
     CACHE_TTL_SECONDS = 30     # How long to cache peer info
     
     def __init__(
-        self, 
+        self,
         dht_protocol: Optional[Any] = None,
         layer_pool: Optional[Any] = None,
-        tracker_url: Optional[str] = None,
     ):
         """
         Initialize SwarmRouter.
         
         Args:
-            dht_protocol: DHT protocol for peer discovery
+            dht_protocol: DHT protocol for decentralized peer discovery
             layer_pool: DynamicLayerPool for local layer info
-            tracker_url: Fallback tracker URL for peer discovery
         """
         self.dht = dht_protocol
         self.layer_pool = layer_pool
-        self.tracker_url = tracker_url
         
         # Peer state cache
         self.peer_stats: Dict[str, PeerCandidate] = {}
@@ -295,8 +292,7 @@ class SwarmRouter:
         
         Returns candidates from:
         1. Local cache (fastest) - peers we know from heartbeats
-        2. DHT lookup (if cache miss)
-        3. Tracker fallback (if DHT fails)
+        2. DHT lookup (if cache miss) - decentralized peer discovery
         
         Args:
             target_layer: The layer index we need to route to
@@ -315,13 +311,6 @@ class SwarmRouter:
         if len(candidates) < self.K_CANDIDATES and self.dht:
             dht_peers = self._dht_lookup_layer(target_layer)
             for peer in dht_peers:
-                if peer.node_id not in {c.node_id for c in candidates}:
-                    candidates.append(peer)
-        
-        # Strategy 3: Tracker fallback (if still not enough)
-        if len(candidates) < self.K_CANDIDATES and self.tracker_url:
-            tracker_peers = self._tracker_lookup_layer(target_layer)
-            for peer in tracker_peers:
                 if peer.node_id not in {c.node_id for c in candidates}:
                     candidates.append(peer)
         
@@ -391,44 +380,6 @@ class SwarmRouter:
             logger.debug(f"DHT lookup failed: {e}")
             return []
             
-    def _tracker_lookup_layer(self, target_layer: int) -> List[PeerCandidate]:
-        """Look up peers for a layer via centralized tracker."""
-        if not self.tracker_url:
-            return []
-            
-        try:
-            import requests
-            resp = requests.get(
-                f"{self.tracker_url}/peers",
-                params={"layer": target_layer},
-                timeout=2.0
-            )
-            
-            if resp.status_code != 200:
-                return []
-                
-            candidates = []
-            for peer_info in resp.json().get("peers", []):
-                try:
-                    # Parse shard range (e.g., "0-12")
-                    shard_str = peer_info.get("shard_range", "0-0")
-                    parts = shard_str.split("-")
-                    layer_range = (int(parts[0]), int(parts[1]) if len(parts) > 1 else int(parts[0]) + 1)
-                    
-                    peer = PeerCandidate(
-                        node_id=peer_info.get("node_id", peer_info.get("url", "")),
-                        grpc_addr=peer_info.get("url", ""),
-                        layer_range=layer_range,
-                    )
-                    candidates.append(peer)
-                except:
-                    continue
-                    
-            return candidates
-        except Exception as e:
-            logger.debug(f"Tracker lookup failed: {e}")
-            return []
-    
     async def _get_channel(self, grpc_addr: str) -> grpc.aio.Channel:
         """Get or create gRPC channel for address."""
         if grpc_addr not in self._channels:

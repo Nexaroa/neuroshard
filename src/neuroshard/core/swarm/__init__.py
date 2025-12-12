@@ -1,6 +1,6 @@
 # neuroshard/core/swarm/__init__.py
 """
-Swarm Architecture - THE architecture for NeuroShard.
+Swarm Architecture
 
 This package contains all swarm-related components:
 - factory: SwarmEnabledDynamicNode, create_swarm_node
@@ -13,6 +13,7 @@ This package contains all swarm-related components:
 - checkpoint: SpeculativeCheckpointer
 - service: SwarmServiceMixin
 - logger: SwarmLogger
+- quorum: Quorum, QuorumRegistry, QuorumMember
 """
 
 __all__ = [
@@ -58,6 +59,20 @@ __all__ = [
     'NodeRole',
     'get_swarm_logger',
     'init_swarm_logger',
+    # Quorum
+    'Quorum',
+    'QuorumMember',
+    'QuorumRegistry',
+    'QuorumLifecycle',
+    'QuorumRole',
+    'QuorumFormationService',
+    'QuorumLifecycleManager',
+    'QuorumTrainer',
+    'QuorumInferenceRouter',
+    'InferenceQuorumInfo',
+    'calculate_inference_price',
+    'SYNC_INTERVAL',
+    'OUTER_LR',
 ]
 
 def __getattr__(name):
@@ -103,4 +118,12 @@ def __getattr__(name):
     elif name in ('SwarmLogger', 'LogCategory', 'NodeRole', 'LogStats', 'get_swarm_logger', 'init_swarm_logger'):
         from neuroshard.core.swarm import logger
         return getattr(logger, name)
+    # Quorum
+    elif name in ('Quorum', 'QuorumMember', 'QuorumRegistry', 'QuorumLifecycle', 'QuorumRole',
+                  'QuorumFormationService', 'QuorumLifecycleManager', 'QuorumTrainer',
+                  'QuorumInferenceRouter', 'InferenceQuorumInfo', 'calculate_inference_price',
+                  'BASE_SESSION_DURATION', 'MAX_SESSION_DURATION', 'RENEWAL_CHECK_RATIO',
+                  'SYNC_INTERVAL', 'OUTER_LR'):
+        from neuroshard.core.swarm import quorum
+        return getattr(quorum, name)
     raise AttributeError(f"module 'neuroshard.core.swarm' has no attribute '{name}'")

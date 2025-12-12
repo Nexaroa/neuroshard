@@ -2,8 +2,11 @@ import grpc
 import threading
 import time
 import logging
+import json
+import hashlib
 from concurrent import futures
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from dataclasses import dataclass, asdict, field
 
 from protos import neuroshard_pb2
 from protos import neuroshard_pb2_grpc
@@ -12,6 +15,70 @@ from neuroshard.core.network.dht_service import node_to_proto, proto_to_node
 from neuroshard.core.network.connection_pool import get_channel
 
 logger = logging.getLogger("DHT")
+
+
+# =============================================================================
+# NETWORK STATE - Versioned Network Configuration
+# =============================================================================
+
+@dataclass
+class NetworkState:
+    """
+    Network-wide state stored in DHT at key "network:state".
+    
+    This contains versioned information about the current model architecture
+    and network configuration. All nodes should reference this to ensure
+    they're compatible with the current network state.
+    
+    Version fields:
+    - arch_version: Increments when model architecture changes (layers added)
+    - vocab_version: Increments when vocabulary expands (via governance)
+    """
+    # Version tracking
+    arch_version: int = 1           # Architecture version (increments on layer growth)
+    vocab_version: int = 1          # Vocabulary version (increments on vocab expansion)
+    
+    # Model architecture
+    num_layers: int = 11            # Current number of layers
+    hidden_dim: int = 512           # Hidden dimension
+    vocab_size: int = 32000         # Current vocabulary size
+    
+    # Network stats
+    total_nodes: int = 0            # Total active nodes
+    total_memory_mb: int = 0        # Total network memory
+    active_quorums: int = 0         # Number of active quorums
+    current_step: int = 0           # Global training step
+    
+    # Timestamps
+    last_updated: float = field(default_factory=time.time)
+    last_arch_upgrade: float = 0.0  # When architecture was last upgraded
+    
+    def to_json(self) -> str:
+        """Serialize to JSON string for DHT storage."""
+        return json.dumps(asdict(self))
+    
+    @classmethod
+    def from_json(cls, json_str: str) -> 'NetworkState':
+        """Deserialize from JSON string."""
+        data = json.loads(json_str)
+        return cls(**data)
+    
+    def is_compatible_with(self, other: 'NetworkState') -> bool:
+        """
+        Check if this state is compatible with another state.
+        
+        States are compatible if they have the same arch_version and vocab_version.
+        Different versions require synchronization before nodes can communicate.
+        """
+        return (self.arch_version == other.arch_version and 
+                self.vocab_version == other.vocab_version)
+
+
+# DHT keys for network state
+DHT_KEY_NETWORK_STATE = "network:state"
+DHT_KEY_ARCH_VERSION = "network:arch_version"
+DHT_KEY_VOCAB_VERSION = "network:vocab_version"
+
 
 class DHTProtocol:
     def __init__(self, local_node: Node, routing_table: RoutingTable, port: int):
@@ -259,3 +326,169 @@ class DHTProtocol:
                     # Found many nodes but all failed - this might be a real problem
                     logger.warning(f"DHT Announce failed: Could not store '{key_string}' (found {len(nodes)} nodes but store failed).")
                 self._last_no_peers_log[key_string] = now
+
+    # =========================================================================
+    # NETWORK STATE MANAGEMENT
+    # =========================================================================
+    
+    def get_network_state(self) -> Optional[NetworkState]:
+        """
+        Get the current network state from DHT.
+        
+        Returns:
+            NetworkState if found, None otherwise
+        """
+        try:
+            key_id = int(hashlib.sha1(DHT_KEY_NETWORK_STATE.encode()).hexdigest(), 16)
+            
+            # Check local storage first
+            if key_id in self.storage:
+                return NetworkState.from_json(self.storage[key_id])
+            
+            # Try DHT lookup
+            value = self.lookup_value(key_id)
+            if value:
+                return NetworkState.from_json(value)
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Failed to get network state: {e}")
+            return None
+    
+    def set_network_state(self, state: NetworkState) -> bool:
+        """
+        Store network state in DHT.
+        
+        This should be called when:
+        - Network architecture changes
+        - Vocabulary expands
+        - Periodically to update node counts
+        
+        Args:
+            state: NetworkState to store
+            
+        Returns:
+            True if stored successfully
+        """
+        try:
+            state.last_updated = time.time()
+            json_value = state.to_json()
+            
+            key_id = int(hashlib.sha1(DHT_KEY_NETWORK_STATE.encode()).hexdigest(), 16)
+            
+            # Store locally
+            self.storage[key_id] = json_value
+            
+            # Replicate to peers
+            nodes = self.lookup_node(key_id)
+            store_count = 0
+            for node in nodes:
+                try:
+                    if self.store(node, key_id, json_value):
+                        store_count += 1
+                except:
+                    pass
+            
+            logger.debug(f"Network state stored: arch_v{state.arch_version}, vocab_v{state.vocab_version}, replicated to {store_count} nodes")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to set network state: {e}")
+            return False
+    
+    def get_or_create_network_state(self) -> NetworkState:
+        """
+        Get existing network state or create default if none exists.
+        
+        This is the main entry point for nodes to get the current state.
+        If no state exists (first node), creates and stores a default.
+        
+        Returns:
+            NetworkState (existing or newly created)
+        """
+        state = self.get_network_state()
+        if state:
+            return state
+        
+        # Create default state (genesis)
+        state = NetworkState(
+            arch_version=1,
+            vocab_version=1,
+            num_layers=11,
+            hidden_dim=512,
+            vocab_size=32000,
+            total_nodes=1,
+            total_memory_mb=0,
+            active_quorums=0,
+            current_step=0,
+        )
+        
+        self.set_network_state(state)
+        logger.info("Created genesis network state")
+        return state
+    
+    def increment_arch_version(self, new_layers: int, new_hidden_dim: int) -> NetworkState:
+        """
+        Increment architecture version when model grows.
+        
+        Called when layer growth system triggers an upgrade.
+        
+        Args:
+            new_layers: New number of layers
+            new_hidden_dim: New hidden dimension
+            
+        Returns:
+            Updated NetworkState
+        """
+        state = self.get_or_create_network_state()
+        state.arch_version += 1
+        state.num_layers = new_layers
+        state.hidden_dim = new_hidden_dim
+        state.last_arch_upgrade = time.time()
+        
+        self.set_network_state(state)
+        logger.info(f"Architecture upgraded: v{state.arch_version} ({state.num_layers} layers, {state.hidden_dim} hidden)")
+        return state
+    
+    def increment_vocab_version(self, new_vocab_size: int) -> NetworkState:
+        """
+        Increment vocabulary version when vocab expands via governance.
+        
+        Args:
+            new_vocab_size: New vocabulary size
+            
+        Returns:
+            Updated NetworkState
+        """
+        state = self.get_or_create_network_state()
+        state.vocab_version += 1
+        state.vocab_size = new_vocab_size
+        
+        self.set_network_state(state)
+        logger.info(f"Vocabulary upgraded: v{state.vocab_version} ({state.vocab_size} tokens)")
+        return state
+    
+    def update_network_stats(self, total_nodes: int, total_memory_mb: int, active_quorums: int, current_step: int) -> NetworkState:
+        """
+        Update network statistics without changing versions.
+        
+        Called periodically to keep network stats current.
+        
+        Args:
+            total_nodes: Current node count
+            total_memory_mb: Total network memory
+            active_quorums: Active quorum count
+            current_step: Global training step
+            
+        Returns:
+            Updated NetworkState
+        """
+        state = self.get_or_create_network_state()
+        state.total_nodes = total_nodes
+        state.total_memory_mb = total_memory_mb
+        state.active_quorums = active_quorums
+        state.current_step = current_step
+        
+        self.set_network_state(state)
+        return state

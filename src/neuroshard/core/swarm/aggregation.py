@@ -77,7 +77,13 @@ class ValidationConfig:
 
 @dataclass
 class AggregationConfig:
-    """Configuration for aggregation."""
+    """
+    Configuration for aggregation.
+    
+    - use_freshness_weights: Enable sqrt(n) * freshness weighting
+      This gives fair influence based on batches processed while
+      preventing large nodes from dominating.
+    """
     strategy: AggregationStrategy = AggregationStrategy.TRIMMED_MEAN
     
     # Trimmed mean settings
@@ -93,17 +99,62 @@ class AggregationConfig:
     
     # Weighting
     use_trust_weights: bool = False       # Weight by peer trust scores
-    use_freshness_weights: bool = False   # Weight by gradient freshness
+    use_freshness_weights: bool = True    # Weight by sqrt(batches) * freshness
+
+
+def compute_contribution_weight(batches_processed: int, age_hours: float) -> float:
+    """
+    Compute contribution weight using sqrt(n) * freshness formula.
+    
+    Weight = sqrt(batches_processed) * freshness
+    
+    Freshness decay:
+    - < 1 hour:  1.0
+    - < 1 day:   0.9
+    - < 1 week:  0.7
+    - >= 1 week: 0.3
+    
+    Args:
+        batches_processed: Number of batches in this contribution
+        age_hours: Age of contribution in hours
+        
+    Returns:
+        Weight value
+    """
+    # Freshness decay
+    if age_hours < 1:
+        freshness = 1.0
+    elif age_hours < 24:  # < 1 day
+        freshness = 0.9
+    elif age_hours < 168:  # < 1 week
+        freshness = 0.7
+    else:
+        freshness = 0.3
+    
+    # sqrt(n) weighting
+    return math.sqrt(batches_processed) * freshness
 
 
 @dataclass
 class GradientContribution:
-    """A gradient contribution from a peer."""
+    """
+    A gradient contribution from a peer.
+    
+    Addition:
+    - batches_processed: Number of batches this contribution represents
+    - weight: Computed as sqrt(batches) * freshness
+    
+    This gives fair influence based on actual work done while
+    preventing large nodes from dominating.
+    """
     peer_id: str
     gradients: Dict[str, torch.Tensor]
     timestamp: float = field(default_factory=time.time)
     trust_score: float = 1.0
     signature: Optional[str] = None
+    
+    # Batch count for sqrt(n) weighting
+    batches_processed: int = 1
     
     # Validation results
     is_validated: bool = False
@@ -112,6 +163,45 @@ class GradientContribution:
     @property
     def age_seconds(self) -> float:
         return time.time() - self.timestamp
+    
+    @property
+    def age_hours(self) -> float:
+        """Get age in hours for freshness calculation."""
+        return self.age_seconds / 3600.0
+    
+    @property
+    def freshness(self) -> float:
+        """
+        Compute freshness factor based on age.
+        
+        Decay schedule:
+        - < 1 hour:  1.0 (fresh)
+        - < 1 day:   0.9
+        - < 1 week:  0.7
+        - >= 1 week: 0.3 (stale)
+        """
+        age = self.age_hours
+        if age < 1:
+            return 1.0
+        elif age < 24:  # < 1 day
+            return 0.9
+        elif age < 168:  # < 1 week
+            return 0.7
+        else:
+            return 0.3
+    
+    @property
+    def weight(self) -> float:
+        """
+        Compute contribution weight.
+        
+        Weight = sqrt(batches_processed) * freshness
+        
+        This provides fair influence:
+        - sqrt(n) prevents large nodes from dominating
+        - Freshness prioritizes recent contributions
+        """
+        return math.sqrt(self.batches_processed) * self.freshness
 
 
 class GradientValidator:
@@ -329,6 +419,7 @@ class RobustAggregator:
         reference_grads: Optional[Dict[str, torch.Tensor]] = None,
         trust_score: float = 1.0,
         validate: bool = True,
+        batches_processed: int = 1,
     ) -> Tuple[bool, str]:
         """
         Add a gradient contribution from a peer.
@@ -339,6 +430,7 @@ class RobustAggregator:
             reference_grads: Local reference for validation
             trust_score: Trust score of peer
             validate: Whether to validate before adding
+            batches_processed: Number of batches this contribution represents
         
         Returns:
             (accepted, reason) tuple
@@ -350,6 +442,7 @@ class RobustAggregator:
             peer_id=peer_id,
             gradients=gradients,
             trust_score=trust_score,
+            batches_processed=batches_processed,
         )
         
         # Validate if reference provided
@@ -424,7 +517,13 @@ class RobustAggregator:
         self,
         contributions: List[GradientContribution],
     ) -> Dict[str, torch.Tensor]:
-        """Simple mean aggregation."""
+        """
+        Mean aggregation with optional sqrt(n) * freshness weighting.
+        
+        Uses sqrt(batches_processed) * freshness as weights.
+        This gives fair influence based on actual work while preventing
+        large nodes from dominating.
+        """
         if not contributions:
             return {}
         
@@ -436,23 +535,29 @@ class RobustAggregator:
         # Average each parameter
         result = {}
         for name in param_names:
-            tensors = [
-                c.gradients[name] for c in contributions
-                if name in c.gradients
-            ]
+            # Filter contributions with this parameter
+            relevant = [c for c in contributions if name in c.gradients]
+            tensors = [c.gradients[name] for c in relevant]
+            
             if tensors:
-                # Apply trust weights if configured
+                # Compute weights
                 if self.agg_config.use_trust_weights:
-                    weights = torch.tensor([
-                        c.trust_score for c in contributions
-                        if name in c.gradients
-                    ])
-                    weights = weights / weights.sum()
-                    result[name] = sum(
-                        w * t for w, t in zip(weights, tensors)
-                    )
+                    # Trust-based weighting
+                    weights = torch.tensor([c.trust_score for c in relevant])
+                elif self.agg_config.use_freshness_weights:
+                    # sqrt(n) * freshness weighting
+                    weights = torch.tensor([c.weight for c in relevant])
                 else:
-                    result[name] = torch.stack(tensors).mean(dim=0)
+                    # Equal weighting
+                    weights = torch.ones(len(relevant))
+                
+                # Normalize weights
+                weights = weights / weights.sum()
+                
+                # Weighted sum
+                result[name] = sum(
+                    w.item() * t for w, t in zip(weights, tensors)
+                )
         
         return result
     

@@ -2956,15 +2956,15 @@ def run_node(
         """
         import time
         
-        # Check if this node is a driver
-        is_driver = NEURO_NODE and NEURO_NODE.model.has_embedding
+        # Check if this node is an initiator (has embedding layer)
+        is_initiator = NEURO_NODE and NEURO_NODE.model.has_embedding
         
-        if not is_driver:
-            logger.info("[DRIVER] Not a driver node - skipping marketplace worker loop")
+        if not is_initiator:
+            logger.info("[INITIATOR] Not an initiator node - skipping marketplace worker loop")
             return
         
-        logger.info("[DRIVER] Starting PRODUCTION marketplace worker loop...")
-        logger.info(f"[DRIVER] Will poll for requests assigned to: {NEURO_NODE.node_id[:16]}...")
+        logger.info("[INITIATOR] Starting PRODUCTION marketplace worker loop...")
+        logger.info(f"[INITIATOR] Will poll for requests assigned to: {NEURO_NODE.node_id[:16]}...")
         
         # Import encrypted prompt handling
         from neuroshard.core.network.encrypted_channel import PromptEncryption, PromptQueue
@@ -2985,14 +2985,14 @@ def run_node(
                 
                 market_request = market.get_request(request_id)
                 if not market_request:
-                    logger.warning(f"[DRIVER] ✗ Request {request_id[:8]}... not found in marketplace")
+                    logger.warning(f"[INITIATOR] ✗ Request {request_id[:8]}... not found in marketplace")
                     return
                 
                 # Get encrypted prompt
                 encrypted_prompt = prompt_queue.get_prompt(request_id)
                 
                 if not encrypted_prompt:
-                    logger.warning(f"[DRIVER] ✗ No prompt found for {request_id[:8]}...")
+                    logger.warning(f"[INITIATOR] ✗ No prompt found for {request_id[:8]}...")
                     return
                 
                 # Decrypt prompt
@@ -3001,9 +3001,9 @@ def run_node(
                         encrypted_prompt.encrypted_data,
                         request_id
                     )
-                    logger.info(f"[DRIVER] ✓ Decrypted prompt: '{prompt_text[:50]}...'")
+                    logger.info(f"[INITIATOR] ✓ Decrypted prompt: '{prompt_text[:50]}...'")
                 except Exception as e:
-                    logger.error(f"[DRIVER] ✗ Failed to decrypt prompt: {e}")
+                    logger.error(f"[INITIATOR] ✗ Failed to decrypt prompt: {e}")
                     return
                 
                 # Process using EXISTING distributed inference
@@ -3014,21 +3014,21 @@ def run_node(
                         temperature=0.8
                     )
                     
-                    logger.info(f"[DRIVER] ✓ Generated: '{output[:100]}...'")
-                    logger.info(f"[DRIVER] ✓ Request {request_id[:8]}... completed")
+                    logger.info(f"[INITIATOR] ✓ Generated: '{output[:100]}...'")
+                    logger.info(f"[INITIATOR] ✓ Request {request_id[:8]}... completed")
                     processing_requests[request_id] = "completed"
                     
                     # Store result in marketplace
                     market.store_result(request_id, output)
                     
                 except Exception as e:
-                    logger.error(f"[DRIVER] ✗ Generation failed: {e}")
+                    logger.error(f"[INITIATOR] ✗ Generation failed: {e}")
                     import traceback
                     traceback.print_exc()
                     processing_requests[request_id] = "failed"
                     
             except Exception as e:
-                logger.error(f"[DRIVER] ✗ Error processing {request_id[:8]}...: {e}")
+                logger.error(f"[INITIATOR] ✗ Error processing {request_id[:8]}...: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
                 processing_requests[request_id] = "failed"
@@ -3045,7 +3045,7 @@ def run_node(
                     request = market.claim_request(NEURO_NODE.node_id)
                     
                     if request:
-                        logger.info(f"[DRIVER] ✓ Claimed request {request.request_id[:8]}... "
+                        logger.info(f"[INITIATOR] ✓ Claimed request {request.request_id[:8]}... "
                               f"({request.tokens_requested} tokens @ {request.locked_price:.6f} NEURO/1M)")
                         
                         # Start pipeline session
@@ -3057,17 +3057,17 @@ def run_node(
                         
                         # Check if we already have the prompt
                         if prompt_queue.has_prompt(request.request_id):
-                            logger.info(f"[DRIVER] ✓ Prompt already received, processing immediately")
+                            logger.info(f"[INITIATOR] ✓ Prompt already received, processing immediately")
                             # Process immediately
                             process_request(request.request_id)
                         else:
-                            logger.info(f"[DRIVER] Waiting for encrypted prompt from user...")
-                            logger.info(f"[DRIVER] User should POST to /api/driver/prompt/{request.request_id[:8]}...")
+                            logger.info(f"[INITIATOR] Waiting for encrypted prompt from user...")
+                            logger.info(f"[INITIATOR] User should POST to /api/driver/prompt/{request.request_id[:8]}...")
                             processing_requests[request.request_id] = None  # Mark as waiting
                                     
                 except Exception as e:
                     if "not found" not in str(e).lower():
-                        logger.error(f"[DRIVER] Marketplace poll error: {e}")
+                        logger.error(f"[INITIATOR] Marketplace poll error: {e}")
                 
                 last_claim_attempt = now
             
@@ -3075,7 +3075,7 @@ def run_node(
             for request_id in list(processing_requests.keys()):
                 if processing_requests[request_id] is None:  # Waiting for prompt
                     if prompt_queue.has_prompt(request_id):
-                        logger.info(f"[DRIVER] ✓ Prompt received for {request_id[:8]}..., starting processing")
+                        logger.info(f"[INITIATOR] ✓ Prompt received for {request_id[:8]}..., starting processing")
                         # Process (uses existing distributed inference)
                         process_request(request_id)
                         processing_requests[request_id] = "processing"  # Mark as processing

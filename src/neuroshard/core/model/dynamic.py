@@ -16,8 +16,9 @@ import logging
 import os
 import json
 from typing import List, Dict, Optional, Tuple, Any, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,555 @@ logger = logging.getLogger(__name__)
 INITIAL_VOCAB_SIZE = 32000
 # Maximum vocab size to pre-allocate for
 MAX_VOCAB_SIZE = 10_000_000
+
+
+# =============================================================================
+# SPEED TIERS - Node Classification by Compute Speed
+# =============================================================================
+
+class SpeedTier(Enum):
+    """
+    Speed tier classification based on per-layer forward pass latency.
+    
+    Used for:
+    - Quorum formation (speed-matched nodes train together)
+    - Contribution mode selection
+    - Reward multipliers
+    """
+    T1 = "tier1"  # < 10ms/layer (H100, A100, high-end data center)
+    T2 = "tier2"  # 10-50ms/layer (RTX 4090, 3090, good consumer GPU)
+    T3 = "tier3"  # 50-200ms/layer (RTX 3060, mid-range GPU, good CPU)
+    T4 = "tier4"  # 200-1000ms/layer (older GPU, standard CPU)
+    T5 = "tier5"  # > 1000ms/layer (Raspberry Pi, old hardware)
+
+
+# Speed tier thresholds in milliseconds
+SPEED_TIER_THRESHOLDS = {
+    SpeedTier.T1: 10,
+    SpeedTier.T2: 50,
+    SpeedTier.T3: 200,
+    SpeedTier.T4: 1000,
+    SpeedTier.T5: float('inf')
+}
+
+# Compatible speed tiers for quorum formation
+# Nodes within 1 tier of each other can form quorums
+COMPATIBLE_TIERS = {
+    SpeedTier.T1: [SpeedTier.T1, SpeedTier.T2],
+    SpeedTier.T2: [SpeedTier.T1, SpeedTier.T2, SpeedTier.T3],
+    SpeedTier.T3: [SpeedTier.T2, SpeedTier.T3, SpeedTier.T4],
+    SpeedTier.T4: [SpeedTier.T3, SpeedTier.T4, SpeedTier.T5],
+    SpeedTier.T5: [SpeedTier.T4, SpeedTier.T5],
+}
+
+
+def classify_speed_tier(latency_ms: float) -> SpeedTier:
+    """
+    Classify a node into a speed tier based on measured latency.
+    
+    Args:
+        latency_ms: Average latency per layer in milliseconds
+        
+    Returns:
+        SpeedTier enum value
+    """
+    if latency_ms < SPEED_TIER_THRESHOLDS[SpeedTier.T1]:
+        return SpeedTier.T1
+    elif latency_ms < SPEED_TIER_THRESHOLDS[SpeedTier.T2]:
+        return SpeedTier.T2
+    elif latency_ms < SPEED_TIER_THRESHOLDS[SpeedTier.T3]:
+        return SpeedTier.T3
+    elif latency_ms < SPEED_TIER_THRESHOLDS[SpeedTier.T4]:
+        return SpeedTier.T4
+    else:
+        return SpeedTier.T5
+
+
+def are_tiers_compatible(tier1: SpeedTier, tier2: SpeedTier) -> bool:
+    """Check if two speed tiers are compatible for quorum formation."""
+    return tier2 in COMPATIBLE_TIERS.get(tier1, [])
+
+
+# =============================================================================
+# CONTRIBUTION MODES - How a Node Participates in the Network
+# =============================================================================
+
+class ContributionMode(Enum):
+    """
+    Contribution mode determines how a node participates in the network.
+    
+    Each node operates in one of these modes based on its capabilities
+    and current network needs. Mode selection is automatic.
+    """
+    PIPELINE = "pipeline"      # Real-time quorum member (synchronous training)
+    ASYNC = "async"            # Offline training, submit gradients periodically
+    DATA = "data"              # Store and serve Genesis training data
+    VERIFY = "verify"          # Re-execute proofs for verification
+    INFERENCE = "inference"    # Serve inference requests only
+    IDLE = "idle"              # Available but not actively contributing
+
+
+# Mode requirements
+MODE_REQUIREMENTS = {
+    ContributionMode.PIPELINE: {
+        "min_speed_tier": SpeedTier.T4,  # T5 too slow for real-time pipeline
+        "requires_layers": True,
+        "requires_quorum": True,
+    },
+    ContributionMode.ASYNC: {
+        "min_speed_tier": SpeedTier.T5,  # Any speed tier can do async
+        "requires_layers": True,
+        "requires_quorum": False,
+    },
+    ContributionMode.DATA: {
+        "min_speed_tier": SpeedTier.T5,
+        "requires_layers": False,
+        "requires_storage": True,
+    },
+    ContributionMode.VERIFY: {
+        "min_speed_tier": SpeedTier.T5,
+        "requires_layers": False,
+        "requires_stake": True,
+    },
+    ContributionMode.INFERENCE: {
+        "min_speed_tier": SpeedTier.T5,
+        "requires_layers": True,
+        "requires_quorum": False,
+    },
+    ContributionMode.IDLE: {
+        "min_speed_tier": SpeedTier.T5,
+        "requires_layers": False,
+    },
+}
+
+
+def select_contribution_mode(
+    speed_tier: SpeedTier,
+    has_layers: bool,
+    has_quorum: bool,
+    has_genesis_data: bool,
+    has_stake: bool,
+    network_needs_verifiers: bool = False,
+    network_needs_data_providers: bool = False,
+) -> ContributionMode:
+    """
+    Automatically select the best contribution mode for a node.
+    
+    Decision logic:
+    1. T5 nodes can't do real-time pipeline -> ASYNC or DATA
+    2. If can join/form quorum -> PIPELINE
+    3. If network needs verifiers and has stake -> VERIFY
+    4. If network needs data providers and has genesis -> DATA
+    5. Fall back to ASYNC
+    
+    Args:
+        speed_tier: Node's speed tier from benchmarking
+        has_layers: Whether node holds model layers
+        has_quorum: Whether node is part of an active quorum
+        has_genesis_data: Whether node has Genesis dataset shards
+        has_stake: Whether node has staked NEURO
+        network_needs_verifiers: Whether network needs more verifiers
+        network_needs_data_providers: Whether network needs more data providers
+        
+    Returns:
+        ContributionMode enum value
+    """
+    # T5 nodes are too slow for real-time pipeline
+    if speed_tier == SpeedTier.T5:
+        if has_genesis_data:
+            return ContributionMode.DATA
+        return ContributionMode.ASYNC
+    
+    # Can join real-time pipeline if in a quorum
+    if has_quorum and has_layers:
+        return ContributionMode.PIPELINE
+    
+    # Check if we should become a verifier
+    if network_needs_verifiers and has_stake:
+        return ContributionMode.VERIFY
+    
+    # Check if we should be a data provider
+    if network_needs_data_providers and has_genesis_data:
+        return ContributionMode.DATA
+    
+    # Default to async if we have layers but no quorum
+    if has_layers:
+        return ContributionMode.ASYNC
+    
+    # No layers, no special role -> idle
+    return ContributionMode.IDLE
+
+
+# =============================================================================
+# LAYER GROWTH SYSTEM
+# =============================================================================
+# The model grows organically as the network expands.
+# Layer growth follows a 5-phase sequence for safe upgrades.
+
+class GrowthPhase(Enum):
+    """Phases of the layer growth sequence."""
+    NONE = "none"                  # No growth in progress
+    ANNOUNCEMENT = "announcement"  # Upgrade announced, grace period
+    PREPARATION = "preparation"    # New layer entries created in DHT
+    ACTIVATION = "activation"      # Verify coverage before activation
+    REFORMATION = "reformation"    # Quorums dissolve and reform
+    WARMUP = "warmup"              # New layer trains at reduced LR
+
+
+@dataclass
+class ArchitectureUpgrade:
+    """Represents a pending architecture upgrade."""
+    upgrade_id: str
+    target_layers: int          # New number of layers
+    target_hidden_dim: int      # New hidden dimension
+    phase: GrowthPhase = GrowthPhase.NONE
+    phase_start_time: float = 0.0
+    
+    # Phase durations (seconds)
+    announcement_duration: float = 300.0   # 5 min grace period
+    preparation_duration: float = 120.0    # 2 min for DHT propagation
+    activation_timeout: float = 600.0      # 10 min to verify coverage
+    reformation_timeout: float = 300.0     # 5 min for quorum reformation
+    warmup_duration: float = 600.0         # 10 min reduced LR
+    
+    # Warmup settings
+    warmup_lr_multiplier: float = 0.1      # 10% of normal LR during warmup
+    
+    def to_dict(self) -> dict:
+        return {
+            "upgrade_id": self.upgrade_id,
+            "target_layers": self.target_layers,
+            "target_hidden_dim": self.target_hidden_dim,
+            "phase": self.phase.value,
+            "phase_start_time": self.phase_start_time,
+        }
+
+
+# Growth trigger thresholds
+GROWTH_CAPACITY_THRESHOLD = 1.5    # Trigger when capacity is 1.5x needed
+GROWTH_CAPACITY_MAX = 2.0          # Don't grow if capacity > 2x needed
+GROWTH_STABILITY_STEPS = 10000     # Min steps since last growth
+GROWTH_MIN_COVERAGE = 0.95         # All layers must have 95% coverage
+
+
+def check_layer_growth(
+    current_layers: int,
+    current_hidden_dim: int,
+    total_network_memory_mb: int,
+    steps_since_last_growth: int,
+    layer_coverage: dict,  # {layer_id: replica_count}
+    network_size: int,
+) -> Optional[ArchitectureUpgrade]:
+    """
+    Check if conditions are met for layer growth.
+    
+    Growth triggers:
+    1. Capacity threshold: Network has 1.5x-2.0x needed capacity
+    2. Layer coverage: All layers have minimum replicas
+    3. Stability: At least 10k steps since last growth
+    
+    Args:
+        current_layers: Current number of layers
+        current_hidden_dim: Current hidden dimension
+        total_network_memory_mb: Total network memory capacity
+        steps_since_last_growth: Training steps since last growth
+        layer_coverage: Dict mapping layer_id to replica count
+        network_size: Number of nodes in network
+        
+    Returns:
+        ArchitectureUpgrade if growth should occur, None otherwise
+    """
+    import uuid
+    from neuroshard.core.economics.constants import get_target_replicas
+    
+    # Check stability
+    if steps_since_last_growth < GROWTH_STABILITY_STEPS:
+        return None
+    
+    # Check layer coverage
+    target_replicas = get_target_replicas(network_size)
+    for layer_id in range(current_layers):
+        replicas = layer_coverage.get(layer_id, 0)
+        if replicas < target_replicas * GROWTH_MIN_COVERAGE:
+            return None  # Layers not well-covered yet
+    
+    # Estimate capacity needed for current architecture
+    # Rough estimate: 100MB per layer at base hidden_dim
+    memory_per_layer = 100 * (current_hidden_dim / 512) ** 2
+    current_needed = current_layers * memory_per_layer * target_replicas
+    
+    # Check capacity threshold
+    capacity_ratio = total_network_memory_mb / current_needed if current_needed > 0 else 0
+    
+    if capacity_ratio < GROWTH_CAPACITY_THRESHOLD:
+        return None  # Not enough extra capacity
+    
+    if capacity_ratio > GROWTH_CAPACITY_MAX:
+        # Way too much capacity - grow aggressively
+        new_layers = current_layers + 2
+        new_hidden_dim = current_hidden_dim
+    else:
+        # Normal growth - add one layer
+        new_layers = current_layers + 1
+        new_hidden_dim = current_hidden_dim
+    
+    return ArchitectureUpgrade(
+        upgrade_id=f"upgrade-{uuid.uuid4().hex[:8]}",
+        target_layers=new_layers,
+        target_hidden_dim=new_hidden_dim,
+        phase=GrowthPhase.ANNOUNCEMENT,
+        phase_start_time=time.time(),
+    )
+
+
+class LayerGrowthManager:
+    """
+    Manages the 5-phase layer growth sequence.
+    
+    Phases:
+    1. ANNOUNCEMENT - Broadcast upgrade, nodes prepare
+    2. PREPARATION - New layer entries created in DHT
+    3. ACTIVATION - Verify new layer has coverage
+    4. REFORMATION - Quorums dissolve and reform with new layer
+    5. WARMUP - New layer trains at 0.1x learning rate
+    """
+    
+    def __init__(self, dht_protocol=None):
+        self.dht = dht_protocol
+        self.current_upgrade: Optional[ArchitectureUpgrade] = None
+        self._lock = threading.Lock()
+        self._callbacks: List = []  # Registered callbacks
+    
+    def start_upgrade(self, upgrade: ArchitectureUpgrade) -> bool:
+        """
+        Start a new architecture upgrade.
+        
+        Args:
+            upgrade: The upgrade to perform
+            
+        Returns:
+            True if upgrade started successfully
+        """
+        with self._lock:
+            if self.current_upgrade is not None:
+                logger.warning("Cannot start upgrade - one already in progress")
+                return False
+            
+            self.current_upgrade = upgrade
+            self.current_upgrade.phase = GrowthPhase.ANNOUNCEMENT
+            self.current_upgrade.phase_start_time = time.time()
+            
+            logger.info(f"Starting architecture upgrade {upgrade.upgrade_id}: "
+                       f"{upgrade.target_layers} layers, {upgrade.target_hidden_dim} hidden")
+            
+            # Broadcast announcement
+            self._broadcast_upgrade()
+            
+            return True
+    
+    def advance_phase(self) -> Optional[GrowthPhase]:
+        """
+        Check if current phase is complete and advance to next.
+        
+        Returns:
+            New phase if advanced, None if no change
+        """
+        with self._lock:
+            if self.current_upgrade is None:
+                return None
+            
+            upgrade = self.current_upgrade
+            elapsed = time.time() - upgrade.phase_start_time
+            
+            if upgrade.phase == GrowthPhase.ANNOUNCEMENT:
+                if elapsed >= upgrade.announcement_duration:
+                    return self._enter_preparation()
+            
+            elif upgrade.phase == GrowthPhase.PREPARATION:
+                if elapsed >= upgrade.preparation_duration:
+                    return self._enter_activation()
+            
+            elif upgrade.phase == GrowthPhase.ACTIVATION:
+                if self._check_activation_conditions():
+                    return self._enter_reformation()
+                elif elapsed >= upgrade.activation_timeout:
+                    logger.warning("Activation timeout - aborting upgrade")
+                    self._abort_upgrade("activation timeout")
+                    return None
+            
+            elif upgrade.phase == GrowthPhase.REFORMATION:
+                if elapsed >= upgrade.reformation_timeout:
+                    return self._enter_warmup()
+            
+            elif upgrade.phase == GrowthPhase.WARMUP:
+                if elapsed >= upgrade.warmup_duration:
+                    return self._complete_upgrade()
+            
+            return None
+    
+    def _enter_preparation(self) -> GrowthPhase:
+        """Enter preparation phase - create new layer entries."""
+        self.current_upgrade.phase = GrowthPhase.PREPARATION
+        self.current_upgrade.phase_start_time = time.time()
+        
+        # Create DHT entries for new layers
+        if self.dht:
+            new_layers = self.current_upgrade.target_layers
+            for layer_id in range(new_layers):
+                key_str = f"layer_{layer_id}"
+                # Announce new layer availability
+                self.dht.announce(key_str)
+        
+        logger.info("Entered PREPARATION phase - DHT entries created")
+        return GrowthPhase.PREPARATION
+    
+    def _enter_activation(self) -> GrowthPhase:
+        """Enter activation phase - verify coverage."""
+        self.current_upgrade.phase = GrowthPhase.ACTIVATION
+        self.current_upgrade.phase_start_time = time.time()
+        
+        logger.info("Entered ACTIVATION phase - verifying coverage")
+        return GrowthPhase.ACTIVATION
+    
+    def _check_activation_conditions(self) -> bool:
+        """Check if new layer has sufficient coverage."""
+        # TODO: Implement coverage verification via DHT
+        # For now, assume coverage is sufficient
+        return True
+    
+    def _enter_reformation(self) -> GrowthPhase:
+        """Enter reformation phase - quorums reform."""
+        self.current_upgrade.phase = GrowthPhase.REFORMATION
+        self.current_upgrade.phase_start_time = time.time()
+        
+        # Notify registered callbacks to dissolve quorums
+        for callback in self._callbacks:
+            try:
+                callback("reformation", self.current_upgrade.to_dict())
+            except Exception as e:
+                logger.warning(f"Callback error: {e}")
+        
+        logger.info("Entered REFORMATION phase - quorums reforming")
+        return GrowthPhase.REFORMATION
+    
+    def _enter_warmup(self) -> GrowthPhase:
+        """Enter warmup phase - reduced learning rate."""
+        self.current_upgrade.phase = GrowthPhase.WARMUP
+        self.current_upgrade.phase_start_time = time.time()
+        
+        # Notify for LR reduction
+        for callback in self._callbacks:
+            try:
+                callback("warmup", {
+                    "lr_multiplier": self.current_upgrade.warmup_lr_multiplier,
+                    **self.current_upgrade.to_dict()
+                })
+            except Exception as e:
+                logger.warning(f"Callback error: {e}")
+        
+        logger.info(f"Entered WARMUP phase - LR at {self.current_upgrade.warmup_lr_multiplier}x")
+        return GrowthPhase.WARMUP
+    
+    def _complete_upgrade(self) -> GrowthPhase:
+        """Complete the upgrade sequence."""
+        upgrade = self.current_upgrade
+        
+        # Update network state
+        if self.dht:
+            try:
+                state = self.dht.increment_arch_version(
+                    upgrade.target_layers,
+                    upgrade.target_hidden_dim
+                )
+                logger.info(f"Network upgraded to arch_version={state.arch_version}")
+            except Exception as e:
+                logger.error(f"Failed to update network state: {e}")
+        
+        # Notify completion
+        for callback in self._callbacks:
+            try:
+                callback("complete", upgrade.to_dict())
+            except Exception as e:
+                logger.warning(f"Callback error: {e}")
+        
+        logger.info(f"Upgrade {upgrade.upgrade_id} COMPLETE: "
+                   f"{upgrade.target_layers} layers, {upgrade.target_hidden_dim} hidden")
+        
+        self.current_upgrade = None
+        return GrowthPhase.NONE
+    
+    def _abort_upgrade(self, reason: str):
+        """Abort current upgrade."""
+        if self.current_upgrade:
+            logger.warning(f"Aborting upgrade {self.current_upgrade.upgrade_id}: {reason}")
+            
+            for callback in self._callbacks:
+                try:
+                    callback("abort", {"reason": reason, **self.current_upgrade.to_dict()})
+                except Exception:
+                    pass
+            
+            self.current_upgrade = None
+    
+    def _broadcast_upgrade(self):
+        """Broadcast upgrade announcement to network."""
+        if self.dht and self.current_upgrade:
+            # Store upgrade info in DHT
+            import json
+            key_str = "network:upgrade"
+            # Just announce our presence for now
+            self.dht.announce(key_str)
+    
+    def register_callback(self, callback):
+        """Register callback for upgrade events."""
+        self._callbacks.append(callback)
+    
+    def get_warmup_lr_multiplier(self) -> float:
+        """Get current LR multiplier (1.0 normally, reduced during warmup)."""
+        if self.current_upgrade and self.current_upgrade.phase == GrowthPhase.WARMUP:
+            return self.current_upgrade.warmup_lr_multiplier
+        return 1.0
+    
+    def is_upgrade_in_progress(self) -> bool:
+        """Check if an upgrade is currently in progress."""
+        return self.current_upgrade is not None
+
+
+# Layer identity initialization for new layers
+def initialize_new_layer_weights(
+    layer: 'torch.nn.Module',
+    identity_scale: float = 0.01,
+) -> None:
+    """
+    Initialize a new layer with near-identity transformation.
+    
+    This allows the model to function before the layer is fully trained,
+    as it approximately passes through inputs unchanged.
+    
+    Args:
+        layer: The layer to initialize
+        identity_scale: Scale for random perturbations
+    """
+    import torch.nn as nn
+    
+    for name, param in layer.named_parameters():
+        if 'weight' in name:
+            if param.dim() == 2:  # Linear layer
+                # Initialize as scaled identity + small noise
+                with torch.no_grad():
+                    if param.shape[0] == param.shape[1]:
+                        # Square matrix - use identity
+                        nn.init.eye_(param)
+                        param.mul_(identity_scale)
+                        param.add_(torch.randn_like(param) * identity_scale * 0.1)
+                    else:
+                        # Non-square - use small random
+                        nn.init.normal_(param, std=identity_scale)
+            else:
+                # Other weights - small random
+                nn.init.normal_(param, std=identity_scale)
+        elif 'bias' in name:
+            nn.init.zeros_(param)
 
 
 @dataclass
@@ -835,6 +1385,208 @@ class DynamicNeuroNode:
         
         # State
         self.is_running = False
+        
+        # Speed tier (determined by self-benchmarking)
+        self._speed_tier: Optional[SpeedTier] = None
+        self._latency_ms: Optional[float] = None
+        self._benchmark_samples: int = 10  # Number of samples for benchmarking
+        
+        # Contribution mode (determined by mode selection logic)
+        self._contribution_mode: ContributionMode = ContributionMode.IDLE
+        self._quorum_id: Optional[str] = None  # Current quorum membership
+    
+    @property
+    def contribution_mode(self) -> ContributionMode:
+        """Get the node's current contribution mode."""
+        return self._contribution_mode
+    
+    @property
+    def quorum_id(self) -> Optional[str]:
+        """Get the node's current quorum ID (None if not in a quorum)."""
+        return self._quorum_id
+    
+    @property
+    def speed_tier(self) -> SpeedTier:
+        """Get the node's speed tier. Runs benchmark if not yet determined."""
+        if self._speed_tier is None:
+            self.benchmark_speed()
+        return self._speed_tier or SpeedTier.T5  # Default to slowest if benchmark fails
+    
+    @property
+    def latency_ms(self) -> float:
+        """Get the measured latency per layer in milliseconds."""
+        if self._latency_ms is None:
+            self.benchmark_speed()
+        return self._latency_ms or 1000.0  # Default to 1 second if not measured
+    
+    def benchmark_speed(self) -> SpeedTier:
+        """
+        Benchmark the node's compute speed by timing forward passes.
+        
+        This determines the speed tier which is used for:
+        - Quorum formation (speed-matched nodes)
+        - Contribution mode selection
+        - Reward calculations
+        
+        Returns:
+            SpeedTier classification
+        """
+        logger.info("Benchmarking node compute speed...")
+        
+        try:
+            # Create a test layer for benchmarking
+            from neuroshard.core.model.scaler import ModelArchitecture
+            
+            # Use current architecture or default
+            if self.layer_pool and self.layer_pool.current_architecture:
+                arch = self.layer_pool.current_architecture
+            else:
+                arch = ModelArchitecture(
+                    hidden_dim=512,
+                    intermediate_dim=2048,
+                    num_layers=11,
+                    num_heads=16,
+                    num_kv_heads=4,
+                    vocab_size=32000,
+                    max_seq_len=2048,
+                    dropout=0.0,
+                    rope_theta=10000.0
+                )
+            
+            # Create a single transformer layer for benchmarking
+            from neuroshard.core.model.llm import TransformerDecoderLayer
+            test_layer = TransformerDecoderLayer(arch).to(self.device)
+            test_layer.eval()
+            
+            # Create test input
+            batch_size = 1
+            seq_len = 128
+            test_input = torch.randn(
+                batch_size, seq_len, arch.hidden_dim,
+                device=self.device, dtype=torch.float32
+            )
+            
+            # Warmup runs
+            with torch.no_grad():
+                for _ in range(3):
+                    _ = test_layer(test_input)
+            
+            # Synchronize if using CUDA
+            if self.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            
+            # Timed runs
+            latencies = []
+            with torch.no_grad():
+                for _ in range(self._benchmark_samples):
+                    start = time.perf_counter()
+                    _ = test_layer(test_input)
+                    
+                    if self.device.startswith("cuda"):
+                        torch.cuda.synchronize()
+                    
+                    end = time.perf_counter()
+                    latencies.append((end - start) * 1000)  # Convert to ms
+            
+            # Compute median latency (more robust than mean)
+            latencies.sort()
+            median_idx = len(latencies) // 2
+            self._latency_ms = latencies[median_idx]
+            
+            # Classify into speed tier
+            self._speed_tier = classify_speed_tier(self._latency_ms)
+            
+            # Cleanup
+            del test_layer
+            del test_input
+            if self.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+            
+            logger.info(f"Benchmark complete: {self._latency_ms:.2f}ms/layer -> {self._speed_tier.value}")
+            return self._speed_tier
+            
+        except Exception as e:
+            logger.warning(f"Benchmark failed: {e}. Defaulting to T5 (slowest)")
+            self._latency_ms = 1000.0
+            self._speed_tier = SpeedTier.T5
+            return self._speed_tier
+    
+    def get_compatible_tiers(self) -> List[SpeedTier]:
+        """Get list of speed tiers compatible for quorum formation."""
+        return COMPATIBLE_TIERS.get(self.speed_tier, [self.speed_tier])
+    
+    def update_contribution_mode(
+        self,
+        network_needs_verifiers: bool = False,
+        network_needs_data_providers: bool = False,
+    ) -> ContributionMode:
+        """
+        Update the node's contribution mode based on current conditions.
+        
+        This should be called periodically or when network conditions change.
+        
+        Args:
+            network_needs_verifiers: Whether the network needs more verifiers
+            network_needs_data_providers: Whether the network needs more data providers
+            
+        Returns:
+            The selected ContributionMode
+        """
+        # Determine current capabilities
+        has_layers = len(self.my_layer_ids) > 0
+        has_quorum = self._quorum_id is not None
+        has_genesis_data = self.genesis_loader is not None and hasattr(self.genesis_loader, 'loaded_shards') and len(self.genesis_loader.loaded_shards) > 0
+        
+        # Check if we have stake
+        has_stake = False
+        if self.p2p_manager and hasattr(self.p2p_manager, 'ledger') and self.p2p_manager.ledger:
+            try:
+                account = self.p2p_manager.ledger.get_account_info()
+                has_stake = account.get("stake", 0) > 0
+            except Exception:
+                pass
+        
+        # Select mode
+        new_mode = select_contribution_mode(
+            speed_tier=self.speed_tier,
+            has_layers=has_layers,
+            has_quorum=has_quorum,
+            has_genesis_data=has_genesis_data,
+            has_stake=has_stake,
+            network_needs_verifiers=network_needs_verifiers,
+            network_needs_data_providers=network_needs_data_providers,
+        )
+        
+        # Log mode change
+        if new_mode != self._contribution_mode:
+            logger.info(f"Contribution mode changed: {self._contribution_mode.value} -> {new_mode.value}")
+            self._contribution_mode = new_mode
+        
+        return self._contribution_mode
+    
+    def join_quorum(self, quorum_id: str) -> bool:
+        """
+        Join a quorum for real-time pipeline training.
+        
+        Args:
+            quorum_id: ID of the quorum to join
+            
+        Returns:
+            True if successfully joined
+        """
+        self._quorum_id = quorum_id
+        self._contribution_mode = ContributionMode.PIPELINE
+        logger.info(f"Joined quorum {quorum_id[:8]}... as PIPELINE member")
+        return True
+    
+    def leave_quorum(self) -> None:
+        """Leave the current quorum and update contribution mode."""
+        if self._quorum_id:
+            logger.info(f"Leaving quorum {self._quorum_id[:8]}...")
+            self._quorum_id = None
+        
+        # Fall back to appropriate mode
+        self.update_contribution_mode()
     
     def start(self):
         """Start the node and initialize components."""

@@ -8,6 +8,8 @@ import os
 import sqlite3
 from typing import Dict, List, Optional, Any
 from urllib.parse import urlparse
+from dataclasses import dataclass
+from enum import Enum
 
 # DHT Imports
 try:
@@ -16,6 +18,247 @@ try:
     DHT_AVAILABLE = True
 except ImportError:
     DHT_AVAILABLE = False
+
+
+# =============================================================================
+# NETWORK PHASES
+# =============================================================================
+# The network adapts its parameters based on size.
+# Same core protocol scales from 1 node to millions.
+
+class NetworkPhase(Enum):
+    """Network phase based on size."""
+    GENESIS = "genesis"     # 1 node - bootstrap mode
+    MICRO = "micro"         # 2-4 nodes - minimal network
+    SMALL = "small"         # 5-19 nodes - emerging network
+    MEDIUM = "medium"       # 20-99 nodes - functional network
+    GROWING = "growing"     # 100-499 nodes - scaling up
+    LARGE = "large"         # 500-4999 nodes - mature network
+    MASSIVE = "massive"     # 5000+ nodes - full scale
+
+
+# Phase thresholds
+PHASE_THRESHOLDS = {
+    NetworkPhase.GENESIS: 1,
+    NetworkPhase.MICRO: 4,
+    NetworkPhase.SMALL: 19,
+    NetworkPhase.MEDIUM: 99,
+    NetworkPhase.GROWING: 499,
+    NetworkPhase.LARGE: 4999,
+    NetworkPhase.MASSIVE: float('inf'),
+}
+
+
+def get_network_phase(num_nodes: int) -> NetworkPhase:
+    """
+    Determine network phase based on node count.
+    
+    Args:
+        num_nodes: Number of active nodes
+        
+    Returns:
+        NetworkPhase enum value
+    """
+    if num_nodes <= 1:
+        return NetworkPhase.GENESIS
+    elif num_nodes <= 4:
+        return NetworkPhase.MICRO
+    elif num_nodes <= 19:
+        return NetworkPhase.SMALL
+    elif num_nodes <= 99:
+        return NetworkPhase.MEDIUM
+    elif num_nodes <= 499:
+        return NetworkPhase.GROWING
+    elif num_nodes <= 4999:
+        return NetworkPhase.LARGE
+    else:
+        return NetworkPhase.MASSIVE
+
+
+@dataclass
+class AdaptiveConfig:
+    """
+    Configuration that adapts to network size.
+    
+    Parameters scale automatically as network grows to maintain
+    security and efficiency at any scale.
+    """
+    # Quorum parameters
+    min_quorum_size: int = 1
+    max_quorum_size: int = 16
+    
+    # Cross-quorum sync (DiLoCo)
+    sync_interval: int = 100       # Batches between syncs
+    outer_lr: float = 0.7          # Outer learning rate
+    
+    # Verification
+    challenge_rate: float = 0.0    # Probability of proof verification
+    challenge_window: int = 600    # Challenge window in seconds
+    
+    # Heartbeat
+    heartbeat_interval: int = 30   # Seconds between heartbeats
+    stale_threshold: int = 4       # Missed heartbeats before stale
+    
+    # Replication
+    min_replicas: int = 1          # Minimum layer replicas
+    target_replicas: int = 3       # Target layer replicas
+
+
+# Phase-specific configurations
+ADAPTIVE_CONFIGS = {
+    NetworkPhase.GENESIS: AdaptiveConfig(
+        min_quorum_size=1,
+        max_quorum_size=1,
+        sync_interval=50,        # Fast sync for solo node
+        outer_lr=0.9,            # Higher LR for fast convergence
+        challenge_rate=0.0,      # No challenges - trust yourself
+        min_replicas=1,
+        target_replicas=1,
+    ),
+    NetworkPhase.MICRO: AdaptiveConfig(
+        min_quorum_size=1,
+        max_quorum_size=4,
+        sync_interval=100,
+        outer_lr=0.8,
+        challenge_rate=0.0,      # Trust in small group
+        min_replicas=1,
+        target_replicas=2,
+    ),
+    NetworkPhase.SMALL: AdaptiveConfig(
+        min_quorum_size=2,
+        max_quorum_size=8,
+        sync_interval=200,
+        outer_lr=0.7,
+        challenge_rate=0.01,     # 1% random verification
+        min_replicas=2,
+        target_replicas=3,
+    ),
+    NetworkPhase.MEDIUM: AdaptiveConfig(
+        min_quorum_size=3,
+        max_quorum_size=12,
+        sync_interval=500,
+        outer_lr=0.7,
+        challenge_rate=0.05,     # 5% verification
+        min_replicas=3,
+        target_replicas=5,
+    ),
+    NetworkPhase.GROWING: AdaptiveConfig(
+        min_quorum_size=3,
+        max_quorum_size=16,
+        sync_interval=1000,
+        outer_lr=0.6,
+        challenge_rate=0.05,
+        min_replicas=3,
+        target_replicas=10,
+    ),
+    NetworkPhase.LARGE: AdaptiveConfig(
+        min_quorum_size=4,
+        max_quorum_size=16,
+        sync_interval=2000,
+        outer_lr=0.5,
+        challenge_rate=0.02,     # Lower rate, more nodes verify
+        min_replicas=5,
+        target_replicas=20,
+    ),
+    NetworkPhase.MASSIVE: AdaptiveConfig(
+        min_quorum_size=5,
+        max_quorum_size=16,
+        sync_interval=5000,
+        outer_lr=0.4,
+        challenge_rate=0.01,
+        min_replicas=10,
+        target_replicas=50,
+    ),
+}
+
+
+def get_adaptive_config(num_nodes: int) -> AdaptiveConfig:
+    """
+    Get adaptive configuration for current network size.
+    
+    Args:
+        num_nodes: Number of active nodes
+        
+    Returns:
+        AdaptiveConfig with appropriate parameters
+    """
+    phase = get_network_phase(num_nodes)
+    return ADAPTIVE_CONFIGS.get(phase, ADAPTIVE_CONFIGS[NetworkPhase.MEDIUM])
+
+
+class NetworkPhaseTracker:
+    """
+    Tracks network size and provides adaptive parameters.
+    
+    Updates periodically from DHT and adjusts parameters automatically.
+    """
+    
+    def __init__(self, update_interval: float = 60.0):
+        self.update_interval = update_interval
+        self._num_nodes: int = 1
+        self._phase: NetworkPhase = NetworkPhase.GENESIS
+        self._config: AdaptiveConfig = get_adaptive_config(1)
+        self._last_update: float = 0
+        self._lock = threading.Lock()
+    
+    @property
+    def num_nodes(self) -> int:
+        return self._num_nodes
+    
+    @property
+    def phase(self) -> NetworkPhase:
+        return self._phase
+    
+    @property
+    def config(self) -> AdaptiveConfig:
+        return self._config
+    
+    def update(self, num_nodes: int) -> bool:
+        """
+        Update network size and recalculate parameters.
+        
+        Args:
+            num_nodes: Current number of nodes
+            
+        Returns:
+            True if phase changed
+        """
+        with self._lock:
+            old_phase = self._phase
+            self._num_nodes = num_nodes
+            self._phase = get_network_phase(num_nodes)
+            self._config = get_adaptive_config(num_nodes)
+            self._last_update = time.time()
+            
+            if self._phase != old_phase:
+                logger.info(f"Network phase changed: {old_phase.value} -> {self._phase.value} "
+                           f"({num_nodes} nodes)")
+                return True
+            return False
+    
+    def should_update(self) -> bool:
+        """Check if it's time for a periodic update."""
+        return time.time() - self._last_update > self.update_interval
+    
+    def get_sync_interval(self) -> int:
+        """Get current sync interval for DiLoCo."""
+        return self._config.sync_interval
+    
+    def get_outer_lr(self) -> float:
+        """Get current outer learning rate."""
+        return self._config.outer_lr
+    
+    def get_challenge_rate(self) -> float:
+        """Get current proof challenge rate."""
+        return self._config.challenge_rate
+    
+    def get_min_quorum_size(self) -> int:
+        """Get minimum quorum size."""
+        return self._config.min_quorum_size
+    
+    def get_target_replicas(self) -> int:
+        """Get target replicas per layer."""
+        return self._config.target_replicas
 
 # Ledger Imports
 try:
@@ -804,58 +1047,7 @@ class P2PManager:
             except Exception as e:
                 logger.debug(f"DHT Announce error: {e}")
 
-        # 2. Legacy Tracker Announce (Fallback)
-        try:
-            parsed = urlparse(self.my_url)
-            ip = parsed.hostname
-            port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-            
-            requests.post(f"{self.tracker_url}/announce", json={
-                "ip": ip,
-                "port": port,
-                "shard_range": self.shard_range,
-                "tps": self.current_tps,
-                "latency": self.current_latency,
-                "node_token": self.node_token,
-                "training_enabled": self.training_enabled  # Critical for pipeline routing
-            }, timeout=2)
-            
-            # Fetch Peers for Bootstrap
-            # Only done if routing table is empty or low
-            if not self.known_peers or len(self.known_peers) < 5:
-                 # First, get peers with matching shard range (for inference routing)
-                 resp = requests.get(f"{self.tracker_url}/peers", params={"shard_range": self.shard_range}, timeout=2)
-                 if resp.status_code == 200:
-                     new_peers = resp.json()
-                     for p in new_peers:
-                         if p["url"] != self.my_url:
-                             self.known_peers[p["url"]] = p
-                 
-                 # Also fetch ALL peers for gossip (ledger sync needs all nodes, not just matching shards)
-                 resp_all = requests.get(f"{self.tracker_url}/peers", params={"limit": 100}, timeout=2)
-                 if resp_all.status_code == 200:
-                     all_peers = resp_all.json()
-                     for p in all_peers:
-                         if p["url"] != self.my_url and p["url"] not in self.known_peers:
-                             is_new_peer = True
-                             self.known_peers[p["url"]] = p
-                             # Bootstrap DHT
-                             if self.routing_table:
-                                 try:
-                                    p_parsed = urlparse(p["url"])
-                                    p_ip = p_parsed.hostname
-                                    p_port = p_parsed.port or 80
-                                    # Deterministic ID for stability in dev
-                                    p_id = int(hashlib.sha1(f"{p['url']}".encode()).hexdigest(), 16)
-                                    if self.routing_table:
-                                        self.routing_table.add_contact(Node(p_id, p_ip, p_port))
-                                 except: pass
-                             
-                             # Log new peer connection (proof replay removed - see _sync_with_new_peer)
-                             if is_new_peer:
-                                 self._sync_with_new_peer(p["url"])
-        except:
-            pass
+        # DHT-only peer discovery
 
     def get_next_hop(self, current_end_layer: int, session_id: Optional[str] = None, for_training: bool = False) -> Optional[str]:
         """
@@ -906,7 +1098,7 @@ class P2PManager:
             else:
                 logger.debug(f"[ROUTING] DHT lookup for layer {current_end_layer}: no value found")
 
-        # Strategy 2: Local Cache (Fallback)
+        # Strategy 2: Local Cache (from heartbeat-discovered peers)
         # Check if target layer is WITHIN the peer's range (not just at start)
         for url, info in self.known_peers.items():
             try:

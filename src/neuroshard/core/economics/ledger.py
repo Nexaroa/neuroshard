@@ -63,13 +63,13 @@ from neuroshard.core.economics.constants import (
     INFERENCE_MARKET_TARGET_RESPONSE_TIME,
     INFERENCE_MARKET_BASE_PRICE,
     
-    # Role distribution
-    DRIVER_SHARE,
-    WORKER_SHARE,
-    VALIDATOR_SHARE,
-    DRIVER_BONUS,
-    VALIDATOR_BONUS,
-    WORKER_LAYER_BONUS,
+    # Quorum role distribution  
+    INITIATOR_SHARE,
+    PROCESSOR_SHARE,
+    FINISHER_SHARE,
+    INITIATOR_BONUS,
+    FINISHER_BONUS,
+    LAYER_BONUS,
     MAX_LAYER_BONUS,
     TRAINING_BONUS,
     
@@ -821,8 +821,8 @@ class NEUROLedger:
             is_complete, error = self.inference_market.register_proof_received(
                 request_id=proof.request_id,
                 node_id=proof.node_id,
-                is_driver=proof.has_embedding,
-                is_validator=proof.has_lm_head
+                is_initiator=proof.has_embedding,
+                is_finisher=proof.has_lm_head
             )
             if error:
                 logger.warning(f"Failed to register proof for {proof.request_id[:8]}...: {error}")
@@ -851,10 +851,10 @@ class NEUROLedger:
            - Total pool: DYNAMIC (based on supply/demand)
            - Worthless model → ~0 NEURO (no demand)
            - Good model → Market price rises naturally
-           - Distributed by role:
-             * DRIVER (has_embedding=True):  See DRIVER_SHARE
-             * WORKER (middle layers):       See WORKER_SHARE
-             * VALIDATOR (has_lm_head=True): See VALIDATOR_SHARE
+           - Distributed by quorum role:
+             * INITIATOR (has Layer 0):     See INITIATOR_SHARE (15%)
+             * PROCESSOR (middle layers):   See PROCESSOR_SHARE (70%)
+             * FINISHER (has LM head):      See FINISHER_SHARE (15%)
         
         3. TRAINING REWARD:
            - See TRAINING_REWARD_PER_BATCH in economics.py
@@ -907,55 +907,44 @@ class NEUROLedger:
         # CRITICAL: Use VERIFIED roles, not claimed roles!
         # This ensures nodes can't claim bonuses they don't deserve
         if proof.signature in self._verified_roles:
-            is_driver, is_validator = self._verified_roles[proof.signature]
+            is_initiator, is_finisher = self._verified_roles[proof.signature]
             # Clean up cache entry
             del self._verified_roles[proof.signature]
         else:
-            # Fallback to claimed (for self-proofs or legacy)
-            is_driver = proof.has_embedding
-            is_validator = proof.has_lm_head
+            # Use claimed roles (determined by layer range in quorum)
+            is_initiator = proof.has_embedding  # Holds Layer 0
+            is_finisher = proof.has_lm_head     # Holds LM head layer
         
-        is_worker = proof.layers_held > 0 and not (is_driver and is_validator)
+        is_processor = proof.layers_held > 0 and not (is_initiator and is_finisher)
         
         inference_reward = 0.0
         
-        if is_driver:
-            # Driver gets 15% of the inference pool
-            inference_reward += inference_pool * DRIVER_SHARE
+        if is_initiator:
+            # Initiator (holds embedding) gets 15% of the inference pool
+            inference_reward += inference_pool * INITIATOR_SHARE
         
-        if is_validator:
-            # Validator gets 15% of the inference pool
-            inference_reward += inference_pool * VALIDATOR_SHARE
+        if is_finisher:
+            # Finisher (holds LM head) gets 15% of the inference pool
+            inference_reward += inference_pool * FINISHER_SHARE
         
-        if is_worker or proof.layers_held > 0:
-            # Workers get rewarded per layer they process
+        if is_processor or proof.layers_held > 0:
+            # Processors get rewarded per layer they process
             # 
-            # The WORKER_SHARE (70%) represents the total computation work.
+            # The PROCESSOR_SHARE (70%) represents the total computation work.
             # Each layer does roughly equal work, so we reward per layer.
             #
-            # Formula: worker_reward = (layers_held / total_layers) * worker_pool
-            #
-            # But we don't know total_layers in the network at proof time.
-            # Instead, we use a PER-LAYER reward rate:
-            #
-            #   WORKER_SHARE_PER_LAYER = WORKER_SHARE / expected_layers
-            #
-            # For simplicity, we give full worker share if you hold ANY layers,
-            # since each node only claims for tokens THEY processed through
-            # THEIR layers. The tokens_processed already reflects their work.
-            #
-            # In multi-node inference:
-            #   - Driver processes 100K tokens → claims Driver share for 100K
-            #   - Worker1 processes 100K tokens → claims Worker share for 100K  
-            #   - Worker2 processes 100K tokens → claims Worker share for 100K
-            #   - Validator processes 100K tokens → claims Validator share for 100K
+            # In quorum-based pipeline:
+            #   - Initiator processes tokens → claims Initiator share
+            #   - Processor1 processes tokens → claims Processor share
+            #   - Processor2 processes tokens → claims Processor share
+            #   - Finisher processes tokens → claims Finisher share
             #
             # Each node's tokens_processed = tokens they actually computed.
-            # So we give full worker share - the tokens_processed is already
+            # So we give full processor share - the tokens_processed is already
             # the accurate measure of their contribution.
             
-            worker_pool = inference_pool * WORKER_SHARE
-            inference_reward += worker_pool  # Full share - tokens_processed is already per-node
+            processor_pool = inference_pool * PROCESSOR_SHARE
+            inference_reward += processor_pool  # Full share - tokens_processed is already per-node
         
         # =====================================================================
         # 3. TRAINING REWARD
@@ -992,19 +981,19 @@ class NEUROLedger:
             stake_multiplier = min(REMOTE_STAKE_MULTIPLIER_CAP, self._calculate_stake_multiplier(stake))
         
         # =====================================================================
-        # 7. ROLE BONUS MULTIPLIER (on uptime reward component)
+        # 7. ROLE BONUS MULTIPLIER
         # =====================================================================
         role_multiplier = 1.0
         
-        if is_driver:
-            role_multiplier *= DRIVER_BONUS  # See economics.py for rate
+        if is_initiator:
+            role_multiplier *= INITIATOR_BONUS  # Bonus for pipeline entry
         
-        if is_validator:
-            role_multiplier *= VALIDATOR_BONUS  # See economics.py for rate
+        if is_finisher:
+            role_multiplier *= FINISHER_BONUS  # Bonus for pipeline exit
         
-        # Layer bonus for workers
+        # Layer bonus for all nodes holding layers
         if proof.layers_held > 0:
-            layer_bonus = min(MAX_LAYER_BONUS, proof.layers_held * WORKER_LAYER_BONUS)
+            layer_bonus = min(MAX_LAYER_BONUS, proof.layers_held * LAYER_BONUS)
             role_multiplier *= (1.0 + layer_bonus)
         
         # Training bonus
@@ -2098,6 +2087,227 @@ class NEUROLedger:
                     "circulating_supply": total_minted - total_burned,
                     "burn_percentage": (total_burned / total_minted * 100) if total_minted > 0 else 0.0
                 }
+    
+    # =========================================================================
+    # OPTIMISTIC VERIFICATION - CHALLENGE SYSTEM
+    # =========================================================================
+    
+    def challenge_proof(
+        self,
+        proof_signature: str,
+        challenger_id: str,
+        challenger_stake: float,
+    ) -> Tuple[bool, float, str]:
+        """
+        Challenge a pending proof (Optimistic Verification).
+        
+        Anyone can challenge a proof within its challenge window by staking NEURO.
+        If the challenge succeeds (fraud detected), challenger wins.
+        If the challenge fails (proof valid), challenger loses stake.
+        
+        Args:
+            proof_signature: Signature of the proof being challenged
+            challenger_id: Node ID of the challenger
+            challenger_stake: Amount of NEURO staked on the challenge
+            
+        Returns:
+            (success, amount, message) tuple
+            - success: True if challenge was processed
+            - amount: Reward (if challenge succeeded) or loss (if failed)
+            - message: Description of result
+        """
+        from neuroshard.core.consensus.verifier import (
+            CHALLENGE_WINDOW,
+            MIN_CHALLENGE_STAKE,
+            SLASH_MULTIPLIER,
+        )
+        
+        # Validate stake amount
+        if challenger_stake < MIN_CHALLENGE_STAKE:
+            return False, 0.0, f"Insufficient stake: {challenger_stake} < {MIN_CHALLENGE_STAKE}"
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
+                # Get challenger's balance
+                challenger_balance = conn.execute(
+                    "SELECT balance FROM balances WHERE node_id = ?",
+                    (challenger_id,)
+                ).fetchone()
+                
+                if not challenger_balance or challenger_balance[0] < challenger_stake:
+                    return False, 0.0, "Insufficient balance to stake challenge"
+                
+                # Get the proof being challenged
+                proof_row = conn.execute("""
+                    SELECT node_id, proof_type, timestamp, reward_amount, 
+                           training_batches, tokens_processed, uptime_seconds
+                    FROM proof_history
+                    WHERE signature = ?
+                """, (proof_signature,)).fetchone()
+                
+                if not proof_row:
+                    return False, 0.0, "Proof not found"
+                
+                prover_id, proof_type, proof_timestamp, reward_amount, batches, tokens, uptime = proof_row
+                
+                # Check if within challenge window
+                elapsed = time.time() - proof_timestamp
+                if elapsed > CHALLENGE_WINDOW:
+                    return False, 0.0, f"Challenge window expired ({elapsed:.0f}s > {CHALLENGE_WINDOW}s)"
+                
+                # Lock challenger's stake
+                conn.execute("""
+                    UPDATE balances SET balance = balance - ? WHERE node_id = ?
+                """, (challenger_stake, challenger_id))
+                
+                # Perform verification
+                is_fraud = self._verify_challenge_claim(
+                    prover_id, proof_type, batches, tokens, uptime
+                )
+                
+                if is_fraud:
+                    # Challenge succeeded - fraud detected
+                    slash_amount = reward_amount * SLASH_MULTIPLIER
+                    challenger_reward = challenger_stake + slash_amount / 2
+                    burn_amount = slash_amount / 2
+                    
+                    # Slash prover
+                    conn.execute("""
+                        UPDATE balances SET balance = balance - ? WHERE node_id = ?
+                    """, (min(slash_amount, reward_amount), prover_id))
+                    
+                    # Reward challenger
+                    conn.execute("""
+                        UPDATE balances SET balance = balance + ? WHERE node_id = ?
+                    """, (challenger_reward, challenger_id))
+                    
+                    # Burn portion
+                    conn.execute("""
+                        UPDATE balances SET balance = balance + ? WHERE node_id = ?
+                    """, (burn_amount, BURN_ADDRESS))
+                    
+                    # Record challenge result
+                    conn.execute("""
+                        INSERT INTO fraud_reports 
+                        (report_id, reporter_id, accused_id, proof_signature, reason, created_at, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        hashlib.sha256(f"challenge:{proof_signature}:{time.time()}".encode()).hexdigest()[:32],
+                        challenger_id,
+                        prover_id,
+                        proof_signature,
+                        "Challenge succeeded - fraud detected",
+                        time.time(),
+                        "resolved"
+                    ))
+                    
+                    logger.warning(f"Challenge succeeded: {prover_id[:8]}... slashed {slash_amount:.6f} NEURO")
+                    return True, challenger_reward, f"Fraud detected. Reward: {challenger_reward:.6f} NEURO"
+                
+                else:
+                    # Challenge failed - proof was valid
+                    prover_bonus = challenger_stake * 0.9  # 90% to prover
+                    burn_amount = challenger_stake * 0.1   # 10% burned
+                    
+                    # Prover gets challenger's stake
+                    conn.execute("""
+                        UPDATE balances SET balance = balance + ? WHERE node_id = ?
+                    """, (prover_bonus, prover_id))
+                    
+                    # Burn portion
+                    conn.execute("""
+                        UPDATE balances SET balance = balance + ? WHERE node_id = ?
+                    """, (burn_amount, BURN_ADDRESS))
+                    
+                    logger.info(f"Challenge failed: {challenger_id[:8]}... lost {challenger_stake:.6f} NEURO")
+                    return True, -challenger_stake, f"Challenge failed. Lost: {challenger_stake:.6f} NEURO"
+    
+    def _verify_challenge_claim(
+        self,
+        prover_id: str,
+        proof_type: str,
+        batches: int,
+        tokens: int,
+        uptime: float,
+    ) -> bool:
+        """
+        Verify a challenged proof claim.
+        
+        Returns True if fraud is detected.
+        """
+        # Physical rate limits
+        if proof_type == "training" and uptime > 0 and batches > 0:
+            rate = batches / uptime
+            if rate > 2.0:  # MAX_TRAINING_RATE_PER_SEC
+                return True  # Fraud - impossible rate
+        
+        if proof_type == "inference" and uptime > 0 and tokens > 0:
+            rate = tokens / uptime
+            if rate > 5000.0:  # MAX_INFERENCE_TOKENS_PER_SEC
+                return True  # Fraud - impossible rate
+        
+        # If verifier interface is available, do deeper check
+        if self.verifier and self.verifier.model_interface:
+            # Create minimal proof object
+            class ProofStub:
+                pass
+            proof = ProofStub()
+            proof.node_id = prover_id
+            proof.proof_type = proof_type
+            proof.training_batches = batches
+            proof.tokens_processed = tokens
+            proof.uptime_seconds = uptime
+            proof.model_hash = ""
+            
+            is_valid, _ = self.verifier.verify_work_content(proof)
+            if not is_valid:
+                return True  # Fraud detected
+        
+        return False  # No fraud detected
+    
+    def get_challengeable_proofs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get proofs that are still within the challenge window.
+        
+        Useful for nodes that want to verify and potentially challenge proofs.
+        
+        Args:
+            limit: Maximum number of proofs to return
+            
+        Returns:
+            List of proof info dicts
+        """
+        from neuroshard.core.consensus.verifier import CHALLENGE_WINDOW
+        
+        cutoff_time = time.time() - CHALLENGE_WINDOW
+        
+        with self.lock:
+            with sqlite3.connect(self.db_path, timeout=60.0) as conn:
+                rows = conn.execute("""
+                    SELECT signature, node_id, proof_type, timestamp, reward_amount,
+                           training_batches, tokens_processed, uptime_seconds
+                    FROM proof_history
+                    WHERE timestamp > ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """, (cutoff_time, limit)).fetchall()
+                
+                proofs = []
+                for row in rows:
+                    sig, node, ptype, ts, reward, batches, tokens, uptime = row
+                    proofs.append({
+                        "signature": sig,
+                        "node_id": node,
+                        "proof_type": ptype,
+                        "timestamp": ts,
+                        "reward": reward,
+                        "training_batches": batches,
+                        "tokens_processed": tokens,
+                        "uptime_seconds": uptime,
+                        "challenge_window_remaining": max(0, CHALLENGE_WINDOW - (time.time() - ts)),
+                    })
+                
+                return proofs
 
 
 # ============================================================================

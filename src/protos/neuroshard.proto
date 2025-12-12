@@ -152,6 +152,13 @@ message GossipProofRequest {
     string model_hash = 14;      // Model hash (for canonical_payload)
     string request_id = 15;      // Request ID for inference proofs (for canonical_payload)
     double current_loss = 16;    // Current training loss (for aggregation on website)
+    
+    // Version fields for network compatibility
+    int32 arch_version = 17;     // Architecture version (increments on layer growth)
+    int32 vocab_version = 18;    // Vocabulary version (increments on vocab expansion)
+    string speed_tier = 19;      // Node's speed tier (tier1, tier2, etc.)
+    string quorum_id = 20;       // Current quorum ID (if in a quorum)
+    string contribution_mode = 21; // Current contribution mode (pipeline, async, etc.)
 }
 
 message GossipProofResponse {
@@ -643,9 +650,97 @@ message UpdatePeerCapacityRequest {
     int32 queue_depth = 5;
     int32 available_memory_mb = 6;
     float gpu_utilization = 7;
+    
+    // Version and tier info
+    int32 arch_version = 8;
+    int32 vocab_version = 9;
+    string speed_tier = 10;
 }
 
 message UpdatePeerCapacityResponse {
     bool success = 1;
     string error_message = 2;
+}
+
+// =============================================================================
+// Network State and Quorum Messages
+// =============================================================================
+
+// Network state stored in DHT
+message NetworkStateInfo {
+    int32 arch_version = 1;
+    int32 vocab_version = 2;
+    int32 num_layers = 3;
+    int32 hidden_dim = 4;
+    int32 vocab_size = 5;
+    int32 total_nodes = 6;
+    int32 active_quorums = 7;
+    int64 current_step = 8;
+    double last_updated = 9;
+}
+
+// Quorum member information
+message QuorumMemberInfo {
+    string node_id = 1;
+    string endpoint = 2;
+    int32 layer_start = 3;
+    int32 layer_end = 4;
+    string speed_tier = 5;
+    string role = 6;           // initiator, processor, finisher
+    double last_heartbeat = 7;
+    int32 batches_processed = 8;
+}
+
+// Quorum information
+message QuorumInfo {
+    string quorum_id = 1;
+    string speed_tier = 2;
+    string lifecycle = 3;      // forming, active, renewing, dissolved
+    repeated QuorumMemberInfo members = 4;
+    double session_start = 5;
+    double session_end = 6;
+    int32 total_batches = 7;
+    int32 arch_version = 8;
+    int32 vocab_version = 9;
+}
+
+// Challenge request for optimistic verification
+message ChallengeProofRequest {
+    string proof_signature = 1;
+    string challenger_id = 2;
+    double challenger_stake = 3;
+    double timestamp = 4;
+    string public_key = 5;
+    string signature = 6;      // Challenger's signature
+}
+
+message ChallengeProofResponse {
+    bool success = 1;
+    string reason = 2;
+    bool fraud_detected = 3;
+    double challenger_reward = 4;
+    double prover_slashed = 5;
+}
+
+// Layer growth announcement
+message LayerGrowthAnnouncement {
+    string upgrade_id = 1;
+    int32 target_layers = 2;
+    int32 target_hidden_dim = 3;
+    string phase = 4;          // announcement, preparation, activation, reformation, warmup
+    double phase_start_time = 5;
+    int32 current_arch_version = 6;
+    int32 new_arch_version = 7;
+}
+
+// Gradient contribution with weighting info
+message WeightedGradientContribution {
+    string node_id = 1;
+    int32 batches_processed = 2;
+    double timestamp = 3;
+    double freshness = 4;
+    double weight = 5;         // sqrt(batches) * freshness
+    map<string, bytes> gradients = 6;
+    string quorum_id = 7;
+    string signature = 8;
 }

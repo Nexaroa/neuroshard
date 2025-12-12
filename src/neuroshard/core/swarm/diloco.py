@@ -78,11 +78,15 @@ class DiLoCoConfig:
     validate_gradients: bool = True     # Enable gradient validation
     gradient_cosine_threshold: float = 0.5  # Min cosine similarity
     
-    # Learning rate scheduling (NEW)
+    # Learning rate scheduling
     use_lr_scheduler: bool = True       # Enable cosine annealing LR
     warmup_steps: int = 1000            # LR warmup steps (linear ramp)
     min_lr_ratio: float = 0.1           # Min LR = min_lr_ratio * inner_lr
     lr_decay_steps: int = 50000         # Steps for full cosine cycle
+    
+    # Quorum integration
+    use_quorum_cohort: bool = True      # Find cohort from quorum system
+    use_freshness_weighting: bool = True  # Weight by sqrt(n) * freshness
 
 
 @dataclass
@@ -235,6 +239,9 @@ class DiLoCoTrainer:
         config: Optional[DiLoCoConfig] = None,
         inner_optimizer: Optional[torch.optim.Optimizer] = None,
         device: str = "cpu",
+        quorum: Optional[Any] = None,
+        dht_protocol: Optional[Any] = None,
+        layer_range: Optional[Tuple[int, int]] = None,
     ):
         """
         Initialize DiLoCo trainer.
@@ -244,10 +251,18 @@ class DiLoCoTrainer:
             config: DiLoCo configuration
             inner_optimizer: Optimizer for inner loop (creates AdamW if None)
             device: Device for training
+            quorum: Current quorum
+            dht_protocol: DHT for cohort discovery
+            layer_range: Layer range this node holds
         """
         self.model = model
         self.config = config or DiLoCoConfig()
         self.device = device
+        
+        # Quorum integration
+        self.quorum = quorum
+        self.dht = dht_protocol
+        self.layer_range = layer_range
         
         # Inner optimizer
         if inner_optimizer is None:
@@ -295,6 +310,8 @@ class DiLoCoTrainer:
         if self.config.use_lr_scheduler:
             logger.info(f"  LR scheduler: warmup={self.config.warmup_steps}, "
                        f"decay_steps={self.config.lr_decay_steps}, min_ratio={self.config.min_lr_ratio}")
+        if quorum:
+            logger.info(f"  Quorum: {quorum.quorum_id[:8]}...")
     
     def set_sync_callback(self, callback: Callable):
         """
@@ -623,7 +640,64 @@ class DiLoCoTrainer:
                 'base_lr': self._base_lr,
                 'min_lr': self._min_lr,
                 'lr_scheduler_enabled': self.config.use_lr_scheduler,
+                'quorum_id': self.quorum.quorum_id if self.quorum else None,
+                'layer_range': self.layer_range,
             }
+    
+    # ==================== QUORUM COHORT ====================
+    
+    def find_layer_cohort(self) -> List[str]:
+        """
+        Find nodes holding the same layers across different quorums.
+        
+        Used for DiLoCo cross-quorum sync where nodes with same layers
+        exchange pseudo-gradients.
+        
+        Returns:
+            List of peer endpoints in the cohort
+        """
+        if not self.layer_range or not self.dht:
+            return []
+        
+        import hashlib
+        import json
+        
+        cohort = []
+        layer_start, layer_end = self.layer_range
+        
+        # Query DHT for each layer we hold
+        for layer_id in range(layer_start, layer_end):
+            try:
+                key_str = f"layer_{layer_id}"
+                key_id = int(hashlib.sha1(key_str.encode()).hexdigest(), 16)
+                
+                # Check DHT storage
+                if hasattr(self.dht, 'storage') and key_id in self.dht.storage:
+                    value = self.dht.storage[key_id]
+                    try:
+                        endpoints = json.loads(value) if isinstance(value, str) else [str(value)]
+                        for endpoint in endpoints:
+                            if endpoint not in cohort:
+                                cohort.append(endpoint)
+                    except json.JSONDecodeError:
+                        if value and value not in cohort:
+                            cohort.append(str(value))
+            except Exception as e:
+                logger.debug(f"Error finding cohort for layer {layer_id}: {e}")
+        
+        return cohort
+    
+    def set_quorum(self, quorum: Any, layer_range: Tuple[int, int]):
+        """
+        Update quorum assignment (e.g., after quorum reformation).
+        
+        Args:
+            quorum: New quorum
+            layer_range: New layer range
+        """
+        self.quorum = quorum
+        self.layer_range = layer_range
+        logger.info(f"DiLoCo quorum updated: {quorum.quorum_id[:8]}..., layers={layer_range}")
     
     def state_dict(self) -> Dict[str, Any]:
         """Get full trainer state for checkpointing."""

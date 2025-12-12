@@ -54,22 +54,135 @@ INFERENCE_MARKET_TARGET_RESPONSE_TIME = 60  # Target seconds to serve requests
 INFERENCE_MARKET_BASE_PRICE = 0.0001      # Starting price (bootstrap with worthless model)
 
 # =============================================================================
-# ROLE DISTRIBUTION (for inference rewards)
+# QUORUM ROLE DISTRIBUTION
 # =============================================================================
+# In quorum-based architecture, roles are:
+# - INITIATOR: Holds embedding layer (Layer 0), starts pipeline
+# - PROCESSOR: Holds middle layers, forwards activations
+# - FINISHER: Holds LM head, computes loss/output
 
-# Role shares for inference (must sum to 1.0)
-DRIVER_SHARE = 0.15                 # 15% - Tokenization, embedding, request routing
-WORKER_SHARE = 0.70                 # 70% - Heavy computation (split by layers)
-VALIDATOR_SHARE = 0.15              # 15% - Output projection, loss calc, response
+# Role shares for rewards (must sum to 1.0)
+INITIATOR_SHARE = 0.15              # 15% - Embedding, batch initiation
+PROCESSOR_SHARE = 0.70              # 70% - Heavy computation (split by layers)
+FINISHER_SHARE = 0.15               # 15% - LM head, output generation
 
 # Role bonuses (multipliers on base rewards)
-DRIVER_BONUS = 1.2                  # 20% bonus for being entry point
-VALIDATOR_BONUS = 1.3               # 30% bonus for being exit point + proof validation
-WORKER_LAYER_BONUS = 0.05           # 5% bonus per layer held (Increased to incentivize storage)
-MAX_LAYER_BONUS = 1.0               # Cap layer bonus at 100% (Allow full nodes to earn 2x)
+INITIATOR_BONUS = 1.2               # 20% bonus for pipeline entry
+FINISHER_BONUS = 1.3                # 30% bonus for pipeline exit + loss calc
+LAYER_BONUS = 0.05                  # 5% bonus per layer held
+MAX_LAYER_BONUS = 1.0               # Cap layer bonus at 100%
 
-# Training bonus (extra incentive for training participation)
-TRAINING_BONUS = 1.1                # 10% bonus when actively training (Lowered as base reward covers it)
+# Training bonus
+TRAINING_BONUS = 1.1                # 10% bonus when actively training
+
+# =============================================================================
+# SCARCITY-BASED INCENTIVES
+# =============================================================================
+# Nodes holding under-replicated layers receive bonus rewards.
+# This incentivizes balanced layer distribution across the network.
+
+# Base scarcity bonus multiplier
+SCARCITY_BONUS_BASE = 0.5           # 50% base bonus for under-replicated layers
+SCARCITY_BONUS_MAX = 1.0            # Max 100% bonus (2x rewards)
+
+# Target replicas per layer (scales with network size)
+# See get_target_replicas() for dynamic calculation
+TARGET_REPLICAS_BASE = 3            # Minimum replicas per layer
+TARGET_REPLICAS_SCALE = 0.1         # Scale factor (10% of nodes)
+
+
+def get_target_replicas(network_size: int) -> int:
+    """
+    Get target number of replicas per layer based on network size.
+    
+    Uses dynamic calculation: max(TARGET_REPLICAS_BASE, network_size * TARGET_REPLICAS_SCALE)
+    
+    Examples:
+        - 10 nodes -> 3 replicas (minimum)
+        - 50 nodes -> 5 replicas
+        - 100 nodes -> 10 replicas
+        - 500 nodes -> 50 replicas
+    
+    Args:
+        network_size: Number of nodes in network
+        
+    Returns:
+        Target number of replicas per layer
+    """
+    scaled = int(network_size * TARGET_REPLICAS_SCALE)
+    return max(TARGET_REPLICAS_BASE, scaled)
+
+
+def compute_scarcity_bonus(layer_id: int, replicas: int, network_size: int) -> float:
+    """
+    Compute scarcity bonus multiplier for a layer.
+    
+    Nodes holding under-replicated layers receive bonus rewards.
+    This incentivizes nodes to hold rare layers, improving network resilience.
+    
+    Bonus Calculation:
+    - If replicas >= target: 1.0 (no bonus)
+    - If replicas < target: 1.0 + SCARCITY_BONUS_BASE * (target - replicas) / target
+    - Capped at 1.0 + SCARCITY_BONUS_MAX (2x rewards)
+    
+    Args:
+        layer_id: Layer identifier
+        replicas: Current number of nodes holding this layer
+        network_size: Total number of nodes in network
+        
+    Returns:
+        Reward multiplier (1.0 to 1.0 + SCARCITY_BONUS_MAX)
+    
+    Examples:
+        >>> compute_scarcity_bonus(5, 3, 100)  # Target is 10 replicas
+        1.35  # 35% bonus (under-replicated)
+        >>> compute_scarcity_bonus(5, 10, 100)  # At target
+        1.0  # No bonus
+        >>> compute_scarcity_bonus(5, 1, 100)  # Critical shortage
+        1.5  # Max bonus (capped)
+    """
+    target = get_target_replicas(network_size)
+    
+    if replicas >= target:
+        return 1.0  # No bonus - layer is well replicated
+    
+    # Calculate bonus based on shortage
+    shortage_ratio = (target - replicas) / target
+    bonus = SCARCITY_BONUS_BASE * shortage_ratio
+    
+    # Cap at maximum bonus
+    return min(1.0 + bonus, 1.0 + SCARCITY_BONUS_MAX)
+
+
+def get_layer_scarcity_scores(
+    layer_counts: dict,  # {layer_id: replica_count}
+    network_size: int,
+) -> dict:
+    """
+    Get scarcity scores for all layers.
+    
+    Args:
+        layer_counts: Dict mapping layer_id to number of replicas
+        network_size: Total number of nodes
+        
+    Returns:
+        Dict mapping layer_id to (scarcity_bonus, is_under_replicated)
+    """
+    target = get_target_replicas(network_size)
+    scores = {}
+    
+    for layer_id, replicas in layer_counts.items():
+        bonus = compute_scarcity_bonus(layer_id, replicas, network_size)
+        is_under = replicas < target
+        scores[layer_id] = {
+            "bonus": bonus,
+            "under_replicated": is_under,
+            "replicas": replicas,
+            "target": target,
+            "shortage": max(0, target - replicas),
+        }
+    
+    return scores
 
 # =============================================================================
 # STAKING ECONOMICS
@@ -345,7 +458,7 @@ def is_eligible_validator(
 # =============================================================================
 """
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║                        NEURO ECONOMICS SUMMARY (v2)                            ║
+║                        NEURO ECONOMICS SUMMARY                                ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║ EARNING NEURO                                                                  ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
