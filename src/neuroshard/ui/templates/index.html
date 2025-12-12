@@ -204,12 +204,19 @@
             <div id="tab-content-area" class="flex-1 flex flex-col overflow-hidden">
                 <!-- Dashboard Tab -->
                 <div id="content-dashboard" class="p-6 animate-slide-up overflow-auto flex-1">
-                    <!-- Stats Grid -->
-                    <div class="grid grid-cols-4 gap-4 mb-6">
-                        <!-- Role -->
+                    <!-- Stats Grid - Architecture V2 -->
+                    <div class="grid grid-cols-5 gap-4 mb-6">
+                        <!-- Contribution Mode -->
                         <div class="bg-dark-800 rounded-xl p-4">
-                            <p class="text-xs text-dark-500 uppercase tracking-wider">Role</p>
-                            <p id="stat-role" class="text-2xl font-bold mt-1">-</p>
+                            <p class="text-xs text-dark-500 uppercase tracking-wider">Mode</p>
+                            <p id="stat-mode" class="text-xl font-bold mt-1 text-neuro-400">IDLE</p>
+                            <p id="stat-mode-desc" class="text-xs text-dark-500 mt-1">Waiting...</p>
+                        </div>
+                        <!-- Speed Tier -->
+                        <div class="bg-dark-800 rounded-xl p-4">
+                            <p class="text-xs text-dark-500 uppercase tracking-wider">Speed Tier</p>
+                            <p id="stat-tier" class="text-2xl font-bold mt-1">-</p>
+                            <p id="stat-tier-desc" class="text-xs text-dark-500 mt-1">-</p>
                         </div>
                         <!-- Layers -->
                         <div class="bg-dark-800 rounded-xl p-4">
@@ -225,6 +232,35 @@
                         <div class="bg-dark-800 rounded-xl p-4">
                             <p class="text-xs text-dark-500 uppercase tracking-wider">Device</p>
                             <p id="stat-device" class="text-2xl font-bold mt-1">CPU</p>
+                        </div>
+                    </div>
+                    
+                    <!-- Quorum Status (Architecture V2) -->
+                    <div class="bg-dark-800 rounded-xl p-4 mb-6" id="quorum-section">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="font-semibold flex items-center gap-2">
+                                <span id="quorum-dot" class="w-2.5 h-2.5 rounded-full bg-dark-500"></span>
+                                Quorum Status
+                            </h3>
+                            <span id="quorum-id" class="text-xs font-mono text-dark-500">No quorum</span>
+                        </div>
+                        <div class="grid grid-cols-4 gap-4">
+                            <div class="bg-dark-700 rounded-lg p-3">
+                                <p class="text-xs text-dark-500 uppercase">Lifecycle</p>
+                                <p id="quorum-lifecycle" class="text-lg font-semibold mt-1 text-dark-400">-</p>
+                            </div>
+                            <div class="bg-dark-700 rounded-lg p-3">
+                                <p class="text-xs text-dark-500 uppercase">Members</p>
+                                <p id="quorum-members" class="text-lg font-mono mt-1">0</p>
+                            </div>
+                            <div class="bg-dark-700 rounded-lg p-3">
+                                <p class="text-xs text-dark-500 uppercase">Sync Round</p>
+                                <p id="quorum-sync" class="text-lg font-mono mt-1">0</p>
+                            </div>
+                            <div class="bg-dark-700 rounded-lg p-3">
+                                <p class="text-xs text-dark-500 uppercase">Batches</p>
+                                <p id="quorum-batches" class="text-lg font-mono mt-1">0</p>
+                            </div>
                         </div>
                     </div>
                     
@@ -276,11 +312,19 @@
                         </div>
                     </div>
                     
-                    <!-- Swarm Status -->
+                    <!-- Network & DiLoCo Status -->
                     <div class="bg-dark-800 rounded-xl p-6 mt-6" id="swarm-section">
-                        <h3 class="font-semibold mb-4">Swarm Architecture</h3>
+                        <h3 class="font-semibold mb-4">Network Status</h3>
                         
-                        <div class="grid grid-cols-3 gap-4">
+                        <div class="grid grid-cols-4 gap-4">
+                            <div class="bg-dark-700 rounded-lg p-3">
+                                <p class="text-xs text-dark-500 uppercase">Known Peers</p>
+                                <p id="swarm-peers" class="text-lg font-mono mt-1">0</p>
+                            </div>
+                            <div class="bg-dark-700 rounded-lg p-3">
+                                <p class="text-xs text-dark-500 uppercase">Layer Growth</p>
+                                <p id="growth-phase" class="text-lg font-mono mt-1 text-dark-400">None</p>
+                            </div>
                             <div class="bg-dark-700 rounded-lg p-3">
                                 <p class="text-xs text-dark-500 uppercase">Inbound Buffer</p>
                                 <p id="swarm-inbound" class="text-lg font-mono mt-1">0%</p>
@@ -288,10 +332,6 @@
                             <div class="bg-dark-700 rounded-lg p-3">
                                 <p class="text-xs text-dark-500 uppercase">Outbound Buffer</p>
                                 <p id="swarm-outbound" class="text-lg font-mono mt-1">0%</p>
-                            </div>
-                            <div class="bg-dark-700 rounded-lg p-3">
-                                <p class="text-xs text-dark-500 uppercase">Known Peers</p>
-                                <p id="swarm-peers" class="text-lg font-mono mt-1">0</p>
                             </div>
                         </div>
                     </div>
@@ -718,7 +758,7 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
         let isConnected = false;
         let lastTotalEarned = 0;
         
-        // Fetch and update stats
+        // Fetch and update stats - Architecture V2
         async function updateStats() {
             try {
                 const resp = await fetch('/api/stats');
@@ -732,14 +772,24 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
                     addLog('Connected to node successfully', 'success');
                 }
                 
-                // Update status
+                // Architecture V2 - Extract key state
                 const training = data.training_enabled;
                 const status = data.training_status || 'idle';
+                const mode = data.contribution_mode || 'idle';
+                const quorumLifecycle = data.quorum_lifecycle || 'none';
+                const tier = data.speed_tier || 'tier5';
                 
-                if (status === 'running') {
-                    setStatus('TRAINING', 'green', `${data.my_layers?.length || 0} layers • ${(data.my_params_m || 0).toFixed(0)}M params`);
+                // Update main status based on Architecture V2 state
+                if (mode === 'pipeline' && quorumLifecycle === 'active') {
+                    setStatus('PIPELINE', 'green', `Quorum training • ${data.my_layers?.length || 0} layers`);
+                } else if (mode === 'async' && (status === 'async_training' || data.async_batches > 0)) {
+                    setStatus('ASYNC', 'green', `Async training • DiLoCo sync`);
+                } else if (quorumLifecycle === 'forming') {
+                    setStatus('FORMING', 'yellow', `Waiting for quorum peers...`);
+                } else if (training && status === 'waiting_for_quorum') {
+                    setStatus('WAITING', 'yellow', `Looking for compatible peers...`);
                 } else if (training) {
-                    setStatus('ONLINE', 'green', `${data.my_layers?.length || 0} layers • Ready to train`);
+                    setStatus('ONLINE', 'green', `${data.my_layers?.length || 0} layers • Ready`);
                 } else {
                     setStatus('INFERENCE', 'yellow', 'Training disabled');
                 }
@@ -753,25 +803,93 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
                     document.getElementById('version').textContent = 'v' + data.version;
                 }
                 
-                // Update stats
-                document.getElementById('stat-role').textContent = data.role || 'Worker';
-                document.getElementById('stat-layers').textContent = data.my_layers?.length || 0;
-                document.getElementById('stat-params').textContent = (data.my_params_m || 0).toFixed(0) + 'M';
-                document.getElementById('stat-device').textContent = (data.device || 'cpu').toUpperCase();
-                
-                // Device color
-                const deviceEl = document.getElementById('stat-device');
-                if (data.device === 'cuda' || data.device === 'mps') {
-                    deviceEl.classList.add('text-green-500');
-                } else {
-                    deviceEl.classList.remove('text-green-500');
+                // === CONTRIBUTION MODE ===
+                const modeEl = document.getElementById('stat-mode');
+                const modeDescEl = document.getElementById('stat-mode-desc');
+                if (modeEl) {
+                    modeEl.textContent = mode.toUpperCase();
+                    modeEl.className = 'text-xl font-bold mt-1 ';
+                    const modeConfig = {
+                        'pipeline': { color: 'text-green-500', desc: 'Real-time quorum training' },
+                        'async': { color: 'text-purple-400', desc: 'Async training (DiLoCo)' },
+                        'inference': { color: 'text-blue-400', desc: 'Serving inference' },
+                        'data': { color: 'text-yellow-400', desc: 'Serving Genesis data' },
+                        'verify': { color: 'text-orange-400', desc: 'Verifying PoNW proofs' },
+                        'idle': { color: 'text-dark-400', desc: 'Waiting for work...' }
+                    };
+                    const cfg = modeConfig[mode] || modeConfig['idle'];
+                    modeEl.classList.add(cfg.color);
+                    if (modeDescEl) modeDescEl.textContent = cfg.desc;
                 }
                 
-                // Training stats
+                // === SPEED TIER ===
+                const tierEl = document.getElementById('stat-tier');
+                const tierDescEl = document.getElementById('stat-tier-desc');
+                if (tierEl) {
+                    tierEl.textContent = tier.toUpperCase().replace('TIER', 'T');
+                    tierEl.className = 'text-2xl font-bold mt-1 ';
+                    const tierConfig = {
+                        'tier1': { color: 'text-green-500', desc: 'Enterprise GPU' },
+                        'tier2': { color: 'text-green-500', desc: 'High-end GPU' },
+                        'tier3': { color: 'text-neuro-400', desc: 'Mid-range GPU' },
+                        'tier4': { color: 'text-yellow-400', desc: 'Entry GPU' },
+                        'tier5': { color: 'text-dark-400', desc: 'CPU/Slow' }
+                    };
+                    const tcfg = tierConfig[tier] || tierConfig['tier5'];
+                    tierEl.classList.add(tcfg.color);
+                    if (tierDescEl) tierDescEl.textContent = tcfg.desc;
+                }
+                
+                // === NODE STATS ===
+                document.getElementById('stat-layers').textContent = data.my_layers?.length || 0;
+                document.getElementById('stat-params').textContent = (data.my_params_m || 0).toFixed(0) + 'M';
+                const deviceEl = document.getElementById('stat-device');
+                deviceEl.textContent = (data.device || 'cpu').toUpperCase();
+                deviceEl.className = 'text-2xl font-bold mt-1 ' + 
+                    ((data.device === 'cuda' || data.device === 'mps') ? 'text-green-500' : '');
+                
+                // === QUORUM STATUS ===
+                document.getElementById('quorum-id').textContent = data.quorum_id ? data.quorum_id.substring(0, 16) + '...' : 'No quorum';
+                document.getElementById('quorum-lifecycle').textContent = quorumLifecycle.charAt(0).toUpperCase() + quorumLifecycle.slice(1);
+                document.getElementById('quorum-members').textContent = data.quorum_members || 0;
+                document.getElementById('quorum-sync').textContent = data.quorum_sync_round || data.async_syncs || 0;
+                document.getElementById('quorum-batches').textContent = data.quorum_batches || data.async_batches || 0;
+                
+                // Quorum dot color
+                const quorumDot = document.getElementById('quorum-dot');
+                if (quorumDot) {
+                    quorumDot.className = 'w-2.5 h-2.5 rounded-full ';
+                    if (quorumLifecycle === 'active') {
+                        quorumDot.classList.add('bg-green-500', 'pulse-glow');
+                    } else if (quorumLifecycle === 'forming') {
+                        quorumDot.classList.add('bg-yellow-500');
+                    } else if (quorumLifecycle === 'dissolving') {
+                        quorumDot.classList.add('bg-red-500');
+                    } else {
+                        quorumDot.classList.add('bg-dark-500');
+                    }
+                }
+                
+                // Quorum lifecycle color
+                const lifecycleEl = document.getElementById('quorum-lifecycle');
+                if (lifecycleEl) {
+                    lifecycleEl.className = 'text-lg font-semibold mt-1 ';
+                    if (quorumLifecycle === 'active') {
+                        lifecycleEl.classList.add('text-green-500');
+                    } else if (quorumLifecycle === 'forming') {
+                        lifecycleEl.classList.add('text-yellow-500');
+                    } else {
+                        lifecycleEl.classList.add('text-dark-400');
+                    }
+                }
+                
+                // === TRAINING STATS ===
                 document.getElementById('stat-tokens').textContent = formatNumber(data.token_count || 0);
                 document.getElementById('stat-training').textContent = data.training_rounds || 0;
+                const loss = data.current_loss;
+                document.getElementById('stat-loss').textContent = loss && loss < Infinity ? loss.toFixed(4) : '∞';
                 
-                // Update settings page values
+                // === SETTINGS PAGE ===
                 const settingsLayers = document.getElementById('setting-layers');
                 const settingsPeers = document.getElementById('setting-peers');
                 const settingsTraining = document.getElementById('setting-training');
@@ -784,40 +902,34 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
                     settingsTraining.className = training ? 'text-lg font-semibold mt-1 text-green-500' : 'text-lg font-semibold mt-1 text-dark-400';
                 }
                 if (settingsDevice) {
-                    const dev = (data.device || 'cpu').toUpperCase();
-                    settingsDevice.textContent = dev;
+                    settingsDevice.textContent = (data.device || 'cpu').toUpperCase();
                     settingsDevice.className = (data.device === 'cuda' || data.device === 'mps') 
                         ? 'text-lg font-semibold mt-1 text-green-500' 
                         : 'text-lg font-semibold mt-1 text-dark-400';
                 }
                 
-                // Update instance ID in dashboard
+                // Update instance ID
                 if (data.instance_id) {
                     const instanceEl = document.getElementById('instance-id');
                     if (instanceEl) instanceEl.textContent = data.instance_id.substring(0, 12) + '...';
                 }
                 
-                const loss = data.current_loss;
-                document.getElementById('stat-loss').textContent = loss && loss < Infinity ? loss.toFixed(4) : '∞';
-                
-                // DiLoCo progress
+                // === DILOCO PROGRESS ===
                 if (data.diloco) {
                     document.getElementById('diloco-section').style.display = 'block';
                     const inner = data.diloco.inner_step || 0;
                     const total = data.diloco.inner_total || 500;
-                    const progress = (inner / total * 100).toFixed(0);
                     document.getElementById('diloco-progress').textContent = `${inner}/${total}`;
-                    document.getElementById('diloco-bar').style.width = progress + '%';
+                    document.getElementById('diloco-bar').style.width = ((inner / total) * 100).toFixed(0) + '%';
                     document.getElementById('diloco-outer').textContent = data.diloco.outer_step || 0;
                 } else {
                     document.getElementById('diloco-section').style.display = 'none';
                 }
                 
-                // Initialize sliders with actual config values (once)
+                // === INITIALIZE CONFIG SLIDERS (once) ===
                 if (data.config && !window.slidersInitialized) {
                     window.slidersInitialized = true;
                     
-                    // CPU threads
                     if (data.config.cpu_threads) {
                         const cpuSlider = document.getElementById('cpu-limit-slider');
                         if (cpuSlider) {
@@ -825,8 +937,6 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
                             document.getElementById('cpu-limit-value').textContent = data.config.cpu_threads;
                         }
                     }
-                    
-                    // Memory
                     if (data.config.memory_mb) {
                         const memSlider = document.getElementById('mem-limit-slider');
                         if (memSlider) {
@@ -834,8 +944,6 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
                             document.getElementById('mem-limit-value').textContent = data.config.memory_mb + ' MB';
                         }
                     }
-                    
-                    // Storage
                     if (data.config.storage_mb) {
                         const storageSlider = document.getElementById('storage-limit-slider');
                         if (storageSlider) {
@@ -844,7 +952,7 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
                         }
                     }
                     
-                    addLog(`Config loaded: CPU=${data.config.cpu_threads || 'auto'}, Memory=${data.config.memory_mb || 'auto'}MB, Storage=${data.config.storage_mb || 100}MB`, 'info');
+                    addLog(`Config: CPU=${data.config.cpu_threads || 'auto'}, Mem=${data.config.memory_mb || 'auto'}MB, Storage=${data.config.storage_mb || 100}MB`, 'info');
                 }
                 
             } catch (e) {
@@ -927,6 +1035,29 @@ neuroshard-node --token YOUR_TOKEN --headless</code></pre>
                 // Track peer count for balance warning
                 lastKnownPeerCount = data.known_peers || 0;
                 
+            } catch (e) {
+                // Silent fail
+            }
+            
+            // Also update growth phase from stats
+            try {
+                const statsResp = await fetch('/api/stats');
+                if (statsResp.ok) {
+                    const stats = await statsResp.json();
+                    const growthEl = document.getElementById('growth-phase');
+                    if (growthEl) {
+                        const phase = stats.growth_phase || 'none';
+                        growthEl.textContent = phase.charAt(0).toUpperCase() + phase.slice(1);
+                        growthEl.className = 'text-lg font-mono mt-1 ';
+                        if (phase === 'none') {
+                            growthEl.classList.add('text-dark-400');
+                        } else if (phase === 'warmup') {
+                            growthEl.classList.add('text-yellow-400');
+                        } else {
+                            growthEl.classList.add('text-neuro-400');
+                        }
+                    }
+                }
             } catch (e) {
                 // Silent fail
             }

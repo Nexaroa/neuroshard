@@ -325,7 +325,7 @@ def _create_safe_handler():
     return logging.handlers.RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=2, encoding='utf-8')
 
 handler = _create_safe_handler()
-handler.setFormatter(logging.Formatter('[NODE] %(message)s'))
+handler.setFormatter(logging.Formatter('[%(asctime)s] [NODE] %(message)s', datefmt='%H:%M:%S'))
 root_logger.addHandler(handler)
 
 # Add memory handler for dashboard logs API
@@ -895,6 +895,26 @@ async def get_api_stats():
         "memory_mb": STATE.get("config_memory_mb"),
         "storage_mb": STATE.get("config_storage_mb", 100),  # Default 100MB
     }
+    
+    # Architecture V2 - Contribution Mode & Quorum Status
+    stats["contribution_mode"] = STATE.get("contribution_mode", "idle")
+    stats["speed_tier"] = STATE.get("speed_tier", "tier5")
+    stats["training_mode"] = STATE.get("training_mode", "disabled")
+    
+    # Quorum status
+    stats["quorum_id"] = STATE.get("quorum_id")
+    stats["quorum_lifecycle"] = STATE.get("quorum_lifecycle", "none")
+    stats["quorum_members"] = STATE.get("quorum_members", 0)
+    stats["quorum_batches"] = STATE.get("quorum_batches", 0)
+    stats["quorum_sync_round"] = STATE.get("quorum_sync_round", 0)
+    
+    # Async training stats (if in async mode)
+    stats["async_batches"] = STATE.get("async_batches", 0)
+    stats["async_syncs"] = STATE.get("async_syncs", 0)
+    
+    # Layer growth status
+    stats["growth_phase"] = STATE.get("growth_phase", "none")
+    stats["growth_target_layers"] = STATE.get("growth_target_layers")
     
     return stats
 
