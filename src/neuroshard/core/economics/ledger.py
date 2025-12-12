@@ -666,10 +666,58 @@ class NEUROLedger:
         return True, "Valid"
     
     def _check_rate_limits(self, conn, proof: PoNWProof) -> Tuple[bool, str]:
-        """Check if node is within rate limits."""
+        """
+        Check if node is within rate limits (READ-ONLY).
+        
+        NOTE: This ONLY checks the limit, it does NOT increment the counter.
+        The counter is incremented in _increment_rate_limits() which is
+        called from process_proof() AFTER the proof is successfully accepted.
+        
+        This prevents the bug where gossip duplicates (which all pass verify_proof
+        before any reaches process_proof) inflate the rate limit counter.
+        """
         now = time.time()
         
         # Get or create rate limit record
+        row = conn.execute(
+            "SELECT proofs_last_hour, tokens_last_minute, last_reset_hour, last_reset_minute FROM rate_limits WHERE node_id = ?",
+            (proof.node_id,)
+        ).fetchone()
+        
+        if row:
+            proofs_last_hour, tokens_last_minute, last_reset_hour, last_reset_minute = row
+            
+            # Reset hourly counter if needed (virtual reset, don't write)
+            if now - last_reset_hour > 3600:
+                proofs_last_hour = 0
+            
+            # Reset minute counter if needed (virtual reset, don't write)
+            if now - last_reset_minute > 60:
+                tokens_last_minute = 0
+        else:
+            proofs_last_hour = 0
+            tokens_last_minute = 0
+        
+        # Check limits (READ-ONLY - no increment here!)
+        if proofs_last_hour >= MAX_PROOFS_PER_HOUR:
+            return True, f"Rate limit: max {MAX_PROOFS_PER_HOUR} proofs/hour"
+        
+        new_tokens = tokens_last_minute + proof.tokens_processed
+        if new_tokens > MAX_TOKENS_PER_MINUTE * 60:  # Scaled to hour
+            return True, f"Rate limit: max {MAX_TOKENS_PER_MINUTE} tokens/minute"
+        
+        return False, ""
+    
+    def _increment_rate_limits(self, conn, proof: PoNWProof):
+        """
+        Increment rate limit counters AFTER a proof is successfully accepted.
+        
+        This is called from process_proof() only when a proof is actually
+        added to proof_history (not for duplicates or failed verifications).
+        """
+        now = time.time()
+        
+        # Get current values
         row = conn.execute(
             "SELECT proofs_last_hour, tokens_last_minute, last_reset_hour, last_reset_minute FROM rate_limits WHERE node_id = ?",
             (proof.node_id,)
@@ -693,15 +741,9 @@ class NEUROLedger:
             last_reset_hour = now
             last_reset_minute = now
         
-        # Check limits
-        if proofs_last_hour >= MAX_PROOFS_PER_HOUR:
-            return True, f"Rate limit: max {MAX_PROOFS_PER_HOUR} proofs/hour"
-        
+        # NOW increment the counter (only for successfully accepted proofs)
         new_tokens = tokens_last_minute + proof.tokens_processed
-        if new_tokens > MAX_TOKENS_PER_MINUTE * 60:  # Scaled to hour
-            return True, f"Rate limit: max {MAX_TOKENS_PER_MINUTE} tokens/minute"
         
-        # Update rate limits
         conn.execute("""
             INSERT INTO rate_limits (node_id, proofs_last_hour, tokens_last_minute, last_reset_hour, last_reset_minute)
             VALUES (?, ?, ?, ?, ?)
@@ -715,8 +757,6 @@ class NEUROLedger:
             proofs_last_hour + 1, new_tokens, last_reset_hour, last_reset_minute,
             proofs_last_hour + 1, new_tokens, last_reset_hour, last_reset_minute
         ))
-        
-        return False, ""
     
     def _check_plausibility(self, proof: PoNWProof) -> Tuple[bool, str]:
         """Check if claimed work is plausible."""
@@ -764,16 +804,21 @@ class NEUROLedger:
         
         return True, ""
     
-    def process_proof(self, proof: PoNWProof) -> Tuple[bool, float, str]:
+    def process_proof(self, proof: PoNWProof, skip_verification: bool = False) -> Tuple[bool, float, str]:
         """
         Process a verified proof and credit rewards.
         
+        Args:
+            proof: The PoNW proof to process
+            skip_verification: If True, skip verify_proof (caller already verified)
+        
         Returns: (success, reward_amount, message)
         """
-        # Verify first
-        is_valid, reason = self.verify_proof(proof)
-        if not is_valid:
-            return False, 0.0, reason
+        # Verify first (unless caller already did)
+        if not skip_verification:
+            is_valid, reason = self.verify_proof(proof)
+            if not is_valid:
+                return False, 0.0, reason
         
         # Calculate reward
         reward = self._calculate_reward(proof)
@@ -822,6 +867,10 @@ class NEUROLedger:
                         updated_at = ?
                     WHERE id = 1
                 """, (reward, time.time()))
+                
+                # Increment rate limits NOW (after proof is successfully accepted)
+                # This prevents gossip duplicates from inflating the counter
+                self._increment_rate_limits(conn, proof)
         
         # If this was a marketplace request, register proof received (DISTRIBUTED)
         # Multiple nodes (driver, workers, validator) submit proofs for same request

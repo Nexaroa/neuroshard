@@ -173,7 +173,8 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 
                 if is_valid:
                     # Process the proof (credits rewards)
-                    success, reward, msg = ledger.process_proof(proof)
+                    # skip_verification=True because we already called verify_proof above
+                    success, reward, msg = ledger.process_proof(proof, skip_verification=True)
                     if success:
                         logger.info(f"[GOSSIP] ✓ Accepted proof from {request.node_id[:16]}...: {reward:.6f} NEURO")
                         
@@ -183,7 +184,12 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                         
                         return neuroshard_pb2.GossipProofResponse(accepted=True)
                     else:
-                        logger.info(f"[GOSSIP] ✗ Proof processing failed: {msg}")
+                        # Duplicates are expected (gossip reaches us via multiple paths)
+                        # Rate limit errors are now rare (fixed: only count accepted proofs)
+                        if "Duplicate" in msg:
+                            logger.debug(f"[GOSSIP] Duplicate proof (expected in gossip)")
+                        else:
+                            logger.warning(f"[GOSSIP] ✗ Proof rejected: {msg}")
                         return neuroshard_pb2.GossipProofResponse(accepted=False)
                 else:
                     logger.info(f"[GOSSIP] ✗ Proof verification failed: {reason}")
