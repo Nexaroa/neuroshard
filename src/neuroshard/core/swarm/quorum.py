@@ -2117,22 +2117,36 @@ class AsyncTrainer:
                 
                 # Train for N steps
                 losses = []
+                data_not_ready_count = 0
+                
                 for step in range(self.ASYNC_STEPS_PER_ROUND):
                     if self._stop_event.is_set():
                         break
                     
                     try:
                         # Get batch from Genesis loader
-                        batch = self.genesis_loader.get_batch(batch_size=self.ASYNC_BATCH_SIZE)
-                        if batch is None:
-                            continue
+                        # Note: get_batch() raises RuntimeError when data not ready, doesn't return None
+                        input_ids, labels = self.genesis_loader.get_batch(batch_size=self.ASYNC_BATCH_SIZE)
                         
-                        input_ids, labels = batch
+                        # Move to device
+                        device = next(self.model.parameters()).device
+                        input_ids = input_ids.to(device)
+                        labels = labels.to(device)
                         
-                        # Forward pass
+                        # Forward pass through local layers
                         self.model.train()
-                        outputs = self.model(input_ids=input_ids, labels=labels)
-                        loss = outputs.get("loss") if isinstance(outputs, dict) else outputs[0]
+                        
+                        # Use forward_my_layers for proper layer handling
+                        embeddings = self.model.embed(input_ids)
+                        hidden = self.model.forward_my_layers(embeddings)
+                        logits = self.model.compute_logits(hidden)
+                        
+                        # Compute loss
+                        loss = torch.nn.functional.cross_entropy(
+                            logits.view(-1, logits.size(-1)),
+                            labels.view(-1),
+                            ignore_index=-100
+                        )
                         
                         # Backward pass
                         self.optimizer.zero_grad()
@@ -2148,9 +2162,20 @@ class AsyncTrainer:
                         self.total_batches += 1
                         losses.append(loss.item())
                         
-                    except Exception as e:
-                        logger.debug(f"[ASYNC] Training step error: {e}")
+                    except RuntimeError as e:
+                        if "Data not ready" in str(e) or "shard" in str(e).lower():
+                            data_not_ready_count += 1
+                            time.sleep(0.1)  # Brief wait for data
+                        else:
+                            logger.warning(f"[ASYNC] Training step error: {e}")
                         continue
+                    except Exception as e:
+                        logger.warning(f"[ASYNC] Training step error: {e}")
+                        continue
+                
+                # Log data availability issues
+                if data_not_ready_count > 0 and len(losses) == 0:
+                    logger.info(f"[ASYNC] Data not ready ({data_not_ready_count} attempts) - waiting for shard download")
                 
                 # Update current loss
                 if losses:

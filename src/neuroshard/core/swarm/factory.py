@@ -1176,7 +1176,7 @@ class SwarmEnabledDynamicNode:
     def __getattr__(self, name):
         """Delegate unknown attributes to base node."""
         return getattr(self.base_node, name)
-    
+
     def __setattr__(self, name, value):
         """Set attributes, delegating base_node-owned attributes properly."""
         # Attributes that belong to base_node (not the wrapper)
