@@ -2878,7 +2878,7 @@ def run_node(
         logger.info("=" * 50)
 
         # Start the HTTP server
-        import uvicorn
+        # Note: uvicorn is already imported at module level (line 18)
         import asyncio as asyncio_lib
         
         async def run_observer():
