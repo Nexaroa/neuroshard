@@ -52,14 +52,13 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 from neuroshard.core.economics.constants import (
-    # Reward rates
+    # Reward rates (per-layer training)
     UPTIME_REWARD_PER_MINUTE,
-    TRAINING_REWARD_PER_BATCH,  # Legacy alias
-    TRAINING_REWARD_PER_BATCH_PER_LAYER,  # New per-layer rate
-    ASYNC_TRAINING_REWARD_PER_BATCH_PER_LAYER,  # Async contributor rate
+    TRAINING_REWARD_PER_BATCH_PER_LAYER,
+    ASYNC_TRAINING_REWARD_PER_BATCH_PER_LAYER,
     DATA_REWARD_PER_SAMPLE,
     
-    # Dynamic inference pricing (PURE MARKET - no caps)
+    # Dynamic inference pricing (PURE MARKET)
     INFERENCE_MARKET_PRICE_SMOOTHING,
     INFERENCE_MARKET_CAPACITY_TIMEOUT,
     INFERENCE_MARKET_TARGET_RESPONSE_TIME,
@@ -70,17 +69,14 @@ from neuroshard.core.economics.constants import (
     PROCESSOR_SHARE,
     FINISHER_SHARE,
     
-    # Role bonuses (now ADDITIVE)
+    # Role bonuses (ADDITIVE)
     INITIATOR_BONUS,
     FINISHER_BONUS,
     TRAINING_BONUS,
-    LAYER_BONUS,  # Deprecated (always 0)
-    MAX_LAYER_BONUS,  # Deprecated (always 0)
     
     # Staking
     STAKING_BASE_BONUS,
     STAKING_UNIT,
-    STAKING_DIMINISHING,
     MIN_STAKE_AMOUNT,
     MAX_STAKE_AMOUNT,
     

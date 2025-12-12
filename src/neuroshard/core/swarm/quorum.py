@@ -1963,3 +1963,277 @@ class QuorumInferenceRouter:
             price = self._quorum_cache[quorum_id].price_per_token
             return price * max_tokens
         return BASE_INFERENCE_PRICE * max_tokens
+
+
+# =============================================================================
+# ASYNC TRAINER - For T5 nodes and nodes without quorum
+# =============================================================================
+
+# Freshness decay for async contributions (from whitepaper)
+ASYNC_FRESHNESS_DECAY = {
+    3600: 1.0,      # < 1 hour: full value
+    86400: 0.7,     # < 1 day: 70% value
+    604800: 0.5,    # < 1 week: 50% value
+    float('inf'): 0.3,  # > 1 week: 30% value
+}
+
+
+def calculate_async_freshness(age_seconds: float) -> float:
+    """Calculate freshness multiplier for async gradient contributions."""
+    for threshold, freshness in sorted(ASYNC_FRESHNESS_DECAY.items()):
+        if age_seconds < threshold:
+            return freshness
+    return 0.3
+
+
+class AsyncTrainer:
+    """
+    Async training for nodes that can't join real-time quorums.
+    
+    Per whitepaper, async training is for:
+    - T5 (slow) nodes that can't keep up with real-time pipelines
+    - Any node that can't find a compatible quorum
+    
+    Process:
+    1. Download current weights for held layers
+    2. Train locally for N steps using Genesis data
+    3. Compute pseudo-gradient: delta_w = w_initial - w_final
+    4. Submit to layer cohort for next DiLoCo sync round
+    5. Apply freshness decay to contribution weight
+    
+    Async contributions are weighted by: sqrt(batches) * freshness
+    This ensures fair influence while prioritizing recent work.
+    """
+    
+    # Training interval: how often to do async training
+    ASYNC_TRAIN_INTERVAL = 60  # Train every 60 seconds
+    ASYNC_BATCH_SIZE = 4       # Smaller batches for async training
+    ASYNC_STEPS_PER_ROUND = 50 # Steps per async training round
+    
+    def __init__(
+        self,
+        node_id: str,
+        model: Any,
+        optimizer: Any,
+        genesis_loader: Any = None,
+        dht_protocol: Any = None,
+    ):
+        """
+        Initialize AsyncTrainer.
+        
+        Args:
+            node_id: This node's ID
+            model: The model to train
+            optimizer: PyTorch optimizer
+            genesis_loader: Genesis data loader
+            dht_protocol: DHT for cohort discovery
+        """
+        self.node_id = node_id
+        self.model = model
+        self.optimizer = optimizer
+        self.genesis_loader = genesis_loader
+        self.dht = dht_protocol
+        
+        # Training state
+        self.running = False
+        self._training_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        
+        # DiLoCo-like state for async
+        self.initial_weights: Dict[str, Any] = {}
+        self.last_sync_time = time.time()
+        
+        # Stats
+        self.total_batches = 0
+        self.total_syncs = 0
+        self.current_loss: Optional[float] = None
+        self.last_gradient_submission_time: Optional[float] = None
+        
+        # Snapshot initial weights
+        self._snapshot_weights()
+        
+        logger.info(f"AsyncTrainer initialized for node {node_id[:16]}...")
+    
+    def _snapshot_weights(self):
+        """Snapshot current weights for pseudo-gradient computation."""
+        import torch
+        self.initial_weights = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.initial_weights[name] = param.data.clone()
+    
+    def start(self):
+        """Start the async training loop."""
+        if self.running:
+            return
+        
+        self.running = True
+        self._stop_event.clear()
+        self._training_thread = threading.Thread(
+            target=self._async_training_loop,
+            daemon=True,
+            name=f"AsyncTrainer-{self.node_id[:8]}"
+        )
+        self._training_thread.start()
+        logger.info("AsyncTrainer started")
+    
+    def stop(self):
+        """Stop the async training loop."""
+        self.running = False
+        self._stop_event.set()
+        if self._training_thread and self._training_thread.is_alive():
+            self._training_thread.join(timeout=5.0)
+        logger.info("AsyncTrainer stopped")
+    
+    def _async_training_loop(self):
+        """
+        Main async training loop.
+        
+        Unlike QuorumTrainer, this runs independently:
+        1. Train locally for ASYNC_STEPS_PER_ROUND steps
+        2. Compute pseudo-gradient
+        3. Submit to DiLoCo cohort sync (if available)
+        4. Reset and repeat
+        """
+        import torch
+        
+        logger.info("[ASYNC] Starting async training loop...")
+        
+        while self.running and not self._stop_event.is_set():
+            try:
+                # Check if we have Genesis data to train on
+                if not self.genesis_loader:
+                    logger.debug("[ASYNC] No Genesis data loader, waiting...")
+                    time.sleep(self.ASYNC_TRAIN_INTERVAL)
+                    continue
+                
+                # Train for N steps
+                losses = []
+                for step in range(self.ASYNC_STEPS_PER_ROUND):
+                    if self._stop_event.is_set():
+                        break
+                    
+                    try:
+                        # Get batch from Genesis loader
+                        batch = self.genesis_loader.get_batch(batch_size=self.ASYNC_BATCH_SIZE)
+                        if batch is None:
+                            continue
+                        
+                        input_ids, labels = batch
+                        
+                        # Forward pass
+                        self.model.train()
+                        outputs = self.model(input_ids=input_ids, labels=labels)
+                        loss = outputs.get("loss") if isinstance(outputs, dict) else outputs[0]
+                        
+                        # Backward pass
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        
+                        # Gradient clipping
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        
+                        # Optimizer step
+                        self.optimizer.step()
+                        
+                        # Track stats
+                        self.total_batches += 1
+                        losses.append(loss.item())
+                        
+                    except Exception as e:
+                        logger.debug(f"[ASYNC] Training step error: {e}")
+                        continue
+                
+                # Update current loss
+                if losses:
+                    self.current_loss = sum(losses) / len(losses)
+                    logger.info(f"[ASYNC] Completed {len(losses)} steps, avg_loss={self.current_loss:.4f}")
+                
+                # Compute pseudo-gradient
+                pseudo_gradient = self._compute_pseudo_gradient()
+                
+                # Submit to cohort sync (if DHT available)
+                if pseudo_gradient and self.dht:
+                    self._submit_to_cohort_sync(pseudo_gradient)
+                
+                # Reset weights snapshot for next round
+                self._snapshot_weights()
+                
+                # Wait before next training round
+                time.sleep(self.ASYNC_TRAIN_INTERVAL)
+                
+            except Exception as e:
+                logger.error(f"[ASYNC] Training loop error: {e}")
+                time.sleep(10)
+        
+        logger.info("[ASYNC] Training loop ended")
+    
+    def _compute_pseudo_gradient(self) -> Optional[Dict[str, Any]]:
+        """
+        Compute pseudo-gradient: delta_w = w_initial - w_current
+        
+        This represents the accumulated update from local training.
+        """
+        import torch
+        
+        if not self.initial_weights:
+            return None
+        
+        pseudo_grad = {}
+        for name, param in self.model.named_parameters():
+            if name in self.initial_weights and param.requires_grad:
+                # Pseudo-gradient is the difference (what we learned)
+                pseudo_grad[name] = self.initial_weights[name] - param.data
+        
+        return pseudo_grad
+    
+    def _submit_to_cohort_sync(self, pseudo_gradient: Dict[str, Any]):
+        """
+        Submit pseudo-gradient to layer cohort for DiLoCo sync.
+        
+        Async contributions are weighted by freshness:
+        - < 1 hour: 100%
+        - < 1 day: 70%
+        - < 1 week: 50%
+        - > 1 week: 30%
+        """
+        try:
+            # Calculate freshness
+            age_seconds = time.time() - self.last_sync_time
+            freshness = calculate_async_freshness(age_seconds)
+            
+            # Create gradient contribution
+            contribution = {
+                "node_id": self.node_id,
+                "batches": self.total_batches,
+                "timestamp": time.time(),
+                "freshness": freshness,
+                "is_async": True,
+                # Note: Actual gradient data would be compressed and sent via DHT/P2P
+            }
+            
+            # Log submission
+            logger.info(f"[ASYNC] Submitting gradient: batches={self.total_batches}, "
+                       f"freshness={freshness:.2f}, age={age_seconds/60:.1f}min")
+            
+            # Update tracking
+            self.last_gradient_submission_time = time.time()
+            self.last_sync_time = time.time()
+            self.total_syncs += 1
+            
+            # TODO: Actual submission via DHT/P2P to layer cohort
+            # For now, the gradient is computed and ready for submission
+            
+        except Exception as e:
+            logger.error(f"[ASYNC] Failed to submit gradient: {e}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get async trainer statistics."""
+        return {
+            "running": self.running,
+            "total_batches": self.total_batches,
+            "total_syncs": self.total_syncs,
+            "current_loss": self.current_loss,
+            "last_submission": self.last_gradient_submission_time,
+            "is_async": True,
+        }

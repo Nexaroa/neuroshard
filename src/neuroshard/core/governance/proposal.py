@@ -124,7 +124,7 @@ class ParameterChange:
     Links to the exact constant/config that will change.
     """
     module: str           # e.g., "economics.constants"
-    parameter: str        # e.g., "TRAINING_REWARD_PER_BATCH"
+    parameter: str        # e.g., "TRAINING_REWARD_PER_BATCH_PER_LAYER"
     old_value: Any        # Current value
     new_value: Any        # Proposed value
     rationale: str        # Why this change
@@ -332,7 +332,7 @@ def create_proposal(
             parameter_changes=[
                 ParameterChange(
                     module="economics.constants",
-                    parameter="TRAINING_REWARD_PER_BATCH",
+                    parameter="TRAINING_REWARD_PER_BATCH_PER_LAYER",
                     old_value=0.0005,
                     new_value=0.0003,  # Reduced because more efficient
                     rationale="MTP extracts 2x signal, so half reward maintains parity"

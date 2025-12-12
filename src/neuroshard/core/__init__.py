@@ -38,8 +38,9 @@ __all__ = [
     # Network
     'P2PManager',
     # Training
-    'TrainingCoordinator',
+    'GradientContribution',
     'GradientCompressor',
+    'GenesisDataLoader',
     'GlobalTrainingTracker',
     # Economics
     'NEUROLedger',
@@ -74,8 +75,8 @@ def __getattr__(name):
         from neuroshard.core import network
         return getattr(network, name)
     # Training components
-    elif name in ('TrainingCoordinator', 'FederatedDataManager', 'GenesisDataLoader',
-                  'GradientCompressor', 'CompressionConfig', 'CompressionMethod',
+    elif name in ('GradientContribution', 'GradientCompressor', 'GenesisDataLoader',
+                  'CompressionConfig', 'CompressionMethod',
                   'GlobalTrainingTracker', 'TrainingSnapshot', 'GlobalTrainingStats'):
         from neuroshard.core import training
         return getattr(training, name)

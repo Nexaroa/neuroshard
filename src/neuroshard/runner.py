@@ -34,7 +34,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
 
-from neuroshard.core.model.dynamic import DynamicNeuroNode, create_dynamic_node
+from neuroshard.core.model.dynamic import (
+    DynamicNeuroNode,
+    create_dynamic_node,
+    ContributionMode,
+    SpeedTier,
+    select_contribution_mode,
+    check_layer_growth,
+    LayerGrowthManager,
+)
 from neuroshard.core.model.tokenizer import get_neuro_tokenizer
 from neuroshard.core.network.p2p import P2PManager
 
@@ -54,6 +62,7 @@ from neuroshard.core.swarm.quorum import (
     QuorumFormationService,
     QuorumTrainer,
     QuorumInferenceRouter,
+    AsyncTrainer,
 )
 from neuroshard.core.consensus.verifier import (
     ProofVerifier,
@@ -358,6 +367,11 @@ QUORUM_INFERENCE_ROUTER: Optional[QuorumInferenceRouter] = None
 PROOF_VERIFIER: Optional[ProofVerifier] = None
 DHT_PROTOCOL: Optional[DHTProtocol] = None
 CURRENT_QUORUM: Optional[Quorum] = None
+
+# Contribution Mode (per whitepaper: PIPELINE, ASYNC, DATA, VERIFY, INFERENCE, IDLE)
+CURRENT_CONTRIBUTION_MODE: ContributionMode = ContributionMode.IDLE
+ASYNC_TRAINER = None  # AsyncTrainer instance for nodes in ASYNC mode
+LAYER_GROWTH_MANAGER: Optional[LayerGrowthManager] = None
 
 def get_app():
     return node_app
@@ -718,6 +732,41 @@ async def get_local_training_history():
         result["analysis"]["note"] = "Global tracker not initialized - restart node to enable"
     
     return result
+
+
+# ==================== CONTRIBUTION MODE ENDPOINT ====================
+
+@node_app.get("/api/contribution_mode")
+async def get_contribution_mode():
+    """
+    Get this node's current contribution mode.
+    
+    Modes per whitepaper:
+    - pipeline: Real-time quorum member (synchronous training)
+    - async: Offline training, submit gradients periodically
+    - data: Store and serve Genesis training data
+    - verify: Re-execute proofs for verification
+    - inference: Serve inference requests only
+    - idle: Available but not actively contributing
+    
+    Returns current mode and relevant details.
+    """
+    return {
+        "mode": CURRENT_CONTRIBUTION_MODE.value if CURRENT_CONTRIBUTION_MODE else "idle",
+        "speed_tier": STATE.get("speed_tier", "unknown"),
+        "has_quorum": CURRENT_QUORUM is not None and CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE if CURRENT_QUORUM else False,
+        "quorum_id": CURRENT_QUORUM.quorum_id[:16] if CURRENT_QUORUM else None,
+        "training_mode": STATE.get("training_mode", "unknown"),
+        "training_status": STATE.get("training_status", "unknown"),
+        "description": {
+            "pipeline": "Real-time training in speed-matched quorum",
+            "async": "Offline training with periodic gradient submission",
+            "data": "Serving Genesis training data shards",
+            "verify": "Verifying PoNW proofs from other nodes",
+            "inference": "Serving inference requests only",
+            "idle": "Available but not actively contributing",
+        }.get(CURRENT_CONTRIBUTION_MODE.value if CURRENT_CONTRIBUTION_MODE else "idle", "Unknown mode"),
+    }
 
 
 # ==================== STATS & PONW ENDPOINTS ====================
@@ -2427,59 +2476,163 @@ def get_local_ip():
     return IP
 
 
-def _get_speed_tier(node) -> str:
+def _get_speed_tier(node, benchmark: bool = True) -> SpeedTier:
     """
-    Determine the speed tier for a node based on hardware capabilities.
+    Determine the speed tier for a node based on hardware and benchmarking.
     
     Speed tiers match training throughput for efficient quorum formation:
-    - tier1: Enterprise GPUs (H100, A100) - fastest
-    - tier2: Consumer GPUs (RTX 4090, 3090)
-    - tier3: Mid-range GPUs (RTX 3080, 4070)
-    - tier4: Entry GPUs or fast CPU (RTX 3060, Apple M2)
-    - tier5: CPU-only or low-memory - slowest
+    - T1: Enterprise GPUs (H100, A100) - fastest (<10ms/layer)
+    - T2: Consumer GPUs (RTX 4090, 3090) (10-50ms/layer)
+    - T3: Mid-range GPUs (RTX 3080, 4070) (50-200ms/layer)
+    - T4: Entry GPUs or fast CPU (RTX 3060, Apple M2) (200-1000ms/layer)
+    - T5: CPU-only or low-memory - slowest (>1000ms/layer)
+    
+    Args:
+        node: The NeuroShard node
+        benchmark: If True, run actual forward pass benchmarking (recommended)
     
     Returns:
-        Speed tier string (e.g., "tier2")
+        SpeedTier enum value
     """
+    # Try benchmark-based classification first (most accurate)
+    if benchmark:
+        benchmark_tier = _benchmark_speed_tier(node)
+        if benchmark_tier:
+            return benchmark_tier
+    
+    # Fall back to heuristic-based classification
     try:
         device = getattr(node, 'device', 'cpu')
         memory_mb = getattr(node, 'memory_limit_mb', 4096)
         
         if device == 'cuda':
             # Check GPU type and memory
-            import torch
             gpu_name = torch.cuda.get_device_name(0).lower() if torch.cuda.is_available() else ""
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0
             
             # Enterprise tier
             if any(x in gpu_name for x in ['h100', 'a100', 'h200', 'a6000']):
-                return "tier1"
+                return SpeedTier.T1
             # High-end consumer
             elif any(x in gpu_name for x in ['4090', '3090', 'a5000']) or gpu_memory >= 20:
-                return "tier2"
+                return SpeedTier.T2
             # Mid-range
             elif any(x in gpu_name for x in ['4080', '3080', '4070', 'a4000']) or gpu_memory >= 10:
-                return "tier3"
+                return SpeedTier.T3
             # Entry-level GPU
             else:
-                return "tier4"
+                return SpeedTier.T4
         
         elif device == 'mps':
             # Apple Silicon - tier based on memory
             if memory_mb >= 32768:  # 32GB+ unified memory
-                return "tier3"
+                return SpeedTier.T3
             elif memory_mb >= 16384:  # 16GB
-                return "tier4"
+                return SpeedTier.T4
             else:
-                return "tier5"
+                return SpeedTier.T5
         
         else:
             # CPU-only
-            return "tier5"
+            return SpeedTier.T5
             
     except Exception as e:
         logger.warning(f"Could not determine speed tier: {e}")
-        return "tier5"  # Conservative default
+        return SpeedTier.T5  # Conservative default
+
+
+def _benchmark_speed_tier(node) -> Optional[SpeedTier]:
+    """
+    Benchmark actual forward pass latency to determine speed tier.
+    
+    Runs 5 forward passes through a single transformer layer and
+    measures average latency to classify the node.
+    
+    Thresholds (per layer forward pass):
+    - T1: <10ms (enterprise GPUs)
+    - T2: 10-50ms (high-end consumer)
+    - T3: 50-200ms (mid-range)
+    - T4: 200-1000ms (entry-level)
+    - T5: >1000ms (slow CPU)
+    
+    Returns:
+        SpeedTier or None if benchmarking fails
+    """
+    try:
+        import torch
+        import time
+        
+        # Check if model is available
+        if not hasattr(node, 'model') or node.model is None:
+            logger.debug("[BENCHMARK] No model available for benchmarking")
+            return None
+        
+        model = node.model
+        device = getattr(node, 'device', 'cpu')
+        
+        # Get a single transformer block to benchmark
+        # Try common layer access patterns
+        layer = None
+        if hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
+            layer = model.transformer.h[0]  # GPT-2 style
+        elif hasattr(model, 'layers'):
+            layer = model.layers[0]  # LLaMA style
+        elif hasattr(model, 'blocks'):
+            layer = model.blocks[0]  # Other style
+        
+        if layer is None:
+            logger.debug("[BENCHMARK] Could not find transformer layer")
+            return None
+        
+        # Create test input (batch_size=1, seq_len=32)
+        config = model.config if hasattr(model, 'config') else None
+        hidden_dim = getattr(config, 'n_embd', 1024) if config else 1024
+        test_input = torch.randn(1, 32, hidden_dim)
+        
+        # Move to device
+        if device == 'cuda' and torch.cuda.is_available():
+            test_input = test_input.cuda()
+            layer = layer.cuda()
+            torch.cuda.synchronize()
+        elif device == 'mps':
+            test_input = test_input.to('mps')
+            layer = layer.to('mps')
+        
+        # Warm-up run
+        with torch.no_grad():
+            _ = layer(test_input)
+        
+        # Benchmark 5 forward passes
+        latencies = []
+        with torch.no_grad():
+            for _ in range(5):
+                if device == 'cuda' and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
+                _ = layer(test_input)
+                if device == 'cuda' and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                end = time.perf_counter()
+                latencies.append((end - start) * 1000)  # Convert to ms
+        
+        avg_latency_ms = sum(latencies) / len(latencies)
+        logger.info(f"[BENCHMARK] Average layer forward pass: {avg_latency_ms:.2f}ms")
+        
+        # Classify based on latency thresholds
+        if avg_latency_ms < 10:
+            return SpeedTier.T1
+        elif avg_latency_ms < 50:
+            return SpeedTier.T2
+        elif avg_latency_ms < 200:
+            return SpeedTier.T3
+        elif avg_latency_ms < 1000:
+            return SpeedTier.T4
+        else:
+            return SpeedTier.T5
+            
+    except Exception as e:
+        logger.debug(f"[BENCHMARK] Benchmarking failed: {e}")
+        return None
 
 
 def run_node(
@@ -2898,8 +3051,9 @@ def run_node(
     
     # Determine speed tier from hardware
     speed_tier = _get_speed_tier(NEURO_NODE)
-    STATE["speed_tier"] = speed_tier
-    logger.info(f"[QUORUM] Node speed tier: {speed_tier}")
+    STATE["speed_tier"] = speed_tier.value  # Store string for JSON serialization
+    STATE["speed_tier_enum"] = speed_tier    # Keep enum for internal use
+    logger.info(f"[QUORUM] Node speed tier: {speed_tier.value}")
     
     # Form or join a quorum if training is enabled
     if enable_training:
@@ -2919,7 +3073,7 @@ def run_node(
             initiator_node_id=NEURO_NODE.node_id,
             initiator_endpoint=grpc_endpoint,
             initiator_layers=(min(layer_ids) if layer_ids else 0, max(layer_ids) + 1 if layer_ids else 1),
-            initiator_speed_tier=speed_tier,
+            initiator_speed_tier=speed_tier.value,
             total_layers=total_layers,
         )
         
@@ -2950,6 +3104,51 @@ def run_node(
     else:
         logger.info("[QUORUM] Training disabled, skipping quorum formation")
     
+    # =========================================================================
+    # SELECT CONTRIBUTION MODE (per whitepaper)
+    # =========================================================================
+    global CURRENT_CONTRIBUTION_MODE, LAYER_GROWTH_MANAGER
+    
+    # Determine contribution mode based on current state
+    has_layers = bool(NEURO_NODE.my_layer_ids)
+    has_quorum = CURRENT_QUORUM is not None and CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE
+    has_genesis_data = hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader is not None
+    has_stake = P2P.ledger.get_account_info().get("stake", 0.0) >= 10.0 if P2P and P2P.ledger else False
+    
+    CURRENT_CONTRIBUTION_MODE = select_contribution_mode(
+        speed_tier=speed_tier,
+        has_layers=has_layers,
+        has_quorum=has_quorum,
+        has_genesis_data=has_genesis_data,
+        has_stake=has_stake,
+        network_needs_verifiers=False,  # TODO: Query from network state
+        network_needs_data_providers=False,
+    )
+    
+    STATE["contribution_mode"] = CURRENT_CONTRIBUTION_MODE.value
+    logger.info(f"[MODE] Contribution mode: {CURRENT_CONTRIBUTION_MODE.value}")
+    
+    # T5 nodes can't do real-time pipeline, log this
+    if speed_tier == SpeedTier.T5:
+        logger.info("[MODE] T5 (slow) node - using async training mode")
+    
+    # Initialize AsyncTrainer if mode is ASYNC and training is enabled
+    global ASYNC_TRAINER
+    if enable_training and CURRENT_CONTRIBUTION_MODE == ContributionMode.ASYNC:
+        logger.info("[ASYNC] Initializing AsyncTrainer for async contribution mode...")
+        ASYNC_TRAINER = AsyncTrainer(
+            node_id=NEURO_NODE.node_id,
+            model=NEURO_NODE.model,
+            optimizer=NEURO_NODE.optimizer,
+            genesis_loader=getattr(NEURO_NODE, 'genesis_loader', None),
+            dht_protocol=DHT_PROTOCOL,
+        )
+        logger.info("[ASYNC] AsyncTrainer initialized")
+    
+    # Initialize LayerGrowthManager for monitoring network growth
+    LAYER_GROWTH_MANAGER = LayerGrowthManager(dht_protocol=DHT_PROTOCOL)
+    logger.info("[GROWTH] LayerGrowthManager initialized")
+    
     logger.info("[QUORUM] initialization complete")
     # =========================================================================
     
@@ -2973,6 +3172,7 @@ def run_node(
         - Marketplace and housekeeping tasks
         """
         global QUORUM_TRAINER, CURRENT_QUORUM, QUORUM_FORMATION
+        global CURRENT_CONTRIBUTION_MODE, ASYNC_TRAINER, LAYER_GROWTH_MANAGER
         
         import psutil
         
@@ -2981,19 +3181,25 @@ def run_node(
         STATE["config_memory_mb"] = available_memory_mb
         STATE["config_storage_mb"] = max_storage_mb
         
-        # Start QuorumTrainer if quorum is active
-        if enable_training and QUORUM_TRAINER and CURRENT_QUORUM:
-            if CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE:
-                logger.info("[QUORUM] Starting QuorumTrainer...")
-                QUORUM_TRAINER.start()
-                STATE["training_mode"] = "quorum"
-                STATE["training_status"] = "active"
+        # Start training based on contribution mode
+        if enable_training:
+            if CURRENT_CONTRIBUTION_MODE == ContributionMode.PIPELINE and QUORUM_TRAINER and CURRENT_QUORUM:
+                if CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE:
+                    logger.info("[QUORUM] Starting QuorumTrainer (PIPELINE mode)...")
+                    QUORUM_TRAINER.start()
+                    STATE["training_mode"] = "quorum"
+                    STATE["training_status"] = "active"
+                else:
+                    STATE["training_mode"] = "forming"
+                    STATE["training_status"] = "waiting_for_quorum"
+            elif CURRENT_CONTRIBUTION_MODE == ContributionMode.ASYNC and ASYNC_TRAINER:
+                logger.info("[ASYNC] Starting AsyncTrainer (ASYNC mode)...")
+                ASYNC_TRAINER.start()
+                STATE["training_mode"] = "async"
+                STATE["training_status"] = "async_training"
             else:
                 STATE["training_mode"] = "forming"
                 STATE["training_status"] = "waiting_for_quorum"
-        elif enable_training:
-            STATE["training_mode"] = "forming"
-            STATE["training_status"] = "waiting_for_quorum"
         else:
             STATE["training_mode"] = "disabled"
             STATE["training_status"] = "disabled"
@@ -3002,12 +3208,14 @@ def run_node(
         last_quorum_check = 0
         last_memory_report = 0
         last_heartbeat = 0
+        last_layer_growth_check = 0
         last_tokens = NEURO_NODE.total_tokens_processed if NEURO_NODE else 0
         last_training_rounds = NEURO_NODE.total_training_rounds if NEURO_NODE else 0
         
         QUORUM_CHECK_INTERVAL = 10  # Check quorum every 10 seconds
         MEMORY_REPORT_INTERVAL = 60
         HEARTBEAT_INTERVAL = 30
+        LAYER_GROWTH_CHECK_INTERVAL = 60  # Check layer growth every 60 seconds
         
         logger.info("[QUORUM] Background task loop started")
         
@@ -3100,6 +3308,81 @@ def run_node(
                     STATE["training_batches"] = QUORUM_TRAINER.total_batches
                     STATE["last_loss"] = QUORUM_TRAINER.current_loss
                     STATE["current_loss"] = QUORUM_TRAINER.current_loss
+                
+                # =============================================================
+                # CONTRIBUTION MODE UPDATE (per whitepaper)
+                # =============================================================
+                # Re-evaluate contribution mode based on current state
+                has_layers = bool(NEURO_NODE.my_layer_ids)
+                has_quorum = CURRENT_QUORUM is not None and CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE
+                has_genesis_data = hasattr(NEURO_NODE, 'genesis_loader') and NEURO_NODE.genesis_loader is not None
+                has_stake = P2P.ledger.get_account_info().get("stake", 0.0) >= 10.0 if P2P and P2P.ledger else False
+                current_speed_tier = STATE.get("speed_tier_enum", SpeedTier.T5)
+                
+                new_mode = select_contribution_mode(
+                    speed_tier=current_speed_tier,
+                    has_layers=has_layers,
+                    has_quorum=has_quorum,
+                    has_genesis_data=has_genesis_data,
+                    has_stake=has_stake,
+                    network_needs_verifiers=False,
+                    network_needs_data_providers=False,
+                )
+                
+                # Log mode changes
+                if new_mode != CURRENT_CONTRIBUTION_MODE:
+                    old_mode = CURRENT_CONTRIBUTION_MODE
+                    logger.info(f"[MODE] Contribution mode changed: {old_mode.value} -> {new_mode.value}")
+                    CURRENT_CONTRIBUTION_MODE = new_mode
+                    STATE["contribution_mode"] = new_mode.value
+                    
+                    # Handle mode-specific transitions
+                    if new_mode == ContributionMode.PIPELINE and has_quorum:
+                        # Stop async trainer if running
+                        if ASYNC_TRAINER and ASYNC_TRAINER.running:
+                            logger.info("[ASYNC] Stopping AsyncTrainer (switching to PIPELINE)")
+                            ASYNC_TRAINER.stop()
+                        STATE["training_mode"] = "quorum"
+                        STATE["training_status"] = "active"
+                        
+                    elif new_mode == ContributionMode.ASYNC:
+                        # Stop quorum trainer if running
+                        if QUORUM_TRAINER and QUORUM_TRAINER.running:
+                            logger.info("[QUORUM] Stopping QuorumTrainer (switching to ASYNC)")
+                            QUORUM_TRAINER.stop()
+                        
+                        # Start async trainer if not running
+                        if not ASYNC_TRAINER:
+                            logger.info("[ASYNC] Creating AsyncTrainer...")
+                            ASYNC_TRAINER = AsyncTrainer(
+                                node_id=NEURO_NODE.node_id,
+                                model=NEURO_NODE.model,
+                                optimizer=NEURO_NODE.optimizer,
+                                genesis_loader=getattr(NEURO_NODE, 'genesis_loader', None),
+                                dht_protocol=DHT_PROTOCOL,
+                            )
+                        if not ASYNC_TRAINER.running:
+                            logger.info("[ASYNC] Starting AsyncTrainer...")
+                            ASYNC_TRAINER.start()
+                        STATE["training_mode"] = "async"
+                        STATE["training_status"] = "async_training"
+                        
+                    elif new_mode == ContributionMode.IDLE:
+                        # Stop both trainers
+                        if ASYNC_TRAINER and ASYNC_TRAINER.running:
+                            ASYNC_TRAINER.stop()
+                        if QUORUM_TRAINER and QUORUM_TRAINER.running:
+                            QUORUM_TRAINER.stop()
+                        STATE["training_mode"] = "idle"
+                        STATE["training_status"] = "waiting"
+                
+                # Update async trainer stats if running
+                if ASYNC_TRAINER and ASYNC_TRAINER.running:
+                    async_stats = ASYNC_TRAINER.get_stats()
+                    STATE["async_batches"] = async_stats["total_batches"]
+                    STATE["async_syncs"] = async_stats["total_syncs"]
+                    STATE["current_loss"] = async_stats["current_loss"]
+                    STATE["training_batches"] = async_stats["total_batches"]
             
             # =================================================================
             # STATE UPDATES
@@ -3136,6 +3419,63 @@ def run_node(
                                f"sync_round={QUORUM_TRAINER.sync_round}")
                 elif enable_training:
                     logger.info(f"[QUORUM] Waiting for quorum formation...")
+            
+            # =================================================================
+            # LAYER GROWTH CHECK (every 60 seconds)
+            # =================================================================
+            if now - last_layer_growth_check >= LAYER_GROWTH_CHECK_INTERVAL:
+                last_layer_growth_check = now
+                
+                try:
+                    # Get network stats for growth check
+                    current_layers = NEURO_NODE.layer_pool.current_num_layers if NEURO_NODE.layer_pool else 32
+                    current_hidden_dim = getattr(NEURO_NODE.model.config, 'n_embd', 1024) if hasattr(NEURO_NODE, 'model') else 1024
+                    
+                    # Get layer coverage from layer pool
+                    layer_coverage = {}
+                    if NEURO_NODE.layer_pool:
+                        for layer_id in range(current_layers):
+                            layer_info = NEURO_NODE.layer_pool.get_layer_info(layer_id) if hasattr(NEURO_NODE.layer_pool, 'get_layer_info') else None
+                            layer_coverage[layer_id] = layer_info.replica_count if layer_info else 1
+                    
+                    # Estimate total network memory (rough estimate based on peer count)
+                    network_size = len(P2P.known_peers) + 1
+                    total_network_memory_mb = network_size * available_memory_mb
+                    
+                    # Get steps since last growth
+                    steps_since_last_growth = STATE.get("total_training_rounds", 0) - STATE.get("last_growth_step", 0)
+                    
+                    # Check if layer growth is needed
+                    upgrade = check_layer_growth(
+                        current_layers=current_layers,
+                        current_hidden_dim=current_hidden_dim,
+                        total_network_memory_mb=total_network_memory_mb,
+                        steps_since_last_growth=steps_since_last_growth,
+                        layer_coverage=layer_coverage,
+                        network_size=network_size,
+                    )
+                    
+                    # If upgrade is needed, start it
+                    if upgrade and LAYER_GROWTH_MANAGER:
+                        logger.info(f"[GROWTH] Layer growth triggered: {upgrade.target_layers} layers")
+                        if LAYER_GROWTH_MANAGER.start_upgrade(upgrade):
+                            STATE["last_growth_step"] = STATE.get("total_training_rounds", 0)
+                            STATE["growth_phase"] = "announcement"
+                            STATE["growth_target_layers"] = upgrade.target_layers
+                    
+                    # Advance growth phase if in progress
+                    if LAYER_GROWTH_MANAGER and LAYER_GROWTH_MANAGER.current_upgrade:
+                        new_phase = LAYER_GROWTH_MANAGER.advance_phase()
+                        if new_phase:
+                            logger.info(f"[GROWTH] Advanced to phase: {new_phase.value}")
+                            STATE["growth_phase"] = new_phase.value
+                        else:
+                            STATE["growth_phase"] = LAYER_GROWTH_MANAGER.current_upgrade.phase.value if LAYER_GROWTH_MANAGER.current_upgrade else "none"
+                    else:
+                        STATE["growth_phase"] = "none"
+                        
+                except Exception as e:
+                    logger.debug(f"[GROWTH] Layer growth check error: {e}")
             
             # =================================================================
             # MEMORY REPORT (every 60 seconds)

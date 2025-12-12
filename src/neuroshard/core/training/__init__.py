@@ -2,22 +2,21 @@
 """
 Training coordination components for NeuroShard.
 
-- distributed: TrainingCoordinator, FederatedDataManager, GenesisDataLoader
+- distributed: GradientContribution, GradientCompressor, GenesisDataLoader
 - production: GradientCompressor (for DiLoCo gradient exchange)
 - global_tracker: GlobalTrainingTracker (for training verification)
 """
 
 __all__ = [
-    'TrainingCoordinator',
-    'FederatedDataManager',
-    'GenesisDataLoader',
+    'GradientContribution',
     'GradientCompressor',
+    'GenesisDataLoader',
     'GlobalTrainingTracker',
 ]
 
 def __getattr__(name):
     """Lazy loading of submodules."""
-    if name in ('TrainingCoordinator', 'FederatedDataManager', 'GenesisDataLoader', 'GradientContribution'):
+    if name in ('GradientContribution', 'GradientCompressor', 'GenesisDataLoader'):
         from neuroshard.core.training import distributed
         return getattr(distributed, name)
     elif name in ('GradientCompressor', 'CompressionConfig', 'CompressionMethod'):

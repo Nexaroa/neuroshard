@@ -41,9 +41,6 @@ TRAINING_REWARD_PER_BATCH_PER_LAYER = 0.0005  # 0.0005 NEURO per batch per layer
                                                # Node with 10 layers, 60 batches/min:
                                                # = 0.0005 × 10 × 60 = 0.3 NEURO/min = ~432 NEURO/day
 
-# Legacy alias (for backward compatibility - use TRAINING_REWARD_PER_BATCH_PER_LAYER)
-TRAINING_REWARD_PER_BATCH = TRAINING_REWARD_PER_BATCH_PER_LAYER
-
 # ASYNC TRAINING REWARD (for offline gradient contributors)
 # Goal: Reward async contributors fairly but less than real-time pipeline
 # Async gradients are less valuable because they may be stale
@@ -102,15 +99,9 @@ INITIATOR_BONUS = 0.2               # +20% bonus for holding embedding layer
 FINISHER_BONUS = 0.3                # +30% bonus for holding LM head + loss calc
 TRAINING_BONUS = 0.1                # +10% bonus when actively training
 
-# NOTE: Layer scaling is already handled by per-layer reward calculation
+# NOTE: Layer scaling is handled by per-layer reward calculation
 # (TRAINING_REWARD_PER_BATCH_PER_LAYER × layers_held)
-# These additional layer bonuses are REMOVED to avoid double-counting:
-# - Old: LAYER_BONUS = 0.05 per layer (caused confusion with per-layer rate)
-# - New: Layer reward is directly proportional via the base rate
-
-# Legacy constants for backward compatibility (deprecated)
-LAYER_BONUS = 0.0                   # DEPRECATED: Now handled by per-layer rate
-MAX_LAYER_BONUS = 0.0               # DEPRECATED: No longer used
+# No separate layer bonus needed - reward scales directly with layers held
 
 # =============================================================================
 # REPUTATION-BASED BONUSES
@@ -237,9 +228,9 @@ def get_layer_scarcity_scores(
 # =============================================================================
 
 # Stake multiplier formula: 1.0 + STAKING_BASE_BONUS * log2(1 + stake / STAKING_UNIT)
+# Uses logarithmic diminishing returns to prevent whale dominance
 STAKING_BASE_BONUS = 0.1            # Base 10% bonus coefficient
 STAKING_UNIT = 1000.0               # Staking calculated per 1000 NEURO
-STAKING_DIMINISHING = True          # Use logarithmic diminishing returns
 
 # Staking limits
 MIN_STAKE_AMOUNT = 1.0              # Minimum stake amount (1 NEURO)
@@ -420,26 +411,7 @@ def calculate_stake_multiplier(stake: float) -> float:
     if stake <= 0:
         return 1.0
     
-    if STAKING_DIMINISHING:
-        return 1.0 + STAKING_BASE_BONUS * math.log2(1 + stake / STAKING_UNIT)
-    else:
-        # Linear (legacy)
-        return 1.0 + (STAKING_BASE_BONUS * (stake / STAKING_UNIT))
-
-
-def calculate_layer_bonus(layers_held: int) -> float:
-    """
-    Calculate layer bonus for workers.
-    
-    DEPRECATED: Layer scaling is now handled directly via per-layer reward rates.
-    This function is kept for backward compatibility but always returns 0.
-    
-    The new approach:
-    - training_reward = batches × TRAINING_REWARD_PER_BATCH_PER_LAYER × layers_held
-    - This directly scales reward with layers, no additional bonus needed.
-    """
-    # Layer bonus is deprecated - scaling is done via per-layer rate
-    return 0.0
+    return 1.0 + STAKING_BASE_BONUS * math.log2(1 + stake / STAKING_UNIT)
 
 
 def calculate_async_freshness(age_seconds: float) -> float:

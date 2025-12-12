@@ -31,18 +31,14 @@ from neuroshard.core.economics.ledger import (
 )
 from neuroshard.core.economics.constants import (
     UPTIME_REWARD_PER_MINUTE,
-    TRAINING_REWARD_PER_BATCH,
-    INITIATOR_BONUS,  # Was DRIVER_BONUS
-    FINISHER_BONUS,   # Was VALIDATOR_BONUS
+    TRAINING_REWARD_PER_BATCH_PER_LAYER,
+    INITIATOR_BONUS,
+    FINISHER_BONUS,
     VALIDATOR_MIN_STAKE,
     SLASH_AMOUNT,
     FEE_BURN_RATE,
     calculate_stake_multiplier,
 )
-
-# Legacy aliases for backward compatibility in tests
-DRIVER_BONUS = INITIATOR_BONUS
-VALIDATOR_BONUS = FINISHER_BONUS
 
 
 class TestPoNWProof(unittest.TestCase):

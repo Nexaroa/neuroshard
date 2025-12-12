@@ -73,6 +73,9 @@ __all__ = [
     'calculate_inference_price',
     'SYNC_INTERVAL',
     'OUTER_LR',
+    # Async Training
+    'AsyncTrainer',
+    'calculate_async_freshness',
 ]
 
 def __getattr__(name):
@@ -123,7 +126,8 @@ def __getattr__(name):
                   'QuorumFormationService', 'QuorumLifecycleManager', 'QuorumTrainer',
                   'QuorumInferenceRouter', 'InferenceQuorumInfo', 'calculate_inference_price',
                   'BASE_SESSION_DURATION', 'MAX_SESSION_DURATION', 'RENEWAL_CHECK_RATIO',
-                  'SYNC_INTERVAL', 'OUTER_LR'):
+                  'SYNC_INTERVAL', 'OUTER_LR',
+                  'AsyncTrainer', 'calculate_async_freshness'):
         from neuroshard.core.swarm import quorum
         return getattr(quorum, name)
     raise AttributeError(f"module 'neuroshard.core.swarm' has no attribute '{name}'")
