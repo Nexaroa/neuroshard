@@ -107,16 +107,20 @@ class DHTProtocol:
     def ping(self, target: Node) -> bool:
         """Send PING to target node."""
         try:
+            target_addr = f"{target.ip}:{target.port + 1000}"
+            logger.debug(f"DHT Ping: {self.local_node.ip}:{self.local_node.port} -> {target_addr}")
             stub = self._get_stub(target)
             req = neuroshard_pb2.DHTPingRequest(
                 sender=node_to_proto(self.local_node)
             )
-            resp = stub.DHTPing(req, timeout=2.0)
+            resp = stub.DHTPing(req, timeout=5.0)  # Increased timeout for cross-network
             # Update routing table with responder
             self.routing_table.add_contact(proto_to_node(resp.responder))
+            logger.debug(f"DHT Ping successful: {target_addr} responded as {resp.responder.ip}:{resp.responder.port}")
             return True
         except grpc.RpcError as e:
-            logger.debug(f"Ping failed to {target}: {e}")
+            # Log at info level for important connectivity issues
+            logger.info(f"DHT Ping failed to {target.ip}:{target.port + 1000}: {e.code() if hasattr(e, 'code') else e}")
             return False
 
     def find_node(self, target: Node, search_id: int) -> List[Node]:

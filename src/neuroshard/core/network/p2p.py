@@ -1120,6 +1120,11 @@ class P2PManager:
             ip = parsed.hostname
             port = parsed.port or 80
             
+            # Ensure IP is valid (never None or empty string)
+            if not ip or ip == "None":
+                logger.debug("[TRACKER] Skipping announce - no valid IP address")
+                return
+            
             # Build shard range string
             if self.observer_mode:
                 shard_range = "observer"
@@ -1128,13 +1133,23 @@ class P2PManager:
             else:
                 shard_range = "unassigned"
             
+            # Safely determine is_exit
+            is_exit = False
+            if not self.observer_mode:
+                try:
+                    if hasattr(self, 'neuro_node') and self.neuro_node:
+                        if hasattr(self.neuro_node, 'model') and self.neuro_node.model:
+                            is_exit = getattr(self.neuro_node.model, 'has_lm_head', False)
+                except Exception:
+                    pass
+            
             # Announce to tracker
             announce_data = {
                 "ip": ip,
                 "port": port,
                 "shard_range": shard_range,
                 "is_entry": self.start_layer == 0 if self.start_layer >= 0 else False,
-                "is_exit": hasattr(self, 'neuro_node') and self.neuro_node and hasattr(self.neuro_node, 'model') and self.neuro_node.model.has_lm_head if not self.observer_mode else False,
+                "is_exit": is_exit,
                 "tps": self.current_tps,
                 "latency": self.current_latency,
                 "node_token": self.node_token,

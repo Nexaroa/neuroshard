@@ -341,9 +341,9 @@ async def shutdown():
     await db.close()
 
 class NodeAnnouncement(BaseModel):
-    ip: str
+    ip: Optional[str] = None  # Can be None, will use request client IP as fallback
     port: int
-    shard_range: str # e.g. "0-4"
+    shard_range: str = "0-0"  # e.g. "0-4", "observer", "unassigned"
     is_entry: bool = False
     is_exit: bool = False
     tps: float = 0.0
@@ -362,28 +362,47 @@ class PeerInfo(BaseModel):
 
 @app.post("/announce")
 async def announce(node: NodeAnnouncement, request: Request):
+    # Use node.ip if provided, otherwise fall back to request client IP
+    # This handles cases where the client sends None or empty IP
     client_ip = node.ip
+    if not client_ip or client_ip in ("None", "null", ""):
+        client_ip = request.client.host if request.client else "unknown"
+    
     url = f"http://{client_ip}:{node.port}"
     
-    # Parse shard range - supports both "0-11" format and "dynamic-57-layers" format
-    try:
-        if node.shard_range.startswith("dynamic-"):
-            # Dynamic mode: "dynamic-57-layers" means node has layers 0 to 56 (57 layers total)
-            # Parse the number of layers
-            parts = node.shard_range.split("-")
+    # Parse shard range - supports multiple formats:
+    # - "0-11" (traditional layer range)
+    # - "dynamic-57-layers" (dynamic mode)
+    # - "observer" (observer mode - no layers)
+    # - "unassigned" (node not yet assigned layers)
+    shard_range = node.shard_range or "0-0"
+    
+    # Handle special shard_range values
+    if shard_range in ("observer", "unassigned"):
+        # Observer nodes and unassigned nodes don't have layers yet
+        # Set to -1,-1 so they won't match layer queries
+        start, end = -1, -1
+    elif shard_range.startswith("dynamic-"):
+        # Dynamic mode: "dynamic-57-layers" means node has layers 0 to 56 (57 layers total)
+        try:
+            parts = shard_range.split("-")
             if len(parts) >= 2:
                 num_layers = int(parts[1])
                 start = 0  # Dynamic nodes always start at layer 0 (embedding)
                 end = num_layers  # End is exclusive, so 57 layers = 0-56
             else:
                 start, end = 0, 1
-        else:
-            # Traditional format: "0-11" means layers 0 to 11
-            start, end = map(int, node.shard_range.split("-"))
+        except Exception as e:
+            logging.debug(f"Failed to parse dynamic shard_range '{shard_range}': {e}")
+            start, end = 0, 1
+    else:
+        # Traditional format: "0-11" means layers 0 to 11
+        try:
+            start, end = map(int, shard_range.split("-"))
             end = end + 1  # Make end exclusive for consistent querying
-    except Exception as e:
-        logging.warning(f"Failed to parse shard_range '{node.shard_range}': {e}")
-        start, end = 0, 1  # Default to at least layer 0
+        except Exception as e:
+            logging.debug(f"Failed to parse shard_range '{shard_range}': {e}")
+            start, end = 0, 1  # Default to at least layer 0
 
     now = time.time()
 

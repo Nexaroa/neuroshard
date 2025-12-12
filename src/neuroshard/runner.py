@@ -2663,6 +2663,35 @@ def _benchmark_speed_tier(node) -> Optional[SpeedTier]:
         return None
 
 
+# =============================================================================
+# DEFAULT BOOTSTRAP NODES (like Bitcoin DNS seeds, IPFS bootstrap nodes)
+# These are well-known nodes that help new nodes discover the network.
+# They are NOT special or trusted - just reliable entry points.
+# Once connected, DHT takes over and tracker/seeds are no longer needed.
+#
+# Priority order:
+# 1. User-specified --seed-peers (highest priority)
+# 2. NEUROSHARD_BOOTSTRAP_NODES environment variable (comma-separated)
+# 3. DEFAULT_BOOTSTRAP_NODES (fallback)
+# =============================================================================
+def get_bootstrap_nodes() -> List[str]:
+    """Get bootstrap nodes from environment or use defaults."""
+    # Check for user-configured bootstrap nodes via environment
+    env_nodes = os.environ.get("NEUROSHARD_BOOTSTRAP_NODES", "")
+    if env_nodes:
+        nodes = [n.strip() for n in env_nodes.split(",") if n.strip()]
+        if nodes:
+            return nodes
+    
+    # Default bootstrap nodes
+    return [
+        # NeuroShard official observer/bootstrap node
+        "observer.neuroshard.com:8001",
+        # Add more community-run bootstrap nodes here as network grows
+    ]
+
+DEFAULT_BOOTSTRAP_NODES = get_bootstrap_nodes()
+
 def run_node(
     port: int,
     tracker: str = "https://neuroshard.com/api/tracker",
@@ -2817,6 +2846,9 @@ def run_node(
     import time
     import hashlib as hashlib_module  # Avoid shadowing issues
     
+    # Track peers we'll ping for bidirectional DHT connectivity
+    peers_to_ping = []
+    
     try:
         import requests
         from urllib.parse import urlparse
@@ -2836,31 +2868,74 @@ def run_node(
                             p_parsed = urlparse(p["url"])
                             p_ip = p_parsed.hostname
                             p_port = p_parsed.port or 80
-                            p_id = int(hashlib_module.sha1(f"{p['url']}".encode()).hexdigest(), 16)
-                            P2P.routing_table.add_contact(Node(p_id, p_ip, p_port))
-                            peer_count += 1
-                        except:
-                            pass
+                            if p_ip and p_ip != "None":
+                                p_id = int(hashlib_module.sha1(f"{p['url']}".encode()).hexdigest(), 16)
+                                peer_node = Node(p_id, p_ip, p_port)
+                                P2P.routing_table.add_contact(peer_node)
+                                peers_to_ping.append((peer_node, p["url"]))
+                                peer_count += 1
+                        except Exception as e:
+                            logger.debug(f"Failed to add peer {p.get('url')}: {e}")
             if peer_count > 0:
                 logger.info(f"DHT: Added {peer_count} peers from tracker")
     except Exception as e:
         logger.debug(f"Tracker peer discovery failed: {e}")
     
+    # CRITICAL: Ping discovered peers to establish BIDIRECTIONAL DHT connectivity
+    # Without this, the peer won't know about us and we can't discover each other's data
+    if P2P.dht and peers_to_ping:
+        logger.info(f"DHT: Pinging {len(peers_to_ping)} peers for bidirectional connectivity...")
+        ping_success = 0
+        for peer_node, peer_url in peers_to_ping[:10]:  # Limit to first 10 to avoid delays
+            try:
+                if P2P.dht.ping(peer_node):
+                    ping_success += 1
+                    logger.debug(f"  ✓ Pinged {peer_node.ip}:{peer_node.port}")
+            except Exception as e:
+                logger.debug(f"  ✗ Ping failed for {peer_url}: {e}")
+        if ping_success > 0:
+            logger.info(f"DHT: Established connectivity with {ping_success} peers")
+    
     # =========================================================================
     # SEED PEERS: Direct DHT bootstrap without tracker (fully decentralized)
+    # Priority: 1) User-specified seed_peers, 2) Default bootstrap nodes
+    # This is how Bitcoin DNS seeds and IPFS bootstrap nodes work.
     # =========================================================================
-    if seed_peers:
-        logger.info(f"DHT: Bootstrapping from {len(seed_peers)} seed peers...")
+    
+    # Determine which bootstrap nodes to use
+    bootstrap_nodes = seed_peers if seed_peers else []
+    
+    # If no user-specified seeds AND we didn't get peers from tracker,
+    # fall back to default bootstrap nodes
+    if not bootstrap_nodes and not peers_to_ping:
+        bootstrap_nodes = DEFAULT_BOOTSTRAP_NODES
+        if bootstrap_nodes:
+            logger.info(f"DHT: Using {len(bootstrap_nodes)} default bootstrap nodes...")
+    
+    if bootstrap_nodes:
+        if seed_peers:
+            logger.info(f"DHT: Bootstrapping from {len(bootstrap_nodes)} user-specified seed peers...")
         seed_count = 0
-        for peer_addr in seed_peers:
+        ping_success = 0
+        for peer_addr in bootstrap_nodes:
             try:
-                # Parse ip:port
+                # Parse ip:port (handle both hostname:port and ip:port)
                 if ':' in peer_addr:
                     peer_ip, peer_port_str = peer_addr.rsplit(':', 1)
                     peer_port = int(peer_port_str)
                 else:
                     peer_ip = peer_addr
                     peer_port = 8000  # Default port
+                
+                # Resolve hostname to IP if needed
+                import socket
+                try:
+                    resolved_ip = socket.gethostbyname(peer_ip)
+                    if resolved_ip != peer_ip:
+                        logger.debug(f"Resolved {peer_ip} -> {resolved_ip}")
+                        peer_ip = resolved_ip
+                except socket.gaierror:
+                    logger.debug(f"Could not resolve {peer_ip}, using as-is")
                 
                 # Generate DHT node ID from address
                 peer_url = f"http://{peer_ip}:{peer_port}"
@@ -2869,24 +2944,28 @@ def run_node(
                 # Add to DHT routing table
                 if P2P.routing_table:
                     from neuroshard.core.network.dht import Node
-                    P2P.routing_table.add_contact(Node(peer_id, peer_ip, peer_port))
+                    peer_node = Node(peer_id, peer_ip, peer_port)
+                    P2P.routing_table.add_contact(peer_node)
                     seed_count += 1
-                    logger.info(f"  + Seed peer: {peer_ip}:{peer_port}")
                     
-                    # Also ping the peer to establish bidirectional connection
+                    # Ping the peer to establish bidirectional connection
                     # This lets the peer add US to their routing table
                     if P2P.dht:
                         try:
-                            seed_node = Node(peer_id, peer_ip, peer_port)
-                            P2P.dht.ping(seed_node)
-                            logger.info(f"  ✓ Pinged seed peer {peer_ip}:{peer_port}")
+                            if P2P.dht.ping(peer_node):
+                                ping_success += 1
+                                logger.info(f"  ✓ Connected to {peer_ip}:{peer_port}")
+                            else:
+                                logger.debug(f"  ✗ Ping failed for {peer_ip}:{peer_port}")
                         except Exception as e:
-                            logger.debug(f"  Ping to {peer_addr} failed: {e}")
+                            logger.debug(f"  ✗ Ping to {peer_addr} failed: {e}")
             except Exception as e:
-                logger.warning(f"Invalid seed peer '{peer_addr}': {e}")
+                logger.debug(f"Bootstrap node '{peer_addr}' unavailable: {e}")
         
-        if seed_count > 0:
-            logger.info(f"DHT: Added {seed_count} seed peers to routing table")
+        if ping_success > 0:
+            logger.info(f"DHT: Connected to {ping_success}/{seed_count} bootstrap nodes")
+        elif seed_count > 0:
+            logger.info(f"DHT: Added {seed_count} bootstrap nodes (connectivity pending)")
     
     # Additional wait to let DHT stabilize
     time.sleep(1)
