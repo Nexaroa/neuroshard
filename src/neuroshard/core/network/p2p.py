@@ -928,6 +928,22 @@ class P2PManager:
                     for n in self.routing_table.get_all_nodes():
                         peers.append(f"http://{n.ip}:{n.port}")
                 
+                # Also look for proof receivers (observers) in DHT
+                if self.dht:
+                    try:
+                        import json
+                        proof_receivers = self.dht.lookup_value(
+                            int(hashlib.sha1(b"proof_receiver").hexdigest(), 16)
+                        )
+                        if proof_receivers:
+                            receivers = json.loads(proof_receivers)
+                            for receiver in receivers:
+                                peer_url = f"http://{receiver}"
+                                if peer_url not in peers:
+                                    peers.append(peer_url)
+                    except Exception:
+                        pass  # Best effort
+                
                 if not peers:
                     logger.info("PoNW: Solo mining (no peers to gossip)")
                 else:
@@ -1025,6 +1041,18 @@ class P2PManager:
         # 1. DHT Announce (Primary)
         # Announces all layers so peers can find us for pipeline routing
         if self.dht:
+            # Observer mode: announce as proof receiver even without layers
+            if self.observer_mode:
+                try:
+                    # Announce as a proof receiver so training nodes can find us
+                    self.dht.announce("proof_receiver")
+                    self.dht.announce("observer")
+                    if verbose:
+                        logger.info("[OBSERVER] DHT Announce: registered as proof receiver")
+                except Exception as e:
+                    logger.debug(f"[OBSERVER] DHT Announce error: {e}")
+                return
+            
             # Skip announcement if layers are not yet assigned
             if self.start_layer < 0:
                 if verbose:
@@ -1043,6 +1071,12 @@ class P2PManager:
                         success_count += 1
                     except:
                         pass
+                
+                # Also announce as proof receiver (all nodes can receive proofs)
+                try:
+                    self.dht.announce("proof_receiver")
+                except:
+                    pass
                 
                 # Log summary (only on first announce or if verbose)
                 if verbose and num_layers > 0:
