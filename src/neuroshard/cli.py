@@ -252,7 +252,11 @@ Get your wallet token at: https://neuroshard.com/wallet
     )
     parser.add_argument(
         "--tracker", type=str, default="https://neuroshard.com/api/tracker",
-        help="Tracker URL for peer discovery"
+        help="Tracker URL for peer discovery (bootstrap only)"
+    )
+    parser.add_argument(
+        "--seed-peers", type=str, default=None,
+        help="Comma-separated seed peers for DHT bootstrap (e.g., '1.2.3.4:8000,5.6.7.8:8001')"
     )
     
     # Network options
@@ -451,6 +455,11 @@ Get your wallet token at: https://neuroshard.com/wallet
     print(f"[NODE] Dashboard: http://localhost:{args.port}/")
     print()
     
+    # Parse seed peers
+    seed_peers = None
+    if args.seed_peers:
+        seed_peers = [p.strip() for p in args.seed_peers.split(',') if p.strip()]
+    
     run_node(
         port=args.port,
         tracker=args.tracker,
@@ -464,6 +473,7 @@ Get your wallet token at: https://neuroshard.com/wallet
         max_cpu_threads=args.cpu_threads,
         diloco_inner_steps=args.diloco_steps,
         device=args.device,
+        seed_peers=seed_peers,
     )
 
 

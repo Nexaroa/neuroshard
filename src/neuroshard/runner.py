@@ -2676,6 +2676,7 @@ def run_node(
     max_cpu_threads: Optional[int] = None,
     diloco_inner_steps: int = 500,
     device: str = "auto",
+    seed_peers: Optional[List[str]] = None,
 ):
     """
     Start a NeuroShard node.
@@ -2684,6 +2685,7 @@ def run_node(
     - No fixed phases or model sizes
     - Node contributes based on available memory
     - More memory = more layers = more NEURO rewards
+    - DHT-based peer discovery with optional seed peers
     
     MULTI-NODE SUPPORT:
     - Same token on multiple machines/ports is now supported
@@ -2692,12 +2694,13 @@ def run_node(
     
     Args:
         port: HTTP port
-        tracker: Tracker URL for peer discovery
+        tracker: Tracker URL for initial peer bootstrap
         node_token: Authentication token
         enable_training: Whether to participate in training
         available_memory_mb: Override memory detection (for testing)
         max_storage_mb: Maximum disk space for training data shards
         max_cpu_threads: Maximum CPU threads to use for training
+        seed_peers: List of seed peer addresses (e.g., ["1.2.3.4:8000"]) for DHT bootstrap
     """
     global NEURO_NODE, P2P
     
@@ -2839,9 +2842,51 @@ def run_node(
                         except:
                             pass
             if peer_count > 0:
-                logger.info(f"DHT: Added {peer_count} peers to routing table")
+                logger.info(f"DHT: Added {peer_count} peers from tracker")
     except Exception as e:
-        logger.debug(f"Peer discovery failed: {e}")
+        logger.debug(f"Tracker peer discovery failed: {e}")
+    
+    # =========================================================================
+    # SEED PEERS: Direct DHT bootstrap without tracker (fully decentralized)
+    # =========================================================================
+    if seed_peers:
+        logger.info(f"DHT: Bootstrapping from {len(seed_peers)} seed peers...")
+        seed_count = 0
+        for peer_addr in seed_peers:
+            try:
+                # Parse ip:port
+                if ':' in peer_addr:
+                    peer_ip, peer_port_str = peer_addr.rsplit(':', 1)
+                    peer_port = int(peer_port_str)
+                else:
+                    peer_ip = peer_addr
+                    peer_port = 8000  # Default port
+                
+                # Generate DHT node ID from address
+                peer_url = f"http://{peer_ip}:{peer_port}"
+                peer_id = int(hashlib_module.sha1(peer_url.encode()).hexdigest(), 16)
+                
+                # Add to DHT routing table
+                if P2P.routing_table:
+                    from neuroshard.core.network.dht import Node
+                    P2P.routing_table.add_contact(Node(peer_id, peer_ip, peer_port))
+                    seed_count += 1
+                    logger.info(f"  + Seed peer: {peer_ip}:{peer_port}")
+                    
+                    # Also ping the peer to establish bidirectional connection
+                    # This lets the peer add US to their routing table
+                    if P2P.dht:
+                        try:
+                            seed_node = Node(peer_id, peer_ip, peer_port)
+                            P2P.dht.ping(seed_node)
+                            logger.info(f"  ✓ Pinged seed peer {peer_ip}:{peer_port}")
+                        except Exception as e:
+                            logger.debug(f"  Ping to {peer_addr} failed: {e}")
+            except Exception as e:
+                logger.warning(f"Invalid seed peer '{peer_addr}': {e}")
+        
+        if seed_count > 0:
+            logger.info(f"DHT: Added {seed_count} seed peers to routing table")
     
     # Additional wait to let DHT stabilize
     time.sleep(1)

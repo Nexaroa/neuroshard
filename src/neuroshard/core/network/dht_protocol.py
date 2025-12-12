@@ -224,7 +224,19 @@ class DHTProtocol:
         """
         Find a value in the DHT.
         Returns the value if found, None otherwise.
+        
+        IMPORTANT: Check local storage FIRST, then query peers.
+        This is essential for small networks where nodes might store data
+        that should be discoverable by peers who ping us directly.
         """
+        # CRITICAL: Check local storage first!
+        # In small networks, the value might only be stored locally.
+        # When a peer pings us and adds us to their routing table,
+        # their next lookup should find our local data.
+        if key in self.storage:
+            return self.storage[key]
+        
+        # Query peers for the value
         shortlist = self.routing_table.find_closest(key)
         if not shortlist:
             return None
@@ -326,6 +338,22 @@ class DHTProtocol:
                     # Found many nodes but all failed - this might be a real problem
                     logger.warning(f"DHT Announce failed: Could not store '{key_string}' (found {len(nodes)} nodes but store failed).")
                 self._last_no_peers_log[key_string] = now
+
+    def lookup_key(self, key_string: str) -> Optional[str]:
+        """
+        Look up a value by string key in the DHT.
+        
+        This is a convenience method that hashes the key string and calls lookup_value.
+        Used for finding nodes that have announced specific roles (e.g., "proof_receiver").
+        
+        Args:
+            key_string: The string key to look up (e.g., "proof_receiver", "layer_0")
+            
+        Returns:
+            The value if found, None otherwise
+        """
+        key_id = int(hashlib.sha1(key_string.encode()).hexdigest(), 16)
+        return self.lookup_value(key_id)
 
     # =========================================================================
     # NETWORK STATE MANAGEMENT

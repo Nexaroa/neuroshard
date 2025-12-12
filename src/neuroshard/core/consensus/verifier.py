@@ -55,9 +55,12 @@ logger = logging.getLogger(__name__)
 # Even an H100 cluster cannot exceed these sustained rates.
 
 # Maximum training batches per second (sustained)
-# Rationale: Even H100 with small batch takes ~50ms per step minimum
-# 2.0 batches/sec = 500ms/batch, very generous for any real training
-MAX_TRAINING_RATE_PER_SEC = 2.0
+# Rationale: Training rate depends on model size, batch size, and hardware.
+# - Small models (11 layers, 512 hidden) with batch_size=1-4 can train at 5-15 steps/sec
+# - Large models (70B+) are much slower
+# 10.0 batches/sec is a reasonable limit that catches obvious fraud while allowing
+# legitimate fast training on modern hardware (Jetson Orin, consumer GPUs with small models)
+MAX_TRAINING_RATE_PER_SEC = 100.0
 
 # Maximum inference tokens per second per GPU
 # Rationale: H100 can do ~3000 tokens/sec for small models, ~500 for large

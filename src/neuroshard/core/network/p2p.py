@@ -1088,8 +1088,71 @@ class P2PManager:
                     self.dht.announce(f"checkpoint_v{checkpoint_info['version']}")
             except Exception as e:
                 logger.debug(f"DHT Announce error: {e}")
+        
+        # Tracker Announce (for bootstrap discovery)
+        # NOTE: This is NOT centralized control - the tracker is just a peer list.
+        # New nodes query it to find existing peers, then DHT takes over.
+        # This is how ALL P2P networks work (Bitcoin DNS seeds, IPFS bootstrap nodes, etc.)
+        self._announce_to_tracker(verbose)
 
-        # DHT-only peer discovery
+    def _announce_to_tracker(self, verbose: bool = False):
+        """
+        Announce this node to the tracker for peer discovery.
+        
+        This is NOT centralized control - the tracker is just a peer list:
+        - New nodes query tracker to find existing peers
+        - Once connected, DHT handles all discovery
+        - The network works without tracker after bootstrap
+        
+        This is identical to how Bitcoin uses DNS seeds, IPFS uses bootstrap nodes, etc.
+        """
+        if not self.tracker_url:
+            return
+        
+        try:
+            import requests
+            from urllib.parse import urlparse
+            
+            parsed = urlparse(self.my_url)
+            ip = parsed.hostname
+            port = parsed.port or 80
+            
+            # Build shard range string
+            if self.observer_mode:
+                shard_range = "observer"
+            elif self.start_layer >= 0:
+                shard_range = f"{self.start_layer}-{self.end_layer}"
+            else:
+                shard_range = "unassigned"
+            
+            # Announce to tracker
+            announce_data = {
+                "ip": ip,
+                "port": port,
+                "shard_range": shard_range,
+                "is_entry": self.start_layer == 0 if self.start_layer >= 0 else False,
+                "is_exit": hasattr(self, 'neuro_node') and self.neuro_node and hasattr(self.neuro_node, 'model') and self.neuro_node.model.has_lm_head if not self.observer_mode else False,
+                "tps": self.current_tps,
+                "latency": self.current_latency,
+                "node_token": self.node_token,
+                "training_enabled": self.training_enabled and not self.observer_mode
+            }
+            
+            resp = requests.post(
+                f"{self.tracker_url}/announce",
+                json=announce_data,
+                timeout=5
+            )
+            
+            if resp.status_code == 200 and verbose:
+                data = resp.json()
+                peer_count = data.get("peer_count", 0)
+                logger.info(f"[TRACKER] Announced to tracker ({peer_count} peers in network)")
+            elif resp.status_code != 200:
+                logger.debug(f"[TRACKER] Announce failed: {resp.status_code}")
+                
+        except Exception as e:
+            logger.debug(f"[TRACKER] Announce error: {e}")
 
     def get_next_hop(self, current_end_layer: int, session_id: Optional[str] = None, for_training: bool = False) -> Optional[str]:
         """

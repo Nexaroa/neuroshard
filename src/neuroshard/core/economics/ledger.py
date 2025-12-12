@@ -2259,7 +2259,7 @@ class NEUROLedger:
         # Physical rate limits
         if proof_type == "training" and uptime > 0 and batches > 0:
             rate = batches / uptime
-            if rate > 2.0:  # MAX_TRAINING_RATE_PER_SEC
+            if rate > 10.0:  # MAX_TRAINING_RATE_PER_SEC (10 batches/sec for small models)
                 return True  # Fraud - impossible rate
         
         if proof_type == "inference" and uptime > 0 and tokens > 0:
