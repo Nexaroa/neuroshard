@@ -2863,43 +2863,12 @@ def run_node(
         STATE["assigned_layers"] = []
         STATE["has_embedding"] = False
         STATE["has_lm_head"] = False
-        STATE["wallet_id"] = P2P.ledger.wallet_id if P2P and P2P.ledger else None
+        STATE["wallet_id"] = P2P.ledger.node_id if P2P and P2P.ledger else None
         
         # Start the gRPC server for receiving proof broadcasts
         # Observer mode: pass None for NEURO_NODE since we don't have a model
         start_grpc_background(port, None, P2P, None)
         logger.info(f"[OBSERVER] gRPC server started on port {port + 1000}")
-        
-        # Observer background task: just sync ledger from DHT periodically
-        async def observer_background_tasks():
-            """Minimal background tasks for observer mode."""
-            while True:
-                try:
-                    # Sync ledger proofs from DHT
-                    if P2P and P2P.dht:
-                        # Query DHT for recent proofs to sync
-                        pass  # Proofs arrive via gRPC gossip
-                    
-                    # Update memory stats
-                    try:
-                        import psutil
-                        proc = psutil.Process()
-                        STATE["memory_mb"] = proc.memory_info().rss / (1024 * 1024)
-                        STATE["system_cpu"] = psutil.cpu_percent()
-                    except:
-                        pass
-                    
-                    await asyncio.sleep(30)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"[OBSERVER] Background task error: {e}")
-                    await asyncio.sleep(10)
-        
-        # Start observer background task
-        @node_app.on_event("startup")
-        async def start_observer_tasks():
-            asyncio.create_task(observer_background_tasks())
         
         # Log startup complete
         logger.info("=" * 50)
@@ -2907,12 +2876,32 @@ def run_node(
         logger.info(f"   Dashboard: http://localhost:{port}/")
         logger.info(f"   Ledger API: http://localhost:{port}/api/ledger/")
         logger.info("=" * 50)
-        
+
         # Start the HTTP server
         import uvicorn
-        config = uvicorn.Config(node_app, host="0.0.0.0", port=port, log_level="warning")
-        server = uvicorn.Server(config)
-        server.run()
+        import asyncio as asyncio_lib
+        
+        async def run_observer():
+            """Run observer with background tasks."""
+            config = uvicorn.Config(node_app, host="0.0.0.0", port=port, log_level="warning")
+            server = uvicorn.Server(config)
+            
+            # Start background task for stats updates
+            async def update_stats():
+                while True:
+                    try:
+                        import psutil
+                        proc = psutil.Process()
+                        STATE["memory_mb"] = proc.memory_info().rss / (1024 * 1024)
+                        STATE["system_cpu"] = psutil.cpu_percent()
+                    except:
+                        pass
+                    await asyncio_lib.sleep(30)
+            
+            asyncio_lib.create_task(update_stats())
+            await server.serve()
+        
+        asyncio_lib.run(run_observer())
         return  # Exit after server stops
     
     # =========================================================================
