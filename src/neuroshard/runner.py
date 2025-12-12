@@ -3145,6 +3145,22 @@ def run_node(
     global ASYNC_TRAINER
     if enable_training and CURRENT_CONTRIBUTION_MODE == ContributionMode.ASYNC:
         logger.info("[ASYNC] Initializing AsyncTrainer for async contribution mode...")
+        
+        # Ensure genesis_loader is initialized (it's lazy by default)
+        if not hasattr(NEURO_NODE, 'genesis_loader') or NEURO_NODE.genesis_loader is None:
+            try:
+                from neuroshard.core.training.distributed import GenesisDataLoader
+                from neuroshard.core.model.tokenizer import get_neuro_tokenizer
+                logger.info("[GENESIS] Initializing data loader for async training...")
+                NEURO_NODE.genesis_loader = GenesisDataLoader(
+                    NEURO_NODE.node_id,
+                    get_neuro_tokenizer(),
+                    max_storage_mb=max_storage_mb
+                )
+                logger.info(f"[GENESIS] Data loader ready: {NEURO_NODE.genesis_loader.total_shards} shards available")
+            except Exception as e:
+                logger.warning(f"[GENESIS] Failed to initialize data loader: {e}")
+        
         ASYNC_TRAINER = AsyncTrainer(
             node_id=NEURO_NODE.node_id,
             model=NEURO_NODE.model,

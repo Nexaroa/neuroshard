@@ -2099,13 +2099,21 @@ class AsyncTrainer:
         
         logger.info("[ASYNC] Starting async training loop...")
         
+        # Track if we've logged the "no genesis loader" message
+        _logged_no_genesis = False
+        
         while self.running and not self._stop_event.is_set():
             try:
                 # Check if we have Genesis data to train on
                 if not self.genesis_loader:
-                    logger.debug("[ASYNC] No Genesis data loader, waiting...")
+                    if not _logged_no_genesis:
+                        logger.warning("[ASYNC] No Genesis data loader available - waiting for data...")
+                        logger.info("[ASYNC] Genesis loader will be initialized when node downloads training shards")
+                        _logged_no_genesis = True
                     time.sleep(self.ASYNC_TRAIN_INTERVAL)
                     continue
+                
+                _logged_no_genesis = False  # Reset if we get a loader
                 
                 # Train for N steps
                 losses = []
