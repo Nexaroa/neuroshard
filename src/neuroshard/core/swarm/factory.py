@@ -1176,7 +1176,21 @@ class SwarmEnabledDynamicNode:
     def __getattr__(self, name):
         """Delegate unknown attributes to base node."""
         return getattr(self.base_node, name)
-
+    
+    def __setattr__(self, name, value):
+        """Set attributes, delegating base_node-owned attributes properly."""
+        # Attributes that belong to base_node (not the wrapper)
+        BASE_NODE_ATTRS = {
+            'genesis_loader', 'swarm', 'is_running', 'enable_training',
+            '_contribution_mode', '_quorum_id', '_speed_tier', '_latency_ms',
+            'total_training_rounds', 'total_tokens_processed',
+        }
+        # If this is an attribute that belongs to base_node and we have a base_node
+        if name in BASE_NODE_ATTRS and hasattr(self, 'base_node') and self.base_node is not None:
+            setattr(self.base_node, name, value)
+        else:
+            # Normal attribute setting for wrapper's own attributes
+            object.__setattr__(self, name, value)
 
     def verify_training_work(self, proof: Any) -> Tuple[bool, str]:
         """
