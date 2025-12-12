@@ -3751,18 +3751,26 @@ def run_node(
     if NEURO_NODE and NEURO_NODE.model.has_embedding:
         threading.Thread(target=driver_worker_loop, daemon=True).start()
     
-    # 6. Run HTTP Server
+    # 6. Run HTTP Server - Print ASCII banner
+    logger.info("")
+    logger.info("███╗   ██╗███████╗██╗   ██╗██████╗  ██████╗ ")
+    logger.info("████╗  ██║██╔════╝██║   ██║██╔══██╗██╔═══██╗")
+    logger.info("██╔██╗ ██║█████╗  ██║   ██║██████╔╝██║   ██║")
+    logger.info("██║╚██╗██║██╔══╝  ██║   ██║██╔══██╗██║   ██║")
+    logger.info("██║ ╚████║███████╗╚██████╔╝██║  ██║╚██████╔╝")
+    logger.info("╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ")
+    logger.info("")
+    logger.info("███████╗██╗  ██╗ █████╗ ██████╗ ██████╗ ")
+    logger.info("██╔════╝██║  ██║██╔══██╗██╔══██╗██╔══██╗")
+    logger.info("███████╗███████║███████║██████╔╝██║  ██║")
+    logger.info("╚════██║██╔══██║██╔══██║██╔══██╗██║  ██║")
+    logger.info("███████║██║  ██║██║  ██║██║  ██║██████╔╝")
+    logger.info("╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ")
+    logger.info("")
     logger.info("=" * 50)
-    logger.info("NeuroShard Node Ready!")
-    logger.info(f"   Device: {NEURO_NODE.device.upper()}")
-    logger.info(f"   My Layers: {NEURO_NODE.my_layer_ids}")
-    logger.info(f"   My Params: {NEURO_NODE.model.get_num_params() / 1e6:.1f}M")
-    logger.info(f"   Embedding: {NEURO_NODE.model.has_embedding}")
-    logger.info(f"   LM Head: {NEURO_NODE.model.has_lm_head}")
-    logger.info(f"   Training: {'Enabled' if enable_training else 'Disabled'}")
-    logger.info(f"   DiLoCo: sync every {diloco_inner_steps} steps")
-    logger.info("=" * 50)
-    logger.info("TRULY DECENTRALIZED: Model grows with network capacity!")
+    logger.info(f"  Device: {NEURO_NODE.device.upper()}  |  Layers: {NEURO_NODE.my_layer_ids}")
+    logger.info(f"  Params: {NEURO_NODE.model.get_num_params() / 1e6:.1f}M  |  Mode: {CURRENT_CONTRIBUTION_MODE.value.upper() if CURRENT_CONTRIBUTION_MODE else 'IDLE'}")
+    logger.info(f"  Training: {'Enabled' if enable_training else 'Disabled'}  |  DiLoCo: {diloco_inner_steps} steps")
     logger.info("=" * 50)
     
     # Custom log config: disable access logs and customize startup messages

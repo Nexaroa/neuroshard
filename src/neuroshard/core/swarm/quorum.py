@@ -2162,6 +2162,10 @@ class AsyncTrainer:
                         self.total_batches += 1
                         losses.append(loss.item())
                         
+                        # Log every 10 steps
+                        if self.total_batches % 10 == 0:
+                            logger.info(f"[ASYNC] Step {self.total_batches}: loss={loss.item():.4f}")
+                        
                     except RuntimeError as e:
                         if "Data not ready" in str(e) or "shard" in str(e).lower():
                             data_not_ready_count += 1

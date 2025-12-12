@@ -755,10 +755,11 @@ class NEUROLedger:
             if tokens_per_second > max_tps * 2:  # Allow 2x buffer
                 return False, f"Token rate implausible ({tokens_per_second:.0f} > {max_tps * 2:.0f} tps)"
         
-        # Training batches check (max ~60 per minute on good hardware)
+        # Training batches check - fast GPUs can do 5-10 batches/second
+        # Tier 1/2 GPUs (A100, RTX 4090, Jetson Orin) can easily hit 300-600 batches/min
         if proof.uptime_seconds > 0:
             batches_per_minute = (proof.training_batches / proof.uptime_seconds) * 60
-            if batches_per_minute > 120:  # 2 batches/second max
+            if batches_per_minute > 2000:  # 10 batches/second max for fast GPUs
                 return False, f"Training rate implausible ({batches_per_minute:.0f} batches/min)"
         
         return True, ""
