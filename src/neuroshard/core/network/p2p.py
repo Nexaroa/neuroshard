@@ -271,12 +271,13 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 class P2PManager:
-    def __init__(self, my_url: str, shard_range: str, tracker_url: str = "http://localhost:3000", node_token: Optional[str] = None, training_enabled: bool = True):
+    def __init__(self, my_url: str, shard_range: str, tracker_url: str = "http://localhost:3000", node_token: Optional[str] = None, training_enabled: bool = True, observer_mode: bool = False):
         self.my_url = my_url
         self.shard_range = shard_range
         self.tracker_url = tracker_url
         self.node_token = node_token
         self.training_enabled = training_enabled  # Whether this node participates in training pipeline
+        self.observer_mode = observer_mode  # Observer mode: sync ledger but don't generate proofs
         self.known_peers: Dict[str, dict] = {} # url -> info
         self.running = True
         self._stop_event = threading.Event()  # For interruptible sleeps
@@ -370,7 +371,14 @@ class P2PManager:
         
         # Start background tasks
         threading.Thread(target=self._announce_loop, daemon=True).start()
-        threading.Thread(target=self._gossip_loop, daemon=True).start()
+        
+        # Only start gossip loop if NOT in observer mode
+        # Observer nodes receive proofs via gRPC but don't generate their own
+        if not self.observer_mode:
+            threading.Thread(target=self._gossip_loop, daemon=True).start()
+        else:
+            logger.info("[OBSERVER] Observer mode enabled - not generating proofs")
+        
         if self.ledger:
             threading.Thread(target=self._sync_stakes_loop, daemon=True).start()
     

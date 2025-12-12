@@ -882,9 +882,17 @@ async def get_api_stats():
                 "outer_step": diloco.get("outer_step_count", 0),
             }
     else:
-        # Node not ready yet
+        # Node not ready yet or observer mode
         stats["token_count"] = 0
         stats["training_rounds"] = 0
+        stats["observer_mode"] = STATE.get("observer_mode", False)
+        
+        # Observer mode specific stats
+        if STATE.get("observer_mode"):
+            stats["role"] = "Observer"
+            stats["training_enabled"] = False
+            stats["my_layers"] = []
+            stats["my_params_m"] = 0
     
     # Add version
     stats["version"] = __version__
@@ -2662,6 +2670,7 @@ def run_node(
     announce_ip: str = None,
     announce_port: int = None,
     enable_training: bool = True,
+    observer_mode: bool = False,
     available_memory_mb: Optional[float] = None,
     max_storage_mb: float = 100.0,
     max_cpu_threads: Optional[int] = None,
@@ -2795,7 +2804,8 @@ def run_node(
     # Use temporary shard_range "unassigned" - will be updated after layer assignment
     # This prevents premature announcement of layer 0 while keeping DHT available for discovery!
     # Pass training_enabled so peers know if we can participate in training pipeline
-    P2P = P2PManager(my_url, "unassigned", tracker, node_token=node_token, training_enabled=enable_training)
+    # Pass observer_mode to disable proof generation (for explorer nodes)
+    P2P = P2PManager(my_url, "unassigned", tracker, node_token=node_token, training_enabled=enable_training, observer_mode=observer_mode)
     P2P.state_ref = STATE
     
     # CRITICAL: Synchronously fetch peers and populate routing table BEFORE node creation!
@@ -2836,6 +2846,78 @@ def run_node(
     # Additional wait to let DHT stabilize
     time.sleep(1)
     
+    # =========================================================================
+    # OBSERVER MODE: Skip model initialization for explorer/block-explorer nodes
+    # =========================================================================
+    if observer_mode:
+        logger.info("=" * 50)
+        logger.info("  NeuroShard OBSERVER Node")
+        logger.info("=" * 50)
+        logger.info("[OBSERVER] Starting in observer mode (no model, no training)")
+        logger.info("[OBSERVER] Syncing ledger from network...")
+        logger.info("[OBSERVER] Ledger explorer API available at /api/ledger/*")
+        
+        # Store observer state
+        STATE["observer_mode"] = True
+        STATE["node_id"] = P2P.ledger_node_id if P2P and P2P.ledger else "observer"
+        STATE["assigned_layers"] = []
+        STATE["has_embedding"] = False
+        STATE["has_lm_head"] = False
+        STATE["wallet_id"] = P2P.ledger.wallet_id if P2P and P2P.ledger else None
+        
+        # Start the gRPC server for receiving proof broadcasts
+        # Observer mode: pass None for NEURO_NODE since we don't have a model
+        start_grpc_background(port, None, P2P, None)
+        logger.info(f"[OBSERVER] gRPC server started on port {port + 1000}")
+        
+        # Observer background task: just sync ledger from DHT periodically
+        async def observer_background_tasks():
+            """Minimal background tasks for observer mode."""
+            while True:
+                try:
+                    # Sync ledger proofs from DHT
+                    if P2P and P2P.dht:
+                        # Query DHT for recent proofs to sync
+                        pass  # Proofs arrive via gRPC gossip
+                    
+                    # Update memory stats
+                    try:
+                        import psutil
+                        proc = psutil.Process()
+                        STATE["memory_mb"] = proc.memory_info().rss / (1024 * 1024)
+                        STATE["system_cpu"] = psutil.cpu_percent()
+                    except:
+                        pass
+                    
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"[OBSERVER] Background task error: {e}")
+                    await asyncio.sleep(10)
+        
+        # Start observer background task
+        @node_app.on_event("startup")
+        async def start_observer_tasks():
+            asyncio.create_task(observer_background_tasks())
+        
+        # Log startup complete
+        logger.info("=" * 50)
+        logger.info("[OBSERVER] NeuroShard Observer Ready!")
+        logger.info(f"   Dashboard: http://localhost:{port}/")
+        logger.info(f"   Ledger API: http://localhost:{port}/api/ledger/")
+        logger.info("=" * 50)
+        
+        # Start the HTTP server
+        import uvicorn
+        config = uvicorn.Config(node_app, host="0.0.0.0", port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        server.run()
+        return  # Exit after server stops
+    
+    # =========================================================================
+    # FULL NODE MODE: Initialize model, training, and quorum system
+    # =========================================================================
     logger.info(f"Initializing NeuroShard Node (training={enable_training}, DiLoCo steps={diloco_inner_steps})...")
     
     # 3. Create swarm config
@@ -3860,6 +3942,8 @@ def main():
     parser.add_argument("--announce-ip", type=str, default=None, help="Force IP address to announce")
     parser.add_argument("--announce-port", type=int, default=None, help="Force port to announce")
     parser.add_argument("--no-training", action="store_true", help="Disable training (inference only)")
+    parser.add_argument("--observer", action="store_true", 
+                       help="Observer mode: sync ledger from network but don't generate proofs (for explorer)")
     parser.add_argument("--memory", type=int, default=None, 
                        help="Override detected memory (MB) - for testing")
     parser.add_argument("--max-storage", type=int, default=100,
@@ -3899,6 +3983,7 @@ def main():
         announce_ip=args.announce_ip,
         announce_port=args.announce_port,
         enable_training=not args.no_training,
+        observer_mode=args.observer,
         available_memory_mb=args.memory,
         max_storage_mb=args.max_storage,
         max_cpu_threads=args.cpu_threads,

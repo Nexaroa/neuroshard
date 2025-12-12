@@ -271,6 +271,10 @@ Get your wallet token at: https://neuroshard.com/wallet
         help="Disable training (inference only)"
     )
     parser.add_argument(
+        "--observer", action="store_true",
+        help="Observer mode: sync ledger from network but don't generate proofs (for explorer)"
+    )
+    parser.add_argument(
         "--diloco-steps", type=int, default=500,
         help="DiLoCo inner steps before gradient sync (default: 500)"
     )
@@ -454,6 +458,7 @@ Get your wallet token at: https://neuroshard.com/wallet
         announce_ip=args.announce_ip,
         announce_port=args.announce_port,
         enable_training=not args.no_training,
+        observer_mode=args.observer,
         available_memory_mb=args.memory,
         max_storage_mb=args.max_storage,
         max_cpu_threads=args.cpu_threads,
