@@ -891,5 +891,286 @@ async def get_network_architecture():
     }
 
 
+# =============================================================================
+# Quorum Support for Native NeuroShard Architecture
+# =============================================================================
+
+class QuorumAnnouncement(BaseModel):
+    """Announcement of a quorum for network discovery."""
+    quorum_id: str
+    speed_tier: str  # tier1-tier5
+    initiator_endpoint: str
+    members: List[Dict]  # List of {node_id, endpoint, layer_range, role}
+    lifecycle: str  # forming, active, renewing, dissolving
+    total_batches: int = 0
+    session_start: float = 0.0
+    session_end: float = 0.0
+
+
+class QuorumInfo(BaseModel):
+    """Information about a quorum."""
+    quorum_id: str
+    speed_tier: str
+    initiator_endpoint: str
+    member_count: int
+    lifecycle: str
+    last_seen: float
+    total_batches: int = 0
+
+
+@app.post("/quorums/announce")
+async def announce_quorum(quorum: QuorumAnnouncement):
+    """
+    Announce a quorum to the tracker for discovery.
+    
+    Nodes use this to register their quorum so other nodes can:
+    - Find quorums to join
+    - Route inference requests
+    - Monitor network health
+    """
+    now = time.time()
+    
+    import sqlite3
+    import json
+    
+    # Ensure quorums table exists
+    with sqlite3.connect(db._sqlite_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS quorums (
+                quorum_id TEXT PRIMARY KEY,
+                speed_tier TEXT,
+                initiator_endpoint TEXT,
+                members TEXT,
+                lifecycle TEXT,
+                total_batches INTEGER,
+                session_start REAL,
+                session_end REAL,
+                last_seen REAL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_quorum_tier ON quorums(speed_tier)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_quorum_lifecycle ON quorums(lifecycle)")
+        
+        # Upsert quorum
+        conn.execute("""
+            INSERT OR REPLACE INTO quorums
+            (quorum_id, speed_tier, initiator_endpoint, members, lifecycle, 
+             total_batches, session_start, session_end, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            quorum.quorum_id,
+            quorum.speed_tier,
+            quorum.initiator_endpoint,
+            json.dumps(quorum.members),
+            quorum.lifecycle,
+            quorum.total_batches,
+            quorum.session_start,
+            quorum.session_end,
+            now
+        ))
+    
+    return {"status": "registered", "quorum_id": quorum.quorum_id}
+
+
+@app.get("/quorums")
+async def get_quorums(
+    speed_tier: Optional[str] = None,
+    lifecycle: Optional[str] = None,
+    limit: int = 50
+) -> Dict:
+    """
+    Get list of active quorums.
+    
+    Args:
+        speed_tier: Filter by speed tier (tier1-tier5)
+        lifecycle: Filter by lifecycle state (forming, active)
+        limit: Max number of quorums to return
+    
+    Returns:
+        List of quorums sorted by activity
+    """
+    now = time.time()
+    
+    import sqlite3
+    import json
+    
+    try:
+        with sqlite3.connect(db._sqlite_path) as conn:
+            # Check if table exists
+            table_check = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='quorums'"
+            ).fetchone()
+            
+            if not table_check:
+                return {"quorums": [], "total": 0}
+            
+            query = "SELECT * FROM quorums WHERE last_seen > ?"
+            params = [now - 120]  # 2 minute timeout
+            
+            if speed_tier:
+                query += " AND speed_tier = ?"
+                params.append(speed_tier)
+            
+            if lifecycle:
+                query += " AND lifecycle = ?"
+                params.append(lifecycle)
+            
+            query += " ORDER BY total_batches DESC LIMIT ?"
+            params.append(limit)
+            
+            cursor = conn.execute(query, params)
+            
+            quorums = []
+            for row in cursor:
+                quorums.append({
+                    "quorum_id": row[0],
+                    "speed_tier": row[1],
+                    "initiator_endpoint": row[2],
+                    "members": json.loads(row[3]) if row[3] else [],
+                    "lifecycle": row[4],
+                    "total_batches": row[5],
+                    "session_start": row[6],
+                    "session_end": row[7],
+                    "last_seen": row[8]
+                })
+        
+        return {"quorums": quorums, "total": len(quorums)}
+    
+    except Exception as e:
+        logging.error(f"Error getting quorums: {e}")
+        return {"quorums": [], "total": 0, "error": str(e)}
+
+
+@app.get("/quorums/{quorum_id}")
+async def get_quorum(quorum_id: str) -> Dict:
+    """Get details of a specific quorum."""
+    import sqlite3
+    import json
+    
+    try:
+        with sqlite3.connect(db._sqlite_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM quorums WHERE quorum_id = ?",
+                (quorum_id,)
+            ).fetchone()
+            
+            if not row:
+                raise HTTPException(status_code=404, detail="Quorum not found")
+            
+            return {
+                "quorum_id": row[0],
+                "speed_tier": row[1],
+                "initiator_endpoint": row[2],
+                "members": json.loads(row[3]) if row[3] else [],
+                "lifecycle": row[4],
+                "total_batches": row[5],
+                "session_start": row[6],
+                "session_end": row[7],
+                "last_seen": row[8]
+            }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/quorums/{quorum_id}")
+async def remove_quorum(quorum_id: str):
+    """Remove a quorum (called when dissolved)."""
+    import sqlite3
+    
+    with sqlite3.connect(db._sqlite_path) as conn:
+        conn.execute("DELETE FROM quorums WHERE quorum_id = ?", (quorum_id,))
+    
+    return {"status": "removed", "quorum_id": quorum_id}
+
+
+@app.get("/network/status")
+async def get_network_status():
+    """
+    Get overall network status for the native NeuroShard architecture.
+    
+    Returns comprehensive network health and training progress.
+    """
+    now = time.time()
+    
+    import sqlite3
+    import json
+    
+    # Get peer stats
+    count, tps, lat = await db.get_stats(now)
+    
+    # Get quorum stats
+    quorum_stats = {
+        "total": 0,
+        "active": 0,
+        "forming": 0,
+        "by_tier": {}
+    }
+    
+    try:
+        with sqlite3.connect(db._sqlite_path) as conn:
+            table_check = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='quorums'"
+            ).fetchone()
+            
+            if table_check:
+                # Total quorums
+                quorum_stats["total"] = conn.execute(
+                    "SELECT COUNT(*) FROM quorums WHERE last_seen > ?",
+                    (now - 120,)
+                ).fetchone()[0]
+                
+                # Active quorums
+                quorum_stats["active"] = conn.execute(
+                    "SELECT COUNT(*) FROM quorums WHERE lifecycle = 'active' AND last_seen > ?",
+                    (now - 120,)
+                ).fetchone()[0]
+                
+                # Forming quorums
+                quorum_stats["forming"] = conn.execute(
+                    "SELECT COUNT(*) FROM quorums WHERE lifecycle = 'forming' AND last_seen > ?",
+                    (now - 120,)
+                ).fetchone()[0]
+                
+                # By tier
+                tier_cursor = conn.execute("""
+                    SELECT speed_tier, COUNT(*) 
+                    FROM quorums 
+                    WHERE last_seen > ? 
+                    GROUP BY speed_tier
+                """, (now - 120,))
+                
+                for row in tier_cursor:
+                    quorum_stats["by_tier"][row[0]] = row[1]
+                
+                # Total batches across all quorums
+                total_batches = conn.execute(
+                    "SELECT SUM(total_batches) FROM quorums WHERE last_seen > ?",
+                    (now - 120,)
+                ).fetchone()[0] or 0
+                quorum_stats["total_batches"] = total_batches
+    
+    except Exception as e:
+        logging.warning(f"Could not get quorum stats: {e}")
+    
+    return {
+        "status": "healthy" if count > 0 else "no_nodes",
+        "timestamp": now,
+        "nodes": {
+            "active": count,
+            "total_tps": int(tps),
+            "avg_latency_ms": int(lat)
+        },
+        "quorums": quorum_stats,
+        "network": {
+            "architecture": "NeuroShard",
+            "training_mode": "quorum-based",
+            "sync_protocol": "DiLoCo"
+        }
+    }
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=3000)

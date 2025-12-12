@@ -76,6 +76,17 @@ MAX_LAYER_BONUS = 1.0               # Cap layer bonus at 100%
 TRAINING_BONUS = 1.1                # 10% bonus when actively training
 
 # =============================================================================
+# REPUTATION-BASED BONUSES
+# =============================================================================
+# Nodes with high uptime and success rates receive bonus rewards.
+# This incentivizes reliable participation in the network.
+
+# Reputation bonus (up to 10% extra based on reputation score)
+REPUTATION_BONUS_MAX = 0.10         # Maximum 10% bonus for perfect reputation
+MIN_UPTIME_FOR_PIPELINE = 0.90      # Minimum 90% uptime required for pipeline mode
+MIN_UPTIME_FOR_QUORUM = 0.80        # Minimum 80% uptime to join a quorum
+
+# =============================================================================
 # SCARCITY-BASED INCENTIVES
 # =============================================================================
 # Nodes holding under-replicated layers receive bonus rewards.

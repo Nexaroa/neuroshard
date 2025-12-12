@@ -86,8 +86,93 @@ class QuorumMember:
     consecutive_failures: int = 0
     batches_processed: int = 0
     
-    # Reputation
+    # Uptime tracking (for reputation)
+    join_time: float = field(default_factory=time.time)
+    total_online_seconds: float = 0.0
+    total_expected_seconds: float = 0.0
+    successful_requests: int = 0
+    failed_requests: int = 0
+    
+    # Derived reputation (0.0 to 1.0)
+    # Combines uptime_ratio and success_rate
     reputation: float = 1.0
+    
+    def update_uptime(self, heartbeat_received: bool = True):
+        """
+        Update uptime tracking based on heartbeat status.
+        
+        Called periodically (e.g., every heartbeat interval) to track
+        whether the node was online.
+        
+        Args:
+            heartbeat_received: Whether a heartbeat was received in this interval
+        """
+        self.total_expected_seconds += HEARTBEAT_INTERVAL
+        if heartbeat_received:
+            self.total_online_seconds += HEARTBEAT_INTERVAL
+        self._recalculate_reputation()
+    
+    def record_request_result(self, success: bool):
+        """
+        Record the result of a request processed by this member.
+        
+        Args:
+            success: Whether the request completed successfully
+        """
+        if success:
+            self.successful_requests += 1
+        else:
+            self.failed_requests += 1
+        self._recalculate_reputation()
+    
+    def _recalculate_reputation(self):
+        """
+        Recalculate reputation based on uptime and success rate.
+        
+        Reputation formula:
+        - 60% weighted by uptime_ratio
+        - 40% weighted by success_rate
+        - Minimum 0.1 (to allow recovery)
+        """
+        uptime_ratio = self.uptime_ratio
+        success_rate = self.success_rate
+        
+        # Weighted combination
+        self.reputation = max(0.1, 0.6 * uptime_ratio + 0.4 * success_rate)
+    
+    @property
+    def uptime_ratio(self) -> float:
+        """
+        Get the uptime ratio (0.0 to 1.0).
+        
+        This is the fraction of expected time the node was actually online.
+        """
+        if self.total_expected_seconds <= 0:
+            return 1.0  # New nodes start with full uptime
+        return min(1.0, self.total_online_seconds / self.total_expected_seconds)
+    
+    @property
+    def success_rate(self) -> float:
+        """
+        Get the request success rate (0.0 to 1.0).
+        
+        This is the fraction of requests that completed successfully.
+        """
+        total = self.successful_requests + self.failed_requests
+        if total == 0:
+            return 1.0  # New nodes start with full success
+        return self.successful_requests / total
+    
+    @property
+    def meets_pipeline_requirements(self) -> bool:
+        """
+        Check if member meets requirements for pipeline mode.
+        
+        Pipeline mode requires:
+        - Uptime ratio >= 90%
+        - Not currently stale or offline
+        """
+        return self.uptime_ratio >= 0.9 and not self.is_stale
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -100,6 +185,11 @@ class QuorumMember:
             "last_heartbeat": self.last_heartbeat,
             "batches_processed": self.batches_processed,
             "reputation": self.reputation,
+            "join_time": self.join_time,
+            "total_online_seconds": self.total_online_seconds,
+            "total_expected_seconds": self.total_expected_seconds,
+            "successful_requests": self.successful_requests,
+            "failed_requests": self.failed_requests,
         }
     
     @classmethod
@@ -114,6 +204,11 @@ class QuorumMember:
             last_heartbeat=data.get("last_heartbeat", time.time()),
             batches_processed=data.get("batches_processed", 0),
             reputation=data.get("reputation", 1.0),
+            join_time=data.get("join_time", time.time()),
+            total_online_seconds=data.get("total_online_seconds", 0.0),
+            total_expected_seconds=data.get("total_expected_seconds", 0.0),
+            successful_requests=data.get("successful_requests", 0),
+            failed_requests=data.get("failed_requests", 0),
         )
     
     @property

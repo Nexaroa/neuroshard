@@ -38,7 +38,7 @@ from neuroshard.core.model.dynamic import DynamicNeuroNode, create_dynamic_node
 from neuroshard.core.model.tokenizer import get_neuro_tokenizer
 from neuroshard.core.network.p2p import P2PManager
 
-# Swarm Architecture V2 Imports
+# Native NeuroShard Architecture Imports
 from neuroshard.core.swarm.factory import (
     SwarmEnabledDynamicNode,
     SwarmNodeConfig,
@@ -97,7 +97,7 @@ def request_shutdown():
     logger.info("[NODE] Shutdown requested...")
     _SHUTDOWN_REQUESTED.set()
     
-    # Stop V2 QuorumTrainer first (cleanly exit training loop)
+    # Stop QuorumTrainer first (cleanly exit training loop)
     if QUORUM_TRAINER:
         try:
             logger.info("[NODE] Stopping QuorumTrainer...")
@@ -350,7 +350,7 @@ NEURO_NODE: Optional[DynamicNeuroNode] = None
 P2P: Optional[P2PManager] = None
 SESSION_TIMESTAMPS = {}
 
-# V2 Architecture Components
+# Quorum System Components
 QUORUM_REGISTRY: Optional[QuorumRegistry] = None
 QUORUM_FORMATION: Optional[QuorumFormationService] = None
 QUORUM_TRAINER: Optional[QuorumTrainer] = None
@@ -1114,13 +1114,13 @@ async def get_ponw_proof():
 
 
 # =============================================================================
-# V2 API: Pipeline Proofs (PoNW)
+# Pipeline Proofs (PoNW)
 # =============================================================================
 
-@node_app.get("/api/v2/ponw")
-async def get_ponw_proof_v2():
+@node_app.get("/api/ponw")
+async def get_ponw_proof():
     """
-    V2: Get Proof of Neural Work with quorum context.
+    Get Proof of Neural Work with quorum context.
     
     Returns a PipelineProof that includes:
     - Quorum membership information
@@ -1134,8 +1134,8 @@ async def get_ponw_proof_v2():
     # Get base proof from node
     base_proof = NEURO_NODE.get_ponw_proof()
     
-    # Add V2 quorum context
-    v2_proof = {
+    # Build proof with quorum context
+    proof_response = {
         **base_proof,
         "version": 2,
         "quorum_id": CURRENT_QUORUM.quorum_id if CURRENT_QUORUM else None,
@@ -1145,25 +1145,25 @@ async def get_ponw_proof_v2():
     
     # Add QuorumTrainer stats if active
     if QUORUM_TRAINER:
-        v2_proof["quorum_batches"] = QUORUM_TRAINER.total_batches
-        v2_proof["quorum_sync_round"] = QUORUM_TRAINER.sync_round
-        v2_proof["quorum_loss"] = QUORUM_TRAINER.current_loss
+        proof_response["quorum_batches"] = QUORUM_TRAINER.total_batches
+        proof_response["quorum_sync_round"] = QUORUM_TRAINER.sync_round
+        proof_response["quorum_loss"] = QUORUM_TRAINER.current_loss
     
     # Add role information from quorum
     if CURRENT_QUORUM and NEURO_NODE:
         member = CURRENT_QUORUM.get_member(NEURO_NODE.node_id)
         if member:
-            v2_proof["quorum_role"] = member.role.value
-            v2_proof["member_batches"] = member.batches_processed
-            v2_proof["member_reputation"] = member.reputation
+            proof_response["quorum_role"] = member.role.value
+            proof_response["member_batches"] = member.batches_processed
+            proof_response["member_reputation"] = member.reputation
     
-    return v2_proof
+    return proof_response
 
 
-@node_app.post("/api/v2/ponw/verify")
-async def verify_ponw_proof_v2(proof: dict):
+@node_app.post("/api/ponw/verify")
+async def verify_ponw_proof(proof: dict):
     """
-    V2: Verify a PoNW proof using the ProofVerifier.
+    Verify a PoNW proof using the ProofVerifier.
     
     Supports optimistic verification with challenge mechanism.
     """
@@ -1949,13 +1949,13 @@ async def inference_v1(req: InferenceV1Request):
 
 
 # =============================================================================
-# V2 API: Quorum-Based Inference
+# Quorum-Based Inference API
 # =============================================================================
 
-@node_app.get("/api/v2/inference/quorums")
+@node_app.get("/api/inference/quorums")
 async def discover_inference_quorums():
     """
-    V2: Discover available inference quorums.
+    Discover available inference quorums.
     
     Returns a list of quorums that can handle inference requests,
     sorted by score (latency, price, reputation).
@@ -1985,17 +1985,17 @@ async def discover_inference_quorums():
 
 
 class QuorumInferenceRequest(BaseModel):
-    """Request for V2 quorum-based inference."""
+    """Request for quorum-based inference."""
     prompt: str
     max_tokens: int = 256
     temperature: float = 0.7
     quorum_id: Optional[str] = None  # Optional: specific quorum to use
 
 
-@node_app.post("/api/v2/inference")
-async def inference_v2(req: QuorumInferenceRequest):
+@node_app.post("/api/inference/quorum")
+async def quorum_inference(req: QuorumInferenceRequest):
     """
-    V2: Run inference through the quorum system.
+    Run inference through the quorum system.
     
     If quorum_id is specified, routes to that quorum's initiator.
     Otherwise, discovers available quorums and selects the best one.
@@ -2009,7 +2009,7 @@ async def inference_v2(req: QuorumInferenceRequest):
         raise HTTPException(status_code=503, detail="Node not ready")
     
     start_time = time.time()
-    request_id = f"v2_{uuid.uuid4().hex[:12]}"
+    request_id = f"q_{uuid.uuid4().hex[:12]}"
     
     # Check if we should route to another quorum or handle locally
     if QUORUM_INFERENCE_ROUTER and CURRENT_QUORUM:
@@ -2068,17 +2068,17 @@ async def inference_v2(req: QuorumInferenceRequest):
                 "inference_ms": inference_ms,
                 "total_ms": inference_ms,
             },
-            "version": "v2",
+            "version": "quorum",
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@node_app.get("/api/v2/quorum/status")
+@node_app.get("/api/quorum/status")
 async def get_quorum_status():
     """
-    V2: Get current quorum status for this node.
+    Get current quorum status for this node.
     """
     if not CURRENT_QUORUM:
         return {
@@ -2849,12 +2849,12 @@ def run_node(
         logger.info("[SWARM] Swarm components started")
     
     # =========================================================================
-    # V2 ARCHITECTURE: Initialize Quorum-Based Training System
+    # NATIVE ARCHITECTURE: Initialize Quorum-Based Training System
     # =========================================================================
     global QUORUM_REGISTRY, QUORUM_FORMATION, QUORUM_TRAINER, QUORUM_INFERENCE_ROUTER
     global PROOF_VERIFIER, DHT_PROTOCOL, CURRENT_QUORUM
     
-    logger.info("[V2] Initializing quorum system...")
+    logger.info("[QUORUM] Initializing quorum system...")
     
     # Initialize DHT Protocol for peer discovery
     try:
@@ -2862,9 +2862,9 @@ def run_node(
             node_id=NEURO_NODE.node_id,
             dht=P2P.routing_table if hasattr(P2P, 'routing_table') else None,
         )
-        logger.info("[V2] DHT Protocol initialized")
+        logger.info("[QUORUM] DHT Protocol initialized")
     except Exception as e:
-        logger.warning(f"[V2] DHT Protocol init failed: {e}, using fallback")
+        logger.warning(f"[QUORUM] DHT Protocol init failed: {e}, using fallback")
         DHT_PROTOCOL = None
     
     # Initialize Quorum Registry (DHT-backed)
@@ -2872,7 +2872,7 @@ def run_node(
         dht=DHT_PROTOCOL,
         node_id=NEURO_NODE.node_id,
     )
-    logger.info("[V2] QuorumRegistry initialized")
+    logger.info("[QUORUM] QuorumRegistry initialized")
     
     # Initialize Quorum Formation Service
     QUORUM_FORMATION = QuorumFormationService(
@@ -2880,30 +2880,30 @@ def run_node(
         layer_pool=NEURO_NODE.layer_pool,
         dht_protocol=DHT_PROTOCOL,
     )
-    logger.info("[V2] QuorumFormationService initialized")
+    logger.info("[QUORUM] QuorumFormationService initialized")
     
     # Initialize Quorum Inference Router
     QUORUM_INFERENCE_ROUTER = QuorumInferenceRouter(
         registry=QUORUM_REGISTRY,
         dht_protocol=DHT_PROTOCOL,
     )
-    logger.info("[V2] QuorumInferenceRouter initialized")
+    logger.info("[QUORUM] QuorumInferenceRouter initialized")
     
     # Initialize Proof Verifier for PoNW
     PROOF_VERIFIER = ProofVerifier(
         optimistic=True,  # Optimistic acceptance for liveness
         network_size=len(P2P.known_peers) + 1,
     )
-    logger.info("[V2] ProofVerifier initialized (optimistic mode)")
+    logger.info("[QUORUM] ProofVerifier initialized (optimistic mode)")
     
     # Determine speed tier from hardware
     speed_tier = _get_speed_tier(NEURO_NODE)
     STATE["speed_tier"] = speed_tier
-    logger.info(f"[V2] Node speed tier: {speed_tier}")
+    logger.info(f"[QUORUM] Node speed tier: {speed_tier}")
     
     # Form or join a quorum if training is enabled
     if enable_training:
-        logger.info("[V2] Attempting quorum formation for training...")
+        logger.info("[QUORUM] Attempting quorum formation for training...")
         
         # Get gRPC endpoint
         grpc_port = port + 1000  # Convention: gRPC is HTTP port + 1000
@@ -2929,7 +2929,7 @@ def run_node(
             STATE["quorum_members"] = len(CURRENT_QUORUM.members)
             
             if CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE:
-                logger.info(f"[V2] Joined ACTIVE quorum {CURRENT_QUORUM.quorum_id[:8]}... "
+                logger.info(f"[QUORUM] Joined ACTIVE quorum {CURRENT_QUORUM.quorum_id[:8]}... "
                            f"with {len(CURRENT_QUORUM.members)} members")
                 
                 # Initialize QuorumTrainer
@@ -2941,25 +2941,25 @@ def run_node(
                     genesis_loader=getattr(NEURO_NODE, 'genesis_loader', None),
                     dht_protocol=DHT_PROTOCOL,
                 )
-                logger.info("[V2] QuorumTrainer initialized")
+                logger.info("[QUORUM] QuorumTrainer initialized")
             else:
-                logger.info(f"[V2] Quorum {CURRENT_QUORUM.quorum_id[:8]}... is FORMING, "
+                logger.info(f"[QUORUM] Quorum {CURRENT_QUORUM.quorum_id[:8]}... is FORMING, "
                            "waiting for more members...")
         else:
-            logger.info("[V2] No quorum formed yet, will retry in background...")
+            logger.info("[QUORUM] No quorum formed yet, will retry in background...")
     else:
-        logger.info("[V2] Training disabled, skipping quorum formation")
+        logger.info("[QUORUM] Training disabled, skipping quorum formation")
     
-    logger.info("[V2] initialization complete")
+    logger.info("[QUORUM] initialization complete")
     # =========================================================================
     
     # 5. Start gRPC Server
     start_grpc_background(port, NEURO_NODE, P2P, None)
     
-    # 6. Background tasks - V2 Quorum-Based System (no legacy fallbacks)
+    # 6. Background tasks - Native Quorum-Based System (no legacy fallbacks)
     def background_tasks():
         """
-        V2 Background Task Loop
+        Background Task Loop
         
         Training is ONLY done via QuorumTrainer:
         - Form/join a quorum with speed-matched peers
@@ -2984,7 +2984,7 @@ def run_node(
         # Start QuorumTrainer if quorum is active
         if enable_training and QUORUM_TRAINER and CURRENT_QUORUM:
             if CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE:
-                logger.info("[V2] Starting QuorumTrainer...")
+                logger.info("[QUORUM] Starting QuorumTrainer...")
                 QUORUM_TRAINER.start()
                 STATE["training_mode"] = "quorum"
                 STATE["training_status"] = "active"
@@ -3009,7 +3009,7 @@ def run_node(
         MEMORY_REPORT_INTERVAL = 60
         HEARTBEAT_INTERVAL = 30
         
-        logger.info("[V2] Background task loop started")
+        logger.info("[QUORUM] Background task loop started")
         
         while not _SHUTDOWN_REQUESTED.is_set():
             now = time.time()
@@ -3031,7 +3031,7 @@ def run_node(
                     # Quorum became ACTIVE - start trainer
                     if CURRENT_QUORUM.lifecycle == QuorumLifecycle.ACTIVE:
                         if not QUORUM_TRAINER:
-                            logger.info("[V2] Quorum ACTIVE, creating QuorumTrainer...")
+                            logger.info("[QUORUM] Quorum ACTIVE, creating QuorumTrainer...")
                             QUORUM_TRAINER = QuorumTrainer(
                                 quorum=CURRENT_QUORUM,
                                 node_id=NEURO_NODE.node_id,
@@ -3043,7 +3043,7 @@ def run_node(
                             QUORUM_TRAINER.start()
                             STATE["training_mode"] = "quorum"
                             STATE["training_status"] = "active"
-                            logger.info("[V2] QuorumTrainer started!")
+                            logger.info("[QUORUM] QuorumTrainer started!")
                         elif not QUORUM_TRAINER.running:
                             QUORUM_TRAINER.start()
                             STATE["training_status"] = "active"
@@ -3051,14 +3051,14 @@ def run_node(
                     # Quorum dissolved - stop trainer and reform
                     elif CURRENT_QUORUM.lifecycle in [QuorumLifecycle.DISSOLVED, QuorumLifecycle.DISSOLVING]:
                         if QUORUM_TRAINER and QUORUM_TRAINER.running:
-                            logger.info("[V2] Quorum dissolving, stopping QuorumTrainer...")
+                            logger.info("[QUORUM] Quorum dissolving, stopping QuorumTrainer...")
                             QUORUM_TRAINER.stop()
                             QUORUM_TRAINER = None
                             STATE["training_status"] = "reforming"
                         
                         # Try to form new quorum
                         if enable_training and QUORUM_FORMATION:
-                            logger.info("[V2] Reforming quorum...")
+                            logger.info("[QUORUM] Reforming quorum...")
                             grpc_port = port + 1000
                             grpc_endpoint = f"{ip_addr}:{grpc_port}"
                             layer_ids = NEURO_NODE.my_layer_ids
@@ -3072,11 +3072,11 @@ def run_node(
                                 total_layers=total_layers,
                             )
                             if CURRENT_QUORUM:
-                                logger.info(f"[V2] Joined quorum {CURRENT_QUORUM.quorum_id[:8]}...")
+                                logger.info(f"[QUORUM] Joined quorum {CURRENT_QUORUM.quorum_id[:8]}...")
                 
                 # No quorum yet - try to form one
                 elif enable_training and QUORUM_FORMATION:
-                    logger.debug("[V2] No quorum, attempting formation...")
+                    logger.debug("[QUORUM] No quorum, attempting formation...")
                     grpc_port = port + 1000
                     grpc_endpoint = f"{ip_addr}:{grpc_port}"
                     layer_ids = NEURO_NODE.my_layer_ids
@@ -3090,7 +3090,7 @@ def run_node(
                         total_layers=total_layers,
                     )
                     if CURRENT_QUORUM:
-                        logger.info(f"[V2] Formed quorum {CURRENT_QUORUM.quorum_id[:8]}...")
+                        logger.info(f"[QUORUM] Formed quorum {CURRENT_QUORUM.quorum_id[:8]}...")
                 
                 # Update training stats from QuorumTrainer
                 if QUORUM_TRAINER and QUORUM_TRAINER.running:
@@ -3131,11 +3131,11 @@ def run_node(
                 
                 # Log training status
                 if QUORUM_TRAINER and QUORUM_TRAINER.running:
-                    logger.info(f"[V2] Training: batches={QUORUM_TRAINER.total_batches}, "
+                    logger.info(f"[QUORUM] Training: batches={QUORUM_TRAINER.total_batches}, "
                                f"loss={QUORUM_TRAINER.current_loss or 'N/A'}, "
                                f"sync_round={QUORUM_TRAINER.sync_round}")
                 elif enable_training:
-                    logger.info(f"[V2] Waiting for quorum formation...")
+                    logger.info(f"[QUORUM] Waiting for quorum formation...")
             
             # =================================================================
             # MEMORY REPORT (every 60 seconds)
@@ -3153,7 +3153,7 @@ def run_node(
                     
                     # Quorum status
                     if CURRENT_QUORUM:
-                        logger.info(f"[V2] Quorum: {CURRENT_QUORUM.quorum_id[:8]}... "
+                        logger.info(f"[QUORUM] Quorum: {CURRENT_QUORUM.quorum_id[:8]}... "
                                    f"({CURRENT_QUORUM.lifecycle.value}, "
                                    f"{len(CURRENT_QUORUM.members)} members)")
                 except Exception:

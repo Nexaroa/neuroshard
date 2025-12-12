@@ -155,6 +155,10 @@ class PoNWProof:
     # Training metrics (for global loss tracking)
     current_loss: Optional[float] = None  # Current training loss (for aggregation)
     
+    # Reputation (for reward bonus calculation)
+    # Based on uptime_ratio and success_rate, tracked by QuorumMember
+    reputation: float = 1.0  # 0.0 to 1.0, default 1.0 for new nodes
+    
     # Signature
     signature: str = ""
     
@@ -1001,9 +1005,25 @@ class NEUROLedger:
             role_multiplier *= TRAINING_BONUS
         
         # =====================================================================
-        # 8. FINAL REWARD
+        # 8. REPUTATION BONUS
         # =====================================================================
-        total_reward = base_reward * stake_multiplier * role_multiplier
+        # Nodes with high uptime and success rates receive bonus rewards.
+        # This incentivizes reliable participation in the network.
+        # Reputation is tracked per-member in QuorumMember.reputation (0.0 to 1.0)
+        # We use the reputation from the proof if provided, otherwise default to 1.0
+        reputation = getattr(proof, 'reputation', 1.0)
+        if reputation is None:
+            reputation = 1.0
+        reputation = max(0.0, min(1.0, reputation))  # Clamp to [0, 1]
+        
+        # REPUTATION_BONUS_MAX = 0.10 (up to 10% extra for perfect reputation)
+        from neuroshard.core.economics.constants import REPUTATION_BONUS_MAX
+        reputation_bonus = 1.0 + (reputation * REPUTATION_BONUS_MAX)
+        
+        # =====================================================================
+        # 9. FINAL REWARD
+        # =====================================================================
+        total_reward = base_reward * stake_multiplier * role_multiplier * reputation_bonus
         
         return total_reward
     
