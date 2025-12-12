@@ -3011,19 +3011,28 @@ def run_node(
     
     # Initialize DHT Protocol for peer discovery
     try:
-        DHT_PROTOCOL = DHTProtocol(
-            node_id=NEURO_NODE.node_id,
-            dht=P2P.routing_table if hasattr(P2P, 'routing_table') else None,
-        )
-        logger.info("[QUORUM] DHT Protocol initialized")
+        from neuroshard.core.network.dht import Node as DHTNode
+        # Convert node_id (hex string) to int for DHT
+        node_id_int = int(NEURO_NODE.node_id[:32], 16) if NEURO_NODE.node_id else 0
+        local_node = DHTNode(node_id=node_id_int, ip=ip_addr, port=port)
+        
+        if P2P.routing_table:
+            DHT_PROTOCOL = DHTProtocol(
+                local_node=local_node,
+                routing_table=P2P.routing_table,
+                port=port,
+            )
+            logger.info("[QUORUM] DHT Protocol initialized")
+        else:
+            logger.warning("[QUORUM] No routing table available, DHT Protocol disabled")
+            DHT_PROTOCOL = None
     except Exception as e:
         logger.warning(f"[QUORUM] DHT Protocol init failed: {e}, using fallback")
         DHT_PROTOCOL = None
     
     # Initialize Quorum Registry (DHT-backed)
     QUORUM_REGISTRY = QuorumRegistry(
-        dht=DHT_PROTOCOL,
-        node_id=NEURO_NODE.node_id,
+        dht_protocol=DHT_PROTOCOL,
     )
     logger.info("[QUORUM] QuorumRegistry initialized")
     
