@@ -30,14 +30,37 @@ DESIGN PRINCIPLES
 
 # UPTIME REWARD (minimal - discourages idle farming)
 # Goal: Minimal passive income, forces users to train for real rewards
+# NOTE: Only awarded when node is in a quorum or actively available
 UPTIME_REWARD_PER_MINUTE = 0.0001   # 0.0001 NEURO per minute
                                      # ~0.14 NEURO/day idle (80% reduction)
 
 # TRAINING REWARD (dominant - this is the core value!)
 # Goal: Strong incentive for active training, covers electricity + profit
-TRAINING_REWARD_PER_BATCH = 0.0005  # 0.0005 NEURO per training batch
-                                     # 60 batches/min = 0.03 NEURO/min = ~43 NEURO/day
-                                     # Training earns 300x more than idle!
+# IMPORTANT: This is PER BATCH PER LAYER - nodes holding more layers earn more!
+TRAINING_REWARD_PER_BATCH_PER_LAYER = 0.0005  # 0.0005 NEURO per batch per layer
+                                               # Node with 10 layers, 60 batches/min:
+                                               # = 0.0005 × 10 × 60 = 0.3 NEURO/min = ~432 NEURO/day
+
+# Legacy alias (for backward compatibility - use TRAINING_REWARD_PER_BATCH_PER_LAYER)
+TRAINING_REWARD_PER_BATCH = TRAINING_REWARD_PER_BATCH_PER_LAYER
+
+# ASYNC TRAINING REWARD (for offline gradient contributors)
+# Goal: Reward async contributors fairly but less than real-time pipeline
+# Async gradients are less valuable because they may be stale
+ASYNC_TRAINING_REWARD_PER_BATCH_PER_LAYER = 0.0003  # 60% of pipeline rate
+                                                     # Lower because:
+                                                     # 1. Not time-critical
+                                                     # 2. May be stale
+                                                     # 3. Less coordination overhead
+
+# ASYNC FRESHNESS DECAY - gradients lose value over time
+# Newer gradients are more valuable for training convergence
+ASYNC_FRESHNESS_DECAY = {
+    3600: 1.0,      # < 1 hour: full value (100%)
+    86400: 0.7,     # < 1 day: 70% value
+    604800: 0.5,    # < 1 week: 50% value
+    float('inf'): 0.3,  # > 1 week: 30% value (still has some diversity value)
+}
 
 # DATA SERVING REWARD (for nodes serving training shards)
 DATA_REWARD_PER_SAMPLE = 0.00001    # 0.00001 NEURO per data sample served
@@ -61,19 +84,33 @@ INFERENCE_MARKET_BASE_PRICE = 0.0001      # Starting price (bootstrap with worth
 # - PROCESSOR: Holds middle layers, forwards activations
 # - FINISHER: Holds LM head, computes loss/output
 
-# Role shares for rewards (must sum to 1.0)
+# Role shares for inference rewards (must sum to 1.0)
 INITIATOR_SHARE = 0.15              # 15% - Embedding, batch initiation
 PROCESSOR_SHARE = 0.70              # 70% - Heavy computation (split by layers)
 FINISHER_SHARE = 0.15               # 15% - LM head, output generation
 
-# Role bonuses (multipliers on base rewards)
-INITIATOR_BONUS = 1.2               # 20% bonus for pipeline entry
-FINISHER_BONUS = 1.3                # 30% bonus for pipeline exit + loss calc
-LAYER_BONUS = 0.05                  # 5% bonus per layer held
-MAX_LAYER_BONUS = 1.0               # Cap layer bonus at 100%
+# =============================================================================
+# ROLE BONUSES (ADDITIVE - applied to base reward)
+# =============================================================================
+# These are ADDITIVE bonuses, not multiplicative!
+# Final multiplier = 1.0 + INITIATOR_BONUS + FINISHER_BONUS + TRAINING_BONUS
+# Example: Initiator + Finisher + Training = 1.0 + 0.2 + 0.3 + 0.1 = 1.6x
+#
+# This prevents exponential reward growth and is more intuitive.
 
-# Training bonus
-TRAINING_BONUS = 1.1                # 10% bonus when actively training
+INITIATOR_BONUS = 0.2               # +20% bonus for holding embedding layer
+FINISHER_BONUS = 0.3                # +30% bonus for holding LM head + loss calc
+TRAINING_BONUS = 0.1                # +10% bonus when actively training
+
+# NOTE: Layer scaling is already handled by per-layer reward calculation
+# (TRAINING_REWARD_PER_BATCH_PER_LAYER × layers_held)
+# These additional layer bonuses are REMOVED to avoid double-counting:
+# - Old: LAYER_BONUS = 0.05 per layer (caused confusion with per-layer rate)
+# - New: Layer reward is directly proportional via the base rate
+
+# Legacy constants for backward compatibility (deprecated)
+LAYER_BONUS = 0.0                   # DEPRECATED: Now handled by per-layer rate
+MAX_LAYER_BONUS = 0.0               # DEPRECATED: No longer used
 
 # =============================================================================
 # REPUTATION-BASED BONUSES
@@ -394,9 +431,126 @@ def calculate_layer_bonus(layers_held: int) -> float:
     """
     Calculate layer bonus for workers.
     
-    Formula: min(MAX_LAYER_BONUS, layers_held * WORKER_LAYER_BONUS)
+    DEPRECATED: Layer scaling is now handled directly via per-layer reward rates.
+    This function is kept for backward compatibility but always returns 0.
+    
+    The new approach:
+    - training_reward = batches × TRAINING_REWARD_PER_BATCH_PER_LAYER × layers_held
+    - This directly scales reward with layers, no additional bonus needed.
     """
-    return min(MAX_LAYER_BONUS, layers_held * WORKER_LAYER_BONUS)
+    # Layer bonus is deprecated - scaling is done via per-layer rate
+    return 0.0
+
+
+def calculate_async_freshness(age_seconds: float) -> float:
+    """
+    Calculate freshness multiplier for async gradient contributions.
+    
+    Newer gradients are more valuable for training convergence.
+    Older gradients still have diversity value but are discounted.
+    
+    Args:
+        age_seconds: Time since gradient was computed
+        
+    Returns:
+        Freshness multiplier (0.3 to 1.0)
+        
+    Examples:
+        >>> calculate_async_freshness(1800)   # 30 minutes
+        1.0
+        >>> calculate_async_freshness(43200)  # 12 hours
+        0.7
+        >>> calculate_async_freshness(259200) # 3 days
+        0.5
+        >>> calculate_async_freshness(1000000) # > 1 week
+        0.3
+    """
+    for threshold, freshness in sorted(ASYNC_FRESHNESS_DECAY.items()):
+        if age_seconds < threshold:
+            return freshness
+    # Fallback to minimum freshness
+    return 0.3
+
+
+def calculate_training_reward(
+    batches: int,
+    layers_held: int,
+    is_async: bool = False,
+    age_seconds: float = 0.0,
+) -> float:
+    """
+    Calculate training reward for a node.
+    
+    This is the canonical function for computing training rewards.
+    Use this instead of manually multiplying constants.
+    
+    Args:
+        batches: Number of training batches processed
+        layers_held: Number of layers this node holds
+        is_async: Whether this is an async contribution (vs pipeline)
+        age_seconds: Age of contribution in seconds (for async freshness)
+        
+    Returns:
+        Base training reward in NEURO (before multipliers)
+        
+    Examples:
+        >>> calculate_training_reward(60, 10)  # Pipeline: 60 batches, 10 layers
+        0.3  # 60 × 0.0005 × 10 = 0.3 NEURO
+        >>> calculate_training_reward(60, 10, is_async=True, age_seconds=7200)  # 2hr old async
+        0.126  # 60 × 0.0003 × 10 × 0.7 = 0.126 NEURO
+    """
+    if layers_held <= 0:
+        return 0.0
+    
+    if is_async:
+        base_rate = ASYNC_TRAINING_REWARD_PER_BATCH_PER_LAYER
+        freshness = calculate_async_freshness(age_seconds)
+        return batches * base_rate * layers_held * freshness
+    else:
+        base_rate = TRAINING_REWARD_PER_BATCH_PER_LAYER
+        return batches * base_rate * layers_held
+
+
+def calculate_role_bonus(
+    has_embedding: bool = False,
+    has_lm_head: bool = False,
+    is_training: bool = False,
+) -> float:
+    """
+    Calculate the role bonus multiplier (ADDITIVE).
+    
+    The multiplier is 1.0 + sum of applicable bonuses.
+    
+    Args:
+        has_embedding: Node holds embedding layer (Layer 0)
+        has_lm_head: Node holds LM head layer
+        is_training: Node is actively training
+        
+    Returns:
+        Role multiplier (1.0 to 1.6)
+        
+    Examples:
+        >>> calculate_role_bonus()  # Plain processor
+        1.0
+        >>> calculate_role_bonus(has_embedding=True)  # Initiator
+        1.2
+        >>> calculate_role_bonus(has_lm_head=True)  # Finisher
+        1.3
+        >>> calculate_role_bonus(has_embedding=True, has_lm_head=True, is_training=True)  # Solo training
+        1.6  # 1.0 + 0.2 + 0.3 + 0.1
+    """
+    multiplier = 1.0
+    
+    if has_embedding:
+        multiplier += INITIATOR_BONUS
+    
+    if has_lm_head:
+        multiplier += FINISHER_BONUS
+    
+    if is_training:
+        multiplier += TRAINING_BONUS
+    
+    return multiplier
 
 
 def calculate_burn_amount(spend_amount: float) -> float:
@@ -473,31 +627,45 @@ def is_eligible_validator(
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║ EARNING NEURO                                                                  ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║ Activity          │ Rate                    │ Daily (Active)                   ║
+║ Activity          │ Rate                    │ Daily (Active, 10 layers)        ║
 ║───────────────────┼─────────────────────────┼──────────────────────────────────║
-║ Training          │ 0.0005 NEURO/batch      │ ~43 NEURO (60 batch/min)         ║
-║ Inference         │ DYNAMIC (0.01-1.0)      │ Market-based (supply/demand)     ║
+║ Pipeline Training │ 0.0005 NEURO/batch/layer│ ~432 NEURO (60 batch/min)        ║
+║ Async Training    │ 0.0003 NEURO/batch/layer│ ~259 NEURO (with freshness)      ║
+║ Inference         │ DYNAMIC (market-based)  │ Supply/demand driven             ║
 ║ Data Serving      │ 0.00001 NEURO/sample    │ Variable                         ║
-║ Uptime (idle)     │ 0.0001 NEURO/min        │ ~0.14 NEURO                      ║
+║ Uptime (idle)     │ 0.0001 NEURO/min        │ ~0.14 NEURO (minimal)            ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║ REALISTIC DAILY EARNINGS (with bonuses)                                       ║
+║ REALISTIC DAILY EARNINGS (10 layers, with bonuses)                            ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║ Idle node         │ ~0.14 NEURO/day         │ Just uptime (unprofitable)       ║
-║ Light training    │ ~10-20 NEURO/day        │ Few hours active (Raspberry Pi)  ║
-║ Active trainer    │ ~40-60 NEURO/day        │ 24/7 training (Gaming PC)        ║
-║ Power user        │ ~200-350 NEURO/day      │ 24/7 + GPU + staking (Server)    ║
+║ Async (1 layer)   │ ~15-25 NEURO/day        │ Raspberry Pi, stale gradients    ║
+║ Pipeline (5 layer)│ ~200-300 NEURO/day      │ Gaming PC in quorum              ║
+║ Pipeline (10 layer│ ~400-600 NEURO/day      │ Server, full model segment       ║
+║ Solo (all layers) │ ~500-800 NEURO/day      │ Full model + all bonuses         ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║ MULTIPLIERS                                                                    ║
+║ ROLE BONUSES (ADDITIVE - sum together)                                        ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║ Initiator         │ +20%                    │ Holds embedding layer (Layer 0)  ║
+║ Finisher          │ +30%                    │ Holds LM head layer              ║
+║ Training          │ +10%                    │ When actively training           ║
+║ Example (all 3)   │ 1.6x total              │ 1.0 + 0.2 + 0.3 + 0.1 = 1.6x    ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║ OTHER MULTIPLIERS                                                              ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║ Staking           │ log2(1 + stake/1000)    │ 1.10x @ 1K, 1.66x @ 100K        ║
-║ Training Bonus    │ +10%                    │ When actively training           ║
-║ Driver Bonus      │ +20%                    │ Holding Layer 0                  ║
-║ Validator Bonus   │ +30%                    │ Holding Last Layer + 100 stake   ║
-║ Layer Bonus       │ +5% per layer           │ Max 100%                         ║
+║ Reputation        │ up to +10%              │ Based on uptime/success rate     ║
+║ Scarcity          │ up to +100%             │ For under-replicated layers      ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║ ASYNC FRESHNESS DECAY                                                          ║
+╠═══════════════════════════════════════════════════════════════════════════════╣
+║ < 1 hour          │ 100% value              │ Fresh gradients, full reward     ║
+║ < 1 day           │ 70% value               │ Slightly stale                   ║
+║ < 1 week          │ 50% value               │ Moderately stale                 ║
+║ > 1 week          │ 30% value               │ Old but still diversity value    ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║ REQUIREMENTS                                                                   ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
-║ Validator         │ 100 NEURO stake         │ + 2GB memory                     ║
+║ Validator         │ 100+ NEURO stake        │ + 2GB memory (scales w/network)  ║
 ║ Stake Min/Max     │ 1 / 10,000,000 NEURO    │                                  ║
 ║ Lock Period       │ 1 - 365 days            │                                  ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣

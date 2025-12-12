@@ -1283,70 +1283,107 @@ def get_verification_probability(network_size: int) -> float:
 
 ### 11.1 Training Rewards
 
+Training is the **dominant** reward activity. More layers = more work = more reward.
+
 ```python
+# Constants (from neuroshard/core/economics/constants.py)
+TRAINING_REWARD_PER_BATCH_PER_LAYER = 0.0005  # Pipeline training
+ASYNC_TRAINING_REWARD_PER_BATCH_PER_LAYER = 0.0003  # Async gradient submission
+
+# Role bonuses (ADDITIVE - sum together, not multiply!)
+INITIATOR_BONUS = 0.2   # +20% for holding embedding layer
+FINISHER_BONUS = 0.3    # +30% for holding LM head
+TRAINING_BONUS = 0.1    # +10% when actively training
+
 def calculate_training_reward(
-    node: Node,
     batches: int,
-    sync_round: int
+    layers_held: int,
+    is_async: bool = False,
+    age_seconds: float = 0.0,
 ) -> float:
-    """Calculate training reward for a node."""
+    """
+    Calculate training reward for a node.
     
-    BASE_RATE = 0.0005  # NEURO per batch per layer
+    Args:
+        batches: Number of training batches processed
+        layers_held: Number of layers this node holds
+        is_async: Whether this is an async contribution (vs pipeline)
+        age_seconds: Age of contribution in seconds (for async freshness)
+        
+    Returns:
+        Base training reward in NEURO (before multipliers)
+        
+    Examples:
+        # Pipeline: 60 batches, 10 layers
+        >>> calculate_training_reward(60, 10)
+        0.3  # 60 × 0.0005 × 10 = 0.3 NEURO
+        
+        # Async, 2 hours old: 60 batches, 10 layers
+        >>> calculate_training_reward(60, 10, is_async=True, age_seconds=7200)
+        0.126  # 60 × 0.0003 × 10 × 0.7 = 0.126 NEURO
+    """
+    if layers_held <= 0:
+        return 0.0
     
-    num_layers = len(range(*node.layer_range))
-    base_reward = BASE_RATE * batches * num_layers
+    if is_async:
+        base_rate = ASYNC_TRAINING_REWARD_PER_BATCH_PER_LAYER
+        freshness = calculate_async_freshness(age_seconds)
+        return batches * base_rate * layers_held * freshness
+    else:
+        base_rate = TRAINING_REWARD_PER_BATCH_PER_LAYER
+        return batches * base_rate * layers_held
+
+
+def calculate_role_bonus(
+    has_embedding: bool = False,
+    has_lm_head: bool = False,
+    is_training: bool = False,
+) -> float:
+    """
+    Calculate the role bonus multiplier (ADDITIVE).
     
-    # Multipliers
-    multipliers = 1.0
+    Returns 1.0 + sum of applicable bonuses.
     
-    # Scarcity bonus (0% to 100%)
-    for layer_id in range(*node.layer_range):
-        layer_info = dht.get(f"layer:{layer_id}")
-        multipliers += layer_info.scarcity_score * 0.5  # Up to 50% per layer
-    
-    # Position bonus
-    if node.has_embedding:
-        multipliers += 0.2  # +20% for embedding
-    if node.has_lm_head:
-        multipliers += 0.3  # +30% for LM head
-    
-    # Stake bonus (logarithmic)
-    if node.stake > 0:
-        stake_bonus = 0.1 * math.log2(1 + node.stake / 1000)
-        multipliers += min(stake_bonus, 0.5)  # Cap at 50%
-    
-    # Reputation bonus
-    multipliers += 0.1 * node.reputation  # Up to 10%
-    
-    return base_reward * multipliers
+    Examples:
+        >>> calculate_role_bonus()  # Plain processor
+        1.0
+        >>> calculate_role_bonus(has_embedding=True, has_lm_head=True, is_training=True)
+        1.6  # 1.0 + 0.2 + 0.3 + 0.1 = 1.6x
+    """
+    return 1.0 + (INITIATOR_BONUS if has_embedding else 0) \
+               + (FINISHER_BONUS if has_lm_head else 0) \
+               + (TRAINING_BONUS if is_training else 0)
 ```
 
 ### 11.2 Async Contributor Rewards
 
+Async gradients are less valuable because they may be stale.
+
 ```python
-def calculate_async_reward(contribution: GradientContribution) -> float:
-    """Calculate reward for async gradient submission."""
+# Freshness decay - gradients lose value over time
+ASYNC_FRESHNESS_DECAY = {
+    3600: 1.0,      # < 1 hour: full value (100%)
+    86400: 0.7,     # < 1 day: 70% value
+    604800: 0.5,    # < 1 week: 50% value
+    float('inf'): 0.3,  # > 1 week: 30% value (still has diversity value)
+}
+
+def calculate_async_freshness(age_seconds: float) -> float:
+    """
+    Calculate freshness multiplier for async gradient contributions.
     
-    BASE_RATE = 0.0003  # Lower than pipeline (less valuable)
-    
-    num_layers = contribution.num_layers
-    base_reward = BASE_RATE * contribution.batches * num_layers
-    
-    # Freshness discount
-    age = time.now() - contribution.timestamp
-    if age < 3600:      # < 1 hour
-        freshness = 1.0
-    elif age < 86400:   # < 1 day
-        freshness = 0.7
-    elif age < 604800:  # < 1 week
-        freshness = 0.5
-    else:
-        freshness = 0.2
-    
-    # Quality check (was gradient useful?)
-    quality = assess_gradient_quality(contribution)  # 0.5 to 1.0
-    
-    return base_reward * freshness * quality
+    Examples:
+        >>> calculate_async_freshness(1800)   # 30 minutes
+        1.0
+        >>> calculate_async_freshness(43200)  # 12 hours
+        0.7
+        >>> calculate_async_freshness(259200) # 3 days
+        0.5
+    """
+    for threshold, freshness in sorted(ASYNC_FRESHNESS_DECAY.items()):
+        if age_seconds < threshold:
+            return freshness
+    return 0.3
 ```
 
 ### 11.3 Scarcity-Based Incentives
@@ -1751,10 +1788,18 @@ RENEWAL_CHECK_RATIO = 0.8         # Check at 80% of session
 BASE_SYNC_INTERVAL = 500          # batches
 OUTER_LR = 0.7                    # DiLoCo outer learning rate
 
-# Rewards
-BASE_TRAINING_REWARD = 0.0005     # NEURO per batch per layer
-BASE_ASYNC_REWARD = 0.0003        # Lower for async
-BASE_INFERENCE_PRICE = 0.0001     # NEURO per token
+# Rewards (per-layer rates)
+TRAINING_REWARD_PER_BATCH_PER_LAYER = 0.0005  # Pipeline training
+ASYNC_TRAINING_REWARD_PER_BATCH_PER_LAYER = 0.0003  # Async (40% less)
+BASE_INFERENCE_PRICE = 0.0001     # NEURO per token (market-driven)
+
+# Role bonuses (ADDITIVE)
+INITIATOR_BONUS = 0.2             # +20% for embedding
+FINISHER_BONUS = 0.3              # +30% for LM head
+TRAINING_BONUS = 0.1              # +10% when training
+
+# Uptime (minimal, discourages idle farming)
+UPTIME_REWARD_PER_MINUTE = 0.0001 # ~0.14 NEURO/day idle
 
 # Verification
 BASE_CHALLENGE_WINDOW = 600       # 10 minutes

@@ -347,40 +347,59 @@ class TestRewardCalculation:
         assert abs(total - 1.0) < 0.01
     
     def test_initiator_bonus_multiplier(self):
-        """Test initiator bonus is a multiplier."""
-        from neuroshard.core.economics.constants import INITIATOR_BONUS
+        """Test initiator bonus is ADDITIVE (not multiplicative)."""
+        from neuroshard.core.economics.constants import INITIATOR_BONUS, calculate_role_bonus
         
-        # INITIATOR_BONUS is 1.2 (20% bonus as a multiplier)
+        # INITIATOR_BONUS is 0.2 (+20% as an ADDITIVE bonus)
+        assert INITIATOR_BONUS == 0.2
+        
+        # Using calculate_role_bonus, the multiplier is 1.0 + bonus
+        multiplier = calculate_role_bonus(has_embedding=True)
+        assert multiplier == 1.2  # 1.0 + 0.2
+        
         base_reward = 100.0
-        initiator_reward = base_reward * INITIATOR_BONUS
+        initiator_reward = base_reward * multiplier
         
         # Should be 120% of base
         assert initiator_reward == 120.0
     
     def test_finisher_bonus_multiplier(self):
-        """Test finisher bonus is a multiplier."""
-        from neuroshard.core.economics.constants import FINISHER_BONUS
+        """Test finisher bonus is ADDITIVE (not multiplicative)."""
+        from neuroshard.core.economics.constants import FINISHER_BONUS, calculate_role_bonus
         
-        # FINISHER_BONUS is 1.3 (30% bonus as a multiplier)
+        # FINISHER_BONUS is 0.3 (+30% as an ADDITIVE bonus)
+        assert FINISHER_BONUS == 0.3
+        
+        # Using calculate_role_bonus, the multiplier is 1.0 + bonus
+        multiplier = calculate_role_bonus(has_lm_head=True)
+        assert multiplier == 1.3  # 1.0 + 0.3
+        
         base_reward = 100.0
-        finisher_reward = base_reward * FINISHER_BONUS
+        finisher_reward = base_reward * multiplier
         
         # Should be 130% of base
         assert finisher_reward == 130.0
     
     def test_layer_bonus_calculation(self):
-        """Test layer bonus for rare layers."""
-        from neuroshard.core.economics.constants import LAYER_BONUS
+        """Test layer scaling via per-layer training reward rate."""
+        from neuroshard.core.economics.constants import (
+            TRAINING_REWARD_PER_BATCH_PER_LAYER,
+            calculate_training_reward,
+        )
         
-        base_reward = 100.0
-        num_layers = 4
+        # Layer scaling is now done via per-layer rate, not a bonus multiplier
+        # LAYER_BONUS is deprecated (0.0) - scaling is direct via:
+        # reward = batches × TRAINING_REWARD_PER_BATCH_PER_LAYER × layers_held
         
-        # Layer bonus is additive per layer
-        layer_multiplier = 1 + (LAYER_BONUS * num_layers)
-        layer_reward = base_reward * layer_multiplier
+        batches = 100
+        layers = 4
         
-        # Should be base + 5% per layer
-        assert layer_reward == base_reward * (1 + 0.05 * num_layers)
+        reward = calculate_training_reward(batches, layers)
+        expected = batches * TRAINING_REWARD_PER_BATCH_PER_LAYER * layers
+        
+        # Reward should scale linearly with layers
+        assert abs(reward - expected) < 0.0001
+        assert abs(reward - 0.2) < 0.0001  # 100 × 0.0005 × 4 = 0.2
     
     def test_sqrt_n_batch_weight(self):
         """Test sqrt(n) weighting for batch count."""

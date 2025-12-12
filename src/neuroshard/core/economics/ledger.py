@@ -54,7 +54,9 @@ logger = logging.getLogger(__name__)
 from neuroshard.core.economics.constants import (
     # Reward rates
     UPTIME_REWARD_PER_MINUTE,
-    TRAINING_REWARD_PER_BATCH,
+    TRAINING_REWARD_PER_BATCH,  # Legacy alias
+    TRAINING_REWARD_PER_BATCH_PER_LAYER,  # New per-layer rate
+    ASYNC_TRAINING_REWARD_PER_BATCH_PER_LAYER,  # Async contributor rate
     DATA_REWARD_PER_SAMPLE,
     
     # Dynamic inference pricing (PURE MARKET - no caps)
@@ -67,11 +69,13 @@ from neuroshard.core.economics.constants import (
     INITIATOR_SHARE,
     PROCESSOR_SHARE,
     FINISHER_SHARE,
+    
+    # Role bonuses (now ADDITIVE)
     INITIATOR_BONUS,
     FINISHER_BONUS,
-    LAYER_BONUS,
-    MAX_LAYER_BONUS,
     TRAINING_BONUS,
+    LAYER_BONUS,  # Deprecated (always 0)
+    MAX_LAYER_BONUS,  # Deprecated (always 0)
     
     # Staking
     STAKING_BASE_BONUS,
@@ -107,6 +111,9 @@ from neuroshard.core.economics.constants import (
     
     # Helper functions
     calculate_stake_multiplier,
+    calculate_training_reward,
+    calculate_role_bonus,
+    calculate_async_freshness,
     is_valid_stake_amount,
     is_valid_stake_duration,
 )
@@ -844,32 +851,32 @@ class NEUROLedger:
         """
         Calculate NEURO reward for a Proof of Neural Work.
         
-        Reward Structure:
-        ================
+        Reward Structure (quorum-based training rewards):
+        ====================================================
         
         1. UPTIME REWARD (all nodes):
-           - 0.1 NEURO per minute of uptime
-           - Incentivizes nodes to stay online
+           - 0.0001 NEURO per minute of uptime
+           - Minimal to discourage idle farming
         
         2. INFERENCE REWARD (PURE MARKET-BASED):
            - Total pool: DYNAMIC (based on supply/demand)
-           - Worthless model → ~0 NEURO (no demand)
-           - Good model → Market price rises naturally
            - Distributed by quorum role:
-             * INITIATOR (has Layer 0):     See INITIATOR_SHARE (15%)
-             * PROCESSOR (middle layers):   See PROCESSOR_SHARE (70%)
-             * FINISHER (has LM head):      See FINISHER_SHARE (15%)
+             * INITIATOR (has Layer 0):     15%
+             * PROCESSOR (middle layers):   70%
+             * FINISHER (has LM head):      15%
         
-        3. TRAINING REWARD:
-           - See TRAINING_REWARD_PER_BATCH in economics.py
+        3. TRAINING REWARD (PER LAYER):
+           - Pipeline: 0.0005 NEURO × batches × layers_held
+           - Async: 0.0003 NEURO × batches × layers_held × freshness
+           - This directly scales reward with contribution!
         
         4. DATA REWARD:
-           - See DATA_REWARD_PER_SAMPLE in economics.py
+           - 0.00001 NEURO per data sample served
         
-        5. MULTIPLIERS:
+        5. MULTIPLIERS (ADDITIVE for role, multiplicative for stake):
+           - Role bonus: 1.0 + (0.2 if initiator) + (0.3 if finisher) + (0.1 if training)
            - Staking: Logarithmic curve (see calculate_stake_multiplier)
-           - Role bonus: Defined in economics.py
-           - Layer bonus: Defined in economics.py
+           - Reputation: Up to +10% for reliable nodes
         """
         # =====================================================================
         # 1. UPTIME REWARD (same for all roles)
@@ -919,7 +926,7 @@ class NEUROLedger:
             is_initiator = proof.has_embedding  # Holds Layer 0
             is_finisher = proof.has_lm_head     # Holds LM head layer
         
-        is_processor = proof.layers_held > 0 and not (is_initiator and is_finisher)
+        is_training = proof.training_batches > 0
         
         inference_reward = 0.0
         
@@ -931,29 +938,34 @@ class NEUROLedger:
             # Finisher (holds LM head) gets 15% of the inference pool
             inference_reward += inference_pool * FINISHER_SHARE
         
-        if is_processor or proof.layers_held > 0:
+        if proof.layers_held > 0:
             # Processors get rewarded per layer they process
-            # 
             # The PROCESSOR_SHARE (70%) represents the total computation work.
-            # Each layer does roughly equal work, so we reward per layer.
-            #
-            # In quorum-based pipeline:
-            #   - Initiator processes tokens → claims Initiator share
-            #   - Processor1 processes tokens → claims Processor share
-            #   - Processor2 processes tokens → claims Processor share
-            #   - Finisher processes tokens → claims Finisher share
-            #
-            # Each node's tokens_processed = tokens they actually computed.
-            # So we give full processor share - the tokens_processed is already
-            # the accurate measure of their contribution.
-            
             processor_pool = inference_pool * PROCESSOR_SHARE
-            inference_reward += processor_pool  # Full share - tokens_processed is already per-node
+            inference_reward += processor_pool
         
         # =====================================================================
-        # 3. TRAINING REWARD
+        # 3. TRAINING REWARD (PER LAYER - the key change!)
         # =====================================================================
-        training_reward = proof.training_batches * TRAINING_REWARD_PER_BATCH
+        # Training reward now properly scales with layers_held:
+        # - More layers = more work = more reward
+        # - This incentivizes nodes to hold more layers
+        #
+        # Formula: batches × rate_per_layer × layers_held
+        #
+        # For async contributors (not in pipeline), we apply freshness decay
+        # since stale gradients are less valuable for training convergence.
+        
+        training_reward = 0.0
+        if proof.training_batches > 0 and proof.layers_held > 0:
+            # Use the canonical training reward calculation
+            # For now, we assume pipeline (not async) - async would have separate proof type
+            training_reward = calculate_training_reward(
+                batches=proof.training_batches,
+                layers_held=proof.layers_held,
+                is_async=False,  # Pipeline training
+                age_seconds=0.0,
+            )
         
         # =====================================================================
         # 4. DATA REWARD
@@ -985,24 +997,16 @@ class NEUROLedger:
             stake_multiplier = min(REMOTE_STAKE_MULTIPLIER_CAP, self._calculate_stake_multiplier(stake))
         
         # =====================================================================
-        # 7. ROLE BONUS MULTIPLIER
+        # 7. ROLE BONUS MULTIPLIER (ADDITIVE - not multiplicative!)
         # =====================================================================
-        role_multiplier = 1.0
-        
-        if is_initiator:
-            role_multiplier *= INITIATOR_BONUS  # Bonus for pipeline entry
-        
-        if is_finisher:
-            role_multiplier *= FINISHER_BONUS  # Bonus for pipeline exit
-        
-        # Layer bonus for all nodes holding layers
-        if proof.layers_held > 0:
-            layer_bonus = min(MAX_LAYER_BONUS, proof.layers_held * LAYER_BONUS)
-            role_multiplier *= (1.0 + layer_bonus)
-        
-        # Training bonus
-        if proof.training_batches > 0:
-            role_multiplier *= TRAINING_BONUS
+        # Role bonuses are now ADDITIVE to prevent exponential growth
+        # Final multiplier = 1.0 + sum of applicable bonuses
+        # Example: Initiator + Finisher + Training = 1.0 + 0.2 + 0.3 + 0.1 = 1.6x
+        role_multiplier = calculate_role_bonus(
+            has_embedding=is_initiator,
+            has_lm_head=is_finisher,
+            is_training=is_training,
+        )
         
         # =====================================================================
         # 8. REPUTATION BONUS
