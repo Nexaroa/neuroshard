@@ -1051,43 +1051,46 @@ class P2PManager:
                         logger.info("[OBSERVER] DHT Announce: registered as proof receiver")
                 except Exception as e:
                     logger.debug(f"[OBSERVER] DHT Announce error: {e}")
-                return
+                # Don't return here - also announce to tracker for discoverability!
             
-            # Skip announcement if layers are not yet assigned
-            if self.start_layer < 0:
+            # Skip DHT layer announcement if layers are not yet assigned
+            # But still continue to tracker announce!
+            elif self.start_layer < 0:
                 if verbose:
-                    logger.info("[P2P] Skipping DHT announcement (layers not assigned yet)")
-                return
-
-            try:
-                num_layers = self.end_layer - self.start_layer + 1
-                success_count = 0
-                
-                # Announce ALL layers we hold so peers can find us for any layer
-                # This is critical for distributed training pipeline routing!
-                for layer_id in range(self.start_layer, self.end_layer + 1):
+                    logger.info("[P2P] Skipping DHT layer announcement (layers not assigned yet)")
+                # Don't return here - also announce to tracker!
+            
+            # Normal training node with assigned layers
+            else:
+                try:
+                    num_layers = self.end_layer - self.start_layer + 1
+                    success_count = 0
+                    
+                    # Announce ALL layers we hold so peers can find us for any layer
+                    # This is critical for distributed training pipeline routing!
+                    for layer_id in range(self.start_layer, self.end_layer + 1):
+                        try:
+                            self.dht.announce(f"layer_{layer_id}")
+                            success_count += 1
+                        except:
+                            pass
+                    
+                    # Also announce as proof receiver (all nodes can receive proofs)
                     try:
-                        self.dht.announce(f"layer_{layer_id}")
-                        success_count += 1
+                        self.dht.announce("proof_receiver")
                     except:
                         pass
-                
-                # Also announce as proof receiver (all nodes can receive proofs)
-                try:
-                    self.dht.announce("proof_receiver")
-                except:
-                    pass
-                
-                # Log summary (only on first announce or if verbose)
-                if verbose and num_layers > 0:
-                    logger.info(f"DHT Announce: {success_count}/{num_layers} layers announced (layers {self.start_layer}-{self.end_layer})")
-                
-                # Also announce checkpoint info for distributed training sync
-                if hasattr(self, 'neuro_node') and self.neuro_node:
-                    checkpoint_info = self.neuro_node.get_checkpoint_info()
-                    self.dht.announce(f"checkpoint_v{checkpoint_info['version']}")
-            except Exception as e:
-                logger.debug(f"DHT Announce error: {e}")
+                    
+                    # Log summary (only on first announce or if verbose)
+                    if verbose and num_layers > 0:
+                        logger.info(f"DHT Announce: {success_count}/{num_layers} layers announced (layers {self.start_layer}-{self.end_layer})")
+                    
+                    # Also announce checkpoint info for distributed training sync
+                    if hasattr(self, 'neuro_node') and self.neuro_node:
+                        checkpoint_info = self.neuro_node.get_checkpoint_info()
+                        self.dht.announce(f"checkpoint_v{checkpoint_info['version']}")
+                except Exception as e:
+                    logger.debug(f"DHT Announce error: {e}")
         
         # Tracker Announce (for bootstrap discovery)
         # NOTE: This is NOT centralized control - the tracker is just a peer list.

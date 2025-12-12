@@ -2943,7 +2943,21 @@ def run_node(
                         pass
                     await asyncio_lib.sleep(30)
             
+            # Start background task for DHT/tracker announcements
+            async def announce_loop():
+                """Periodic announce to tracker and DHT so nodes can discover us."""
+                first_announce = True
+                while True:
+                    try:
+                        # Announce to DHT and tracker
+                        P2P._announce_once(verbose=first_announce)
+                        first_announce = False
+                    except Exception as e:
+                        logger.debug(f"[OBSERVER] Announce error: {e}")
+                    await asyncio_lib.sleep(30)  # Announce every 30 seconds
+            
             asyncio_lib.create_task(update_stats())
+            asyncio_lib.create_task(announce_loop())
             await server.serve()
         
         asyncio_lib.run(run_observer())
