@@ -817,6 +817,29 @@ class NEUROLedger:
             if batches_per_minute > 2000:  # 10 batches/second max for fast GPUs
                 return False, f"Training rate implausible ({batches_per_minute:.0f} batches/min)"
         
+        # =================================================================
+        # CRITICAL: Training proof must show ACTUAL work was done
+        # =================================================================
+        # A training proof claiming batches but showing no evidence of actual work
+        # is likely a fake/placeholder that just increments counters without training.
+        #
+        # Valid training requires at least one of:
+        # 1. tokens_processed > 0 (processed actual data)
+        # 2. current_loss is a valid number (computed actual loss)
+        #
+        # A proof with training_batches > 0 but BOTH tokens_processed=0 AND no loss
+        # indicates the node is just running a placeholder loop.
+        if proof.proof_type == "training" and proof.training_batches > 0:
+            has_tokens = proof.tokens_processed > 0
+            has_loss = proof.current_loss is not None and proof.current_loss > 0
+            
+            if not has_tokens and not has_loss:
+                logger.warning(
+                    f"FAKE TRAINING DETECTED: {proof.node_id[:16]}... claimed {proof.training_batches} batches "
+                    f"but tokens_processed=0 and loss=None - no actual work done!"
+                )
+                return False, "Training proof rejected: no evidence of actual work (tokens=0, loss=None)"
+        
         return True, ""
     
     def process_proof(self, proof: PoNWProof, skip_verification: bool = False) -> Tuple[bool, float, str]:
