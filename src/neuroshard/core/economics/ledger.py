@@ -664,6 +664,21 @@ class NEUROLedger:
             return False, f"Work validation failed: {work_reason}"
 
         return True, "Valid"
+
+    def has_proof(self, signature: str) -> bool:
+        """Check if a proof signature already exists in the ledger (Thread-safe)."""
+        if not signature:
+            return False
+            
+        try:
+            with self.lock:
+                with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT 1 FROM proof_history WHERE signature = ?", (signature,))
+                    return cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Error checking proof existence: {e}")
+            return False
     
     def _check_rate_limits(self, conn, proof: PoNWProof) -> Tuple[bool, str]:
         """

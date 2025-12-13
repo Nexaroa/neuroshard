@@ -228,7 +228,11 @@ class DHTProofStore:
                     logger.debug(f"Stored proof for wallet {wallet_id[:8]}... on {success_count}/{len(closest_nodes)} DHT nodes")
                 return True
             else:
-                logger.warning(f"Failed to store proof on any DHT nodes for wallet {wallet_id[:8]}...")
+                # Don't warn if network is just too small (e.g. startup)
+                if available_peers < 1:
+                     logger.debug(f"Deferred DHT storage for wallet {wallet_id[:8]}... (network too small: {available_peers} peers)")
+                else:
+                     logger.warning(f"Failed to store proof on any DHT nodes for wallet {wallet_id[:8]}... (tried {len(closest_nodes)} nodes)")
                 return False
                 
         except Exception as e:

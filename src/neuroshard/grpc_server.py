@@ -169,10 +169,18 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             # Verify and process the proof using our ledger
             if self.p2p and self.p2p.ledger:
                 ledger = self.p2p.ledger
+                
+                # 1. Deduplication (Idempotency check)
+                # Check if we already have this proof BEFORE doing expensive verification
+                if ledger.has_proof(proof.signature):
+                    logger.debug(f"[GOSSIP] Ignoring duplicate proof from {request.node_id[:8]}... (already processed)")
+                    return neuroshard_pb2.GossipProofResponse(accepted=True)
+                
+                # 2. Verify
                 is_valid, reason = ledger.verify_proof(proof)
                 
                 if is_valid:
-                    # Process the proof (credits rewards)
+                    # 3. Process (credits rewards)
                     # skip_verification=True because we already called verify_proof above
                     success, reward, msg = ledger.process_proof(proof, skip_verification=True)
                     if success:
@@ -184,15 +192,15 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                         
                         return neuroshard_pb2.GossipProofResponse(accepted=True)
                     else:
-                        # Only log actual failures, not expected duplicates
-                        # Duplicates are normal in gossip networks (same proof via multiple paths)
-                        if "Duplicate" not in msg:
-                            logger.warning(f"[GOSSIP] ✗ Proof rejected: {msg}")
+                        # Should rarely happen given has_proof check above, but handle race conditions
+                        if "Duplicate" in msg:
+                             logger.debug(f"[GOSSIP] Ignoring duplicate proof (race condition)")
+                             return neuroshard_pb2.GossipProofResponse(accepted=True)
+                             
+                        logger.warning(f"[GOSSIP] ✗ Proof rejected: {msg}")
                         return neuroshard_pb2.GossipProofResponse(accepted=False)
                 else:
-                    # Duplicates are normal in gossip networks - don't log as failures
-                    if "Duplicate" not in reason:
-                        logger.info(f"[GOSSIP] ✗ Proof verification failed: {reason}")
+                    logger.info(f"[GOSSIP] ✗ Proof verification failed: {reason}")
                     return neuroshard_pb2.GossipProofResponse(accepted=False)
             
             # No ledger - just accept silently
