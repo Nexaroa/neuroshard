@@ -153,7 +153,8 @@ class DHTProtocol:
             
             self.routing_table.add_contact(proto_to_node(resp.responder))
             return resp.success
-        except grpc.RpcError:
+        except grpc.RpcError as e:
+            logger.debug(f"DHT store gRPC error to {target.ip}:{target.port}: {e.code()}")
             return False
         
     def find_value(self, target: Node, key: int):

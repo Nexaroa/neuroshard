@@ -208,12 +208,17 @@ class DHTProofStore:
             
             # Store on each node
             success_count = 0
+            logger.debug(f"Attempting to store proof on {len(closest_nodes)} DHT nodes for wallet {wallet_id[:8]}...")
             for node in closest_nodes:
                 try:
-                    if self.dht.store(node, dht_key, proof_json):
+                    result = self.dht.store(node, dht_key, proof_json)
+                    if result:
                         success_count += 1
+                        logger.debug(f"  ✓ Stored on {node.ip}:{node.port}")
+                    else:
+                        logger.debug(f"  ✗ Store returned False for {node.ip}:{node.port}")
                 except Exception as e:
-                    logger.debug(f"Failed to store proof on node {node}: {e}")
+                    logger.debug(f"  ✗ Exception storing on {node.ip}:{node.port}: {e}")
             
             if success_count > 0:
                 # Show network size context

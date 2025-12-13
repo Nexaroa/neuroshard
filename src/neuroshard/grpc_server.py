@@ -190,7 +190,9 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                             logger.warning(f"[GOSSIP] ✗ Proof rejected: {msg}")
                         return neuroshard_pb2.GossipProofResponse(accepted=False)
                 else:
-                    logger.info(f"[GOSSIP] ✗ Proof verification failed: {reason}")
+                    # Duplicates are normal in gossip networks - don't log as failures
+                    if "Duplicate" not in reason:
+                        logger.info(f"[GOSSIP] ✗ Proof verification failed: {reason}")
                     return neuroshard_pb2.GossipProofResponse(accepted=False)
             
             # No ledger - just accept silently
