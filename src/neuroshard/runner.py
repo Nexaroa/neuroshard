@@ -413,7 +413,7 @@ async def generate_text(req: TextGenerationRequest):
     try:
         generated = NEURO_NODE.generate(
             prompt=req.prompt,
-            max_new_tokens=req.max_new_tokens,
+            max_tokens=req.max_new_tokens,
             temperature=req.temperature,
         )
         
@@ -2168,7 +2168,7 @@ async def inference_v1(req: InferenceV1Request):
                 # Generate tokens one at a time
                 text = NEURO_NODE.generate(
                     prompt=req.prompt,
-                    max_new_tokens=req.max_tokens,
+                    max_tokens=req.max_tokens,
                     temperature=req.temperature,
                 )
                 
@@ -2192,7 +2192,7 @@ async def inference_v1(req: InferenceV1Request):
     try:
         text = NEURO_NODE.generate(
             prompt=req.prompt,
-            max_new_tokens=req.max_tokens,
+            max_tokens=req.max_tokens,
             temperature=req.temperature,
         )
         
@@ -2318,7 +2318,7 @@ async def quorum_inference(req: QuorumInferenceRequest):
     try:
         text = NEURO_NODE.generate(
             prompt=req.prompt,
-            max_new_tokens=req.max_tokens,
+            max_tokens=req.max_tokens,
             temperature=req.temperature,
         )
         
@@ -4093,7 +4093,7 @@ def run_node(
                 try:
                     output = NEURO_NODE.generate(
                         prompt=prompt_text,
-                        max_new_tokens=market_request.tokens_requested,
+                        max_tokens=market_request.tokens_requested,
                         temperature=0.8
                     )
                     
