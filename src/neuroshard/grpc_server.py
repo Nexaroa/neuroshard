@@ -184,11 +184,9 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                         
                         return neuroshard_pb2.GossipProofResponse(accepted=True)
                     else:
-                        # Duplicates are expected (gossip reaches us via multiple paths)
-                        # Rate limit errors are now rare (fixed: only count accepted proofs)
-                        if "Duplicate" in msg:
-                            logger.debug(f"[GOSSIP] Duplicate proof (expected in gossip)")
-                        else:
+                        # Only log actual failures, not expected duplicates
+                        # Duplicates are normal in gossip networks (same proof via multiple paths)
+                        if "Duplicate" not in msg:
                             logger.warning(f"[GOSSIP] ✗ Proof rejected: {msg}")
                         return neuroshard_pb2.GossipProofResponse(accepted=False)
                 else:

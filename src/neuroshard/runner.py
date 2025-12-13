@@ -3672,6 +3672,8 @@ def run_node(
         last_layer_growth_check = 0
         last_tokens = NEURO_NODE.total_tokens_processed if NEURO_NODE else 0
         last_training_rounds = NEURO_NODE.total_training_rounds if NEURO_NODE else 0
+        last_quorum_batches = 0  # Track last quorum batch count for delta calculation
+        last_async_batches = 0   # Track last async batch count for delta calculation
         
         QUORUM_CHECK_INTERVAL = 10  # Check quorum every 10 seconds
         MEMORY_REPORT_INTERVAL = 60
@@ -3763,10 +3765,15 @@ def run_node(
                 
                 # Update training stats from QuorumTrainer
                 if QUORUM_TRAINER and QUORUM_TRAINER.running:
-                    STATE["quorum_batches"] = QUORUM_TRAINER.total_batches
+                    current_quorum_batches = QUORUM_TRAINER.total_batches
+                    STATE["quorum_batches"] = current_quorum_batches
                     STATE["quorum_loss"] = QUORUM_TRAINER.current_loss
                     STATE["quorum_sync_round"] = QUORUM_TRAINER.sync_round
-                    STATE["training_batches"] = QUORUM_TRAINER.total_batches
+                    # Add DELTA batches (not cumulative) - P2P resets training_batches after each proof
+                    batch_delta = current_quorum_batches - last_quorum_batches
+                    if batch_delta > 0:
+                        STATE["training_batches"] = STATE.get("training_batches", 0) + batch_delta
+                        last_quorum_batches = current_quorum_batches
                     STATE["last_loss"] = QUORUM_TRAINER.current_loss
                     STATE["current_loss"] = QUORUM_TRAINER.current_loss
                 
@@ -3840,10 +3847,15 @@ def run_node(
                 # Update async trainer stats if running
                 if ASYNC_TRAINER and ASYNC_TRAINER.running:
                     async_stats = ASYNC_TRAINER.get_stats()
-                    STATE["async_batches"] = async_stats["total_batches"]
+                    current_async_batches = async_stats["total_batches"]
+                    STATE["async_batches"] = current_async_batches
                     STATE["async_syncs"] = async_stats["total_syncs"]
                     STATE["current_loss"] = async_stats["current_loss"]
-                    STATE["training_batches"] = async_stats["total_batches"]
+                    # Add DELTA batches (not cumulative) - P2P resets training_batches after each proof
+                    batch_delta = current_async_batches - last_async_batches
+                    if batch_delta > 0:
+                        STATE["training_batches"] = STATE.get("training_batches", 0) + batch_delta
+                        last_async_batches = current_async_batches
             
             # =================================================================
             # STATE UPDATES
