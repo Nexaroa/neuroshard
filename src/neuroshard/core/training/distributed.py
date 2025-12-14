@@ -337,29 +337,56 @@ class GenesisDataLoader:
     def _assign_shards(self):
         """
         Assign shards to this node based on:
-        1. Node's deterministic hash (ensures different nodes get different shards)
-        2. User's storage limit (max_shards)
-        3. Rotation offset (allows cycling through entire dataset over time)
+        1. Manifest's explicit shard list (only valid shards that exist)
+        2. Node's deterministic hash (ensures different nodes get different shards)
+        3. User's storage limit (max_shards)
+        4. Rotation offset (allows cycling through entire dataset over time)
         """
-        if self.total_shards == 0:
+        # Get list of valid shard IDs from manifest
+        valid_shard_ids = self._get_valid_shard_ids()
+        
+        if not valid_shard_ids:
+            logger.warning("[GENESIS] No valid shards in manifest, using shard 0")
             self.assigned_shard_ids = [0]
             return
         
+        # Sort for deterministic assignment across nodes
+        valid_shard_ids = sorted(valid_shard_ids)
+        num_valid = len(valid_shard_ids)
+        
         # Base offset from node ID (deterministic)
         node_hash = int(hashlib.sha256(self.node_id.encode()).hexdigest(), 16)
-        base_offset = node_hash % self.total_shards
+        base_offset = node_hash % num_valid
         
         # Rotation offset (changes over time to cover more data)
-        rotation_offset = (self.shard_rotation_count * self.max_shards) % self.total_shards
+        rotation_offset = (self.shard_rotation_count * self.max_shards) % num_valid
         
-        # Assign shards starting from (base + rotation) offset
+        # Assign shards from VALID list only (no gaps!)
         self.assigned_shard_ids = []
-        for i in range(self.max_shards):
-            shard_id = (base_offset + rotation_offset + i) % self.total_shards
-            self.assigned_shard_ids.append(shard_id)
+        for i in range(min(self.max_shards, num_valid)):
+            idx = (base_offset + rotation_offset + i) % num_valid
+            self.assigned_shard_ids.append(valid_shard_ids[idx])
         
-        logger.info(f"Assigned {len(self.assigned_shard_ids)} shards: "
+        logger.info(f"Assigned {len(self.assigned_shard_ids)} shards from {num_valid} valid: "
                    f"{self.assigned_shard_ids[:5]}{'...' if len(self.assigned_shard_ids) > 5 else ''}")
+    
+    def _get_valid_shard_ids(self) -> List[int]:
+        """
+        Get list of valid shard IDs from manifest.
+        
+        The manifest contains a 'shards' array listing every shard that actually exists.
+        This prevents 403 errors from trying to download non-existent shards.
+        """
+        if not self.manifest:
+            return []
+        
+        # Check for explicit shard list in manifest
+        shards_list = self.manifest.get("shards", [])
+        if shards_list:
+            return [s["shard_id"] for s in shards_list if "shard_id" in s]
+        
+        # Fallback: assume contiguous (legacy manifests)
+        return list(range(self.total_shards))
 
     def rotate_shards(self):
         """

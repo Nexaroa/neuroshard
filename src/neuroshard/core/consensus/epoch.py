@@ -475,12 +475,20 @@ class EpochManager:
         proof_epoch_id = int(timestamp / self.epoch_duration)
         
         with self._lock:
-            # Only accept proofs for current or immediately previous epoch (grace period)
-            if proof_epoch_id < self.current_epoch_id - 1:
-                return False, f"Proof too old: epoch {proof_epoch_id} < {self.current_epoch_id - 1}"
+            # Accept proofs for current epoch ±1 (to handle clock skew between nodes)
+            # This is necessary because distributed nodes may have slightly different clocks
+            # Proofs are still validated by timestamp, this just allows for 1 epoch drift
+            epoch_diff = abs(proof_epoch_id - self.current_epoch_id)
             
+            if epoch_diff > 1:
+                if proof_epoch_id < self.current_epoch_id:
+                    return False, f"Proof too old: epoch {proof_epoch_id} < {self.current_epoch_id - 1}"
+                else:
+                    return False, f"Proof too far ahead: epoch {proof_epoch_id} > {self.current_epoch_id + 1}"
+            
+            # If proof is from next epoch, advance our epoch counter
             if proof_epoch_id > self.current_epoch_id:
-                return False, f"Proof from future epoch: {proof_epoch_id} > {self.current_epoch_id}"
+                self.current_epoch_id = proof_epoch_id
             
             # Create epoch proof record
             commitment_hash = None

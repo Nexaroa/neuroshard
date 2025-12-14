@@ -208,10 +208,12 @@ class PoNWProof:
         """
         Verify that the proof shows evidence of actual training work.
         
-        For training proofs, we require:
-        1. model_hash_start != model_hash_end (weights changed)
-        2. gradient_commitment is present (can be spot-checked)
-        3. current_loss is valid (training computed loss)
+        NO LEGACY SUPPORT - All nodes must use chained PoNW.
+        
+        Requirements:
+        1. model_hash_start != model_hash_end (weights actually changed)
+        2. gradient_commitment present (spot-checkable proof of computation)
+        3. current_loss > 0 (training computed actual loss)
         
         Returns:
             (is_valid, error_message)
@@ -222,17 +224,21 @@ class PoNWProof:
         if self.training_batches <= 0:
             return True, "No training batches claimed"
         
-        # Check 1: Weights must have changed
-        if self.model_hash_start and self.model_hash_end:
-            if self.model_hash_start == self.model_hash_end:
-                return False, "Model weights unchanged (no actual training)"
+        # REQUIRED: Must have valid loss (proves forward pass happened)
+        if self.current_loss is None or self.current_loss <= 0:
+            return False, "No valid loss - training proof requires loss > 0"
         
-        # Check 2: Must have gradient commitment OR loss
-        has_commitment = bool(self.gradient_commitment)
-        has_loss = self.current_loss is not None and self.current_loss > 0
+        # REQUIRED: Must have model state hashes (proves weight tracking)
+        if not self.model_hash_start or not self.model_hash_end:
+            return False, "Missing model state hashes - update node to latest version"
         
-        if not has_commitment and not has_loss:
-            return False, "No gradient commitment or loss (cannot verify work)"
+        # REQUIRED: Weights must have changed (proves backward pass happened)
+        if self.model_hash_start == self.model_hash_end:
+            return False, "Model weights unchanged - no actual training occurred"
+        
+        # REQUIRED: Must have gradient commitment (for spot-checking)
+        if not self.gradient_commitment:
+            return False, "Missing gradient commitment - update node to latest version"
         
         return True, "Training work verified"
     
