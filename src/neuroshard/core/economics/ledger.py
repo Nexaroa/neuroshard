@@ -131,9 +131,12 @@ class PoNWProof:
     Security Properties:
     1. node_id: Derived from node_token (cannot be forged)
     2. timestamp: Must be recent (prevents replay)
-    3. signature: HMAC-SHA256(node_token, canonical_payload)
+    3. signature: ECDSA(node_key, canonical_payload)
     4. nonce: Random value to prevent signature collision
-    5. request_id: Links to InferenceRequest for price locking (NEW: marketplace)
+    5. request_id: Links to InferenceRequest for price locking
+    6. epoch_id: Binds proof to a specific epoch (prevents epoch-hopping)
+    7. model_hash_start/end: Proves actual weight changes (training work)
+    8. gradient_commitment: Spot-checkable proof of gradient computation
     """
     node_id: str
     proof_type: str
@@ -146,11 +149,11 @@ class PoNWProof:
     training_batches: int = 0
     data_samples: int = 0
     
-    # NEW: Marketplace - links to InferenceRequest for price locking
+    # Marketplace - links to InferenceRequest for price locking
     request_id: Optional[str] = None  # If inference, which request was this?
     
     # Context for verification
-    model_hash: str = ""          # Hash of model state (for training proofs)
+    model_hash: str = ""          # Legacy: Hash of model state (for training proofs)
     layers_held: int = 0          # Number of layers this node holds
     has_embedding: bool = False   # Driver node
     has_lm_head: bool = False     # Validator node
@@ -159,8 +162,26 @@ class PoNWProof:
     current_loss: Optional[float] = None  # Current training loss (for aggregation)
     
     # Reputation (for reward bonus calculation)
-    # Based on uptime_ratio and success_rate, tracked by QuorumMember
     reputation: float = 1.0  # 0.0 to 1.0, default 1.0 for new nodes
+    
+    # =========================================================================
+    # NEW: Chained PoNW Fields (Blockchain-like Verification)
+    # =========================================================================
+    
+    # Epoch binding - proof must belong to a specific epoch
+    epoch_id: int = 0             # Which epoch this proof belongs to
+    
+    # Model state commitment - proves actual training work
+    model_hash_start: str = ""    # H(weights) BEFORE training
+    model_hash_end: str = ""      # H(weights) AFTER training
+    
+    # Gradient commitment - the "nonce equivalent" for PoNW
+    # This is a hash of gradient statistics that can be spot-checked
+    gradient_commitment: str = ""  # H(gradient_norms + loss + data_hash)
+    data_hash: str = ""           # H(training_batch) for reproducibility
+    
+    # Gradient statistics for verification
+    gradient_norm: float = 0.0    # L2 norm of gradients (sanity check)
     
     # Signature
     signature: str = ""
@@ -171,14 +192,49 @@ class PoNWProof:
         CRITICAL: All float fields must use consistent formatting to ensure
         the same payload is generated on sender and receiver.
         
-        NOTE: request_id is included in signature to prevent proof stealing.
+        NOTE: All fields that affect reward must be in the payload.
+        The epoch_id and gradient_commitment are included for chain integrity.
         """
         return (
             f"{self.node_id}:{self.proof_type}:{self.timestamp:.6f}:{self.nonce}:"
             f"{float(self.uptime_seconds):.1f}:{self.tokens_processed}:{self.training_batches}:"
             f"{self.data_samples}:{self.request_id if self.request_id else ''}:"
-            f"{self.model_hash}:{self.layers_held}"
+            f"{self.model_hash}:{self.layers_held}:"
+            f"{self.epoch_id}:{self.model_hash_start}:{self.model_hash_end}:"
+            f"{self.gradient_commitment}"
         )
+    
+    def verify_training_work(self) -> Tuple[bool, str]:
+        """
+        Verify that the proof shows evidence of actual training work.
+        
+        For training proofs, we require:
+        1. model_hash_start != model_hash_end (weights changed)
+        2. gradient_commitment is present (can be spot-checked)
+        3. current_loss is valid (training computed loss)
+        
+        Returns:
+            (is_valid, error_message)
+        """
+        if self.proof_type != "training":
+            return True, "Not a training proof"
+        
+        if self.training_batches <= 0:
+            return True, "No training batches claimed"
+        
+        # Check 1: Weights must have changed
+        if self.model_hash_start and self.model_hash_end:
+            if self.model_hash_start == self.model_hash_end:
+                return False, "Model weights unchanged (no actual training)"
+        
+        # Check 2: Must have gradient commitment OR loss
+        has_commitment = bool(self.gradient_commitment)
+        has_loss = self.current_loss is not None and self.current_loss > 0
+        
+        if not has_commitment and not has_loss:
+            return False, "No gradient commitment or loss (cannot verify work)"
+        
+        return True, "Training work verified"
     
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -479,6 +535,78 @@ class NEUROLedger:
                         status TEXT DEFAULT 'pending',
                         slash_amount REAL DEFAULT 0.0,
                         created_at REAL NOT NULL
+                    )
+                """)
+                
+                # =========================================================
+                # CHAINED EPOCHS (Blockchain-like Epoch Chain)
+                # =========================================================
+                # Each epoch is cryptographically linked to the previous:
+                # - prev_epoch_hash: Creates immutable chain
+                # - model_state_hash: Tracks training progression
+                # - proofs_merkle_root: Efficiently prove proof inclusion
+                # - gradient_commitments_root: Enable spot-check verification
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS epochs (
+                        epoch_id INTEGER PRIMARY KEY,
+                        prev_epoch_hash TEXT NOT NULL,
+                        timestamp_start REAL NOT NULL,
+                        timestamp_end REAL NOT NULL,
+                        model_state_hash_start TEXT NOT NULL,
+                        model_state_hash_end TEXT NOT NULL,
+                        proofs_merkle_root TEXT NOT NULL,
+                        proof_count INTEGER DEFAULT 0,
+                        total_reward REAL DEFAULT 0.0,
+                        total_batches INTEGER DEFAULT 0,
+                        average_loss REAL DEFAULT 0.0,
+                        gradient_commitments_root TEXT DEFAULT '',
+                        proposer_node_id TEXT NOT NULL,
+                        proposer_signature TEXT NOT NULL,
+                        epoch_hash TEXT NOT NULL UNIQUE,
+                        finalized BOOLEAN DEFAULT 0,
+                        created_at REAL DEFAULT 0.0
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_epoch_hash ON epochs(epoch_hash)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_epoch_finalized ON epochs(finalized)")
+                
+                # Gradient commitments for spot-check verification
+                # These can be challenged and re-verified for economic security
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS gradient_commitments (
+                        commitment_hash TEXT PRIMARY KEY,
+                        proof_signature TEXT NOT NULL,
+                        node_id TEXT NOT NULL,
+                        epoch_id INTEGER NOT NULL,
+                        model_hash_start TEXT NOT NULL,
+                        model_hash_end TEXT NOT NULL,
+                        data_hash TEXT NOT NULL,
+                        gradient_norms TEXT NOT NULL,
+                        final_loss REAL NOT NULL,
+                        batch_size INTEGER DEFAULT 0,
+                        sequence_length INTEGER DEFAULT 0,
+                        created_at REAL DEFAULT 0.0,
+                        spot_checked BOOLEAN DEFAULT 0,
+                        spot_check_result TEXT DEFAULT NULL,
+                        FOREIGN KEY (epoch_id) REFERENCES epochs(epoch_id)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_gc_proof ON gradient_commitments(proof_signature)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_gc_epoch ON gradient_commitments(epoch_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_gc_node ON gradient_commitments(node_id)")
+                
+                # Spot-check challenges for economic security
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS spot_check_challenges (
+                        challenge_id TEXT PRIMARY KEY,
+                        commitment_hash TEXT NOT NULL,
+                        challenger_id TEXT NOT NULL,
+                        challenger_stake REAL DEFAULT 0.0,
+                        challenged_at REAL NOT NULL,
+                        status TEXT DEFAULT 'pending',
+                        result TEXT DEFAULT NULL,
+                        resolved_at REAL DEFAULT NULL,
+                        FOREIGN KEY (commitment_hash) REFERENCES gradient_commitments(commitment_hash)
                     )
                 """)
     
@@ -820,25 +948,37 @@ class NEUROLedger:
         # =================================================================
         # CRITICAL: Training proof must show ACTUAL work was done
         # =================================================================
-        # A training proof claiming batches but showing no evidence of actual work
-        # is likely a fake/placeholder that just increments counters without training.
+        # Use the new verify_training_work() method on PoNWProof which checks:
+        # 1. model_hash_start != model_hash_end (weights actually changed)
+        # 2. gradient_commitment is present (can be spot-checked)
+        # 3. current_loss is valid (training computed loss)
         #
-        # Valid training requires at least one of:
-        # 1. tokens_processed > 0 (processed actual data)
-        # 2. current_loss is a valid number (computed actual loss)
-        #
-        # A proof with training_batches > 0 but BOTH tokens_processed=0 AND no loss
-        # indicates the node is just running a placeholder loop.
+        # This replaces the old simple check and enables gradient spot-checking.
         if proof.proof_type == "training" and proof.training_batches > 0:
-            has_tokens = proof.tokens_processed > 0
-            has_loss = proof.current_loss is not None and proof.current_loss > 0
-            
-            if not has_tokens and not has_loss:
+            is_valid, error_msg = proof.verify_training_work()
+            if not is_valid:
                 logger.warning(
                     f"FAKE TRAINING DETECTED: {proof.node_id[:16]}... claimed {proof.training_batches} batches "
-                    f"but tokens_processed=0 and loss=None - no actual work done!"
+                    f"but failed verification: {error_msg}"
                 )
-                return False, "Training proof rejected: no evidence of actual work (tokens=0, loss=None)"
+                return False, f"Training proof rejected: {error_msg}"
+        
+        # =================================================================
+        # EPOCH BINDING: Proof must belong to current or recent epoch
+        # =================================================================
+        # This prevents "epoch hopping" where nodes submit proofs to whichever
+        # epoch gives them the best reward or to avoid detection.
+        if proof.epoch_id > 0:  # 0 = legacy proof (no epoch binding)
+            current_epoch = int(time.time() / 60)  # 60-second epochs
+            epoch_diff = abs(current_epoch - proof.epoch_id)
+            
+            # Allow proofs from current epoch or 1 epoch back (grace period)
+            if epoch_diff > 1:
+                logger.warning(
+                    f"EPOCH MISMATCH: {proof.node_id[:16]}... submitted proof for epoch {proof.epoch_id} "
+                    f"but current epoch is {current_epoch}"
+                )
+                return False, f"Proof epoch {proof.epoch_id} too far from current epoch {current_epoch}"
         
         return True, ""
     

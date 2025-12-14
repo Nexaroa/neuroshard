@@ -93,6 +93,20 @@ service NeuroShardService {
     
     // Update peer capacity (TCP fallback for UDP heartbeat)
     rpc UpdatePeerCapacity (UpdatePeerCapacityRequest) returns (UpdatePeerCapacityResponse);
+    
+    // --- Chained Epoch System RPCs ---
+    
+    // Announce a finalized epoch to peers
+    rpc AnnounceEpoch (EpochAnnouncementRequest) returns (EpochAnnouncementResponse);
+    
+    // Request a specific epoch from peer
+    rpc GetEpoch (EpochRequest) returns (EpochResponse);
+    
+    // Get latest finalized epoch ID
+    rpc GetLatestEpoch (Empty) returns (LatestEpochResponse);
+    
+    // Submit spot-check challenge for gradient commitment
+    rpc SpotCheckChallenge (SpotCheckChallengeRequest) returns (SpotCheckChallengeResponse);
 }
 
 message InferenceRequest {
@@ -743,4 +757,90 @@ message WeightedGradientContribution {
     map<string, bytes> gradients = 6;
     string quorum_id = 7;
     string signature = 8;
+}
+
+// =============================================================================
+// CHAINED EPOCH SYSTEM - Blockchain-like Epoch Chain
+// =============================================================================
+
+// Epoch announcement - gossiped when an epoch is finalized
+message EpochAnnouncementRequest {
+    int64 epoch_id = 1;
+    string epoch_hash = 2;
+    string prev_epoch_hash = 3;
+    string proposer_node_id = 4;
+    string proposer_signature = 5;
+    int32 proof_count = 6;
+    double total_reward = 7;
+    double timestamp_start = 8;
+    double timestamp_end = 9;
+    string model_state_hash_start = 10;
+    string model_state_hash_end = 11;
+    string proofs_merkle_root = 12;
+    string gradient_commitments_root = 13;
+}
+
+message EpochAnnouncementResponse {
+    bool accepted = 1;
+    string reason = 2;
+}
+
+// Request a specific epoch from a peer
+message EpochRequest {
+    int64 epoch_id = 1;
+}
+
+message EpochResponse {
+    bool found = 1;
+    int64 epoch_id = 2;
+    string epoch_hash = 3;
+    string prev_epoch_hash = 4;
+    double timestamp_start = 5;
+    double timestamp_end = 6;
+    string model_state_hash_start = 7;
+    string model_state_hash_end = 8;
+    string proofs_merkle_root = 9;
+    int32 proof_count = 10;
+    double total_reward = 11;
+    int32 total_batches = 12;
+    double average_loss = 13;
+    string gradient_commitments_root = 14;
+    string proposer_node_id = 15;
+    string proposer_signature = 16;
+}
+
+// Get latest finalized epoch
+message Empty {}
+
+message LatestEpochResponse {
+    int64 epoch_id = 1;
+    string epoch_hash = 2;
+}
+
+// Gradient commitment for spot-check verification
+message GradientCommitmentMessage {
+    string commitment_hash = 1;
+    string model_hash_start = 2;
+    string model_hash_end = 3;
+    string data_hash = 4;
+    repeated double gradient_norms = 5;
+    string gradient_hash = 6;
+    double final_loss = 7;
+    int32 batch_size = 8;
+    int32 sequence_length = 9;
+}
+
+// Spot-check challenge for gradient verification
+message SpotCheckChallengeRequest {
+    string commitment_hash = 1;
+    string challenger_id = 2;
+    double challenger_stake = 3;
+    double timestamp = 4;
+    string signature = 5;
+}
+
+message SpotCheckChallengeResponse {
+    bool accepted = 1;
+    string challenge_id = 2;
+    string reason = 3;
 }

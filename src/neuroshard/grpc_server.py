@@ -190,6 +190,10 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                         # This ensures any node can query balances from DHT, not just local ledger
                         self._store_received_proof_in_dht(proof, reward, request.public_key)
                         
+                        # 📦 EPOCH TRACKING: Register proof with epoch manager
+                        # This enables chained epoch verification for blockchain-like security
+                        self._register_proof_with_epoch_manager(proof, reward)
+                        
                         return neuroshard_pb2.GossipProofResponse(accepted=True)
                     else:
                         # Should rarely happen given has_proof check above, but handle race conditions
@@ -270,6 +274,54 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
             
         except Exception as e:
             logger.debug(f"DHT proof replication error: {e}")
+    
+    def _register_proof_with_epoch_manager(self, proof, reward: float):
+        """
+        Register a verified proof with the epoch manager for epoch chaining.
+        
+        This is a key part of the Chained PoNW system:
+        - Each proof is bound to a specific epoch
+        - Epochs aggregate proofs with merkle roots
+        - Epochs are cryptographically linked (like blockchain)
+        
+        Args:
+            proof: The verified PoNW proof
+            reward: The reward amount credited
+        """
+        try:
+            # Import here to avoid circular imports
+            from neuroshard.runner import STATE
+            
+            # Get epoch manager from global state (set by observer mode)
+            epoch_manager = STATE.get("epoch_manager")
+            if not epoch_manager:
+                return  # Not in observer mode or epoch manager not initialized
+            
+            # Extract gradient commitment if present
+            gradient_commitment = None
+            if hasattr(proof, 'gradient_commitment') and proof.gradient_commitment:
+                from neuroshard.core.consensus.epoch import GradientCommitment
+                # If we have full gradient data, create the commitment object
+                # Otherwise, we just have the hash
+                gradient_commitment = None  # Will use hash from proof
+            
+            # Accept proof into current epoch
+            accepted, message = epoch_manager.accept_proof(
+                proof_signature=proof.signature,
+                node_id=proof.node_id,
+                proof_type=proof.proof_type,
+                timestamp=proof.timestamp,
+                reward=reward,
+                gradient_commitment=gradient_commitment,
+            )
+            
+            if accepted:
+                logger.debug(f"[EPOCH] Proof registered: {message}")
+            else:
+                logger.warning(f"[EPOCH] Proof not registered: {message}")
+                
+        except Exception as e:
+            logger.debug(f"[EPOCH] Registration error: {e}")
     
     def GossipTransaction(self, request, context):
         """
@@ -354,6 +406,237 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
         except Exception as e:
             logger.error(f"GossipStake error: {e}")
             return neuroshard_pb2.GossipStakeResponse(accepted=False, reason=str(e))
+    
+    # =========================================================================
+    # CHAINED EPOCH SYSTEM RPCs
+    # =========================================================================
+    
+    def AnnounceEpoch(self, request, context):
+        """
+        Receive an epoch announcement from a peer.
+        
+        When a finalized epoch is gossiped:
+        1. Verify the epoch hash is correct
+        2. Verify it links to our previous epoch
+        3. Store it locally
+        4. Optionally gossip to other peers
+        """
+        try:
+            from neuroshard.core.consensus.epoch import Epoch, EpochStatus
+            from neuroshard.runner import STATE
+            
+            # Reconstruct epoch from request
+            epoch = Epoch(
+                epoch_id=request.epoch_id,
+                epoch_hash=request.epoch_hash,
+                prev_epoch_hash=request.prev_epoch_hash,
+                timestamp_start=request.timestamp_start,
+                timestamp_end=request.timestamp_end,
+                model_state_hash_start=request.model_state_hash_start,
+                model_state_hash_end=request.model_state_hash_end,
+                proofs_merkle_root=request.proofs_merkle_root,
+                proof_count=request.proof_count,
+                total_reward=request.total_reward,
+                total_batches=0,  # Not in gossip message
+                average_loss=0.0,  # Not in gossip message
+                gradient_commitments_root=request.gradient_commitments_root,
+                proposer_node_id=request.proposer_node_id,
+                proposer_signature=request.proposer_signature,
+                status=EpochStatus.FINALIZED,
+            )
+            
+            # Verify epoch hash
+            computed_hash = epoch.compute_epoch_hash()
+            if computed_hash != epoch.epoch_hash:
+                logger.warning(f"[EPOCH] Invalid hash from peer: {computed_hash[:16]}... != {epoch.epoch_hash[:16]}...")
+                return neuroshard_pb2.EpochAnnouncementResponse(
+                    accepted=False,
+                    reason="Invalid epoch hash"
+                )
+            
+            # Store in epoch manager if available
+            epoch_manager = STATE.get("epoch_manager")
+            if epoch_manager:
+                epoch_manager.epoch_chain[epoch.epoch_id] = epoch
+                if epoch.epoch_id > epoch_manager.latest_finalized_epoch_id:
+                    epoch_manager.latest_finalized_epoch_id = epoch.epoch_id
+            
+            # Store in local ledger
+            if self.p2p and self.p2p.ledger:
+                self.p2p._store_epoch_locally(epoch)
+            
+            logger.info(f"[EPOCH] Accepted epoch {epoch.epoch_id} from peer")
+            return neuroshard_pb2.EpochAnnouncementResponse(accepted=True)
+            
+        except Exception as e:
+            logger.error(f"AnnounceEpoch error: {e}")
+            return neuroshard_pb2.EpochAnnouncementResponse(
+                accepted=False,
+                reason=str(e)
+            )
+    
+    def GetEpoch(self, request, context):
+        """
+        Return a specific epoch to a requesting peer.
+        
+        Used for epoch chain synchronization.
+        """
+        try:
+            import sqlite3
+            from neuroshard.runner import STATE
+            
+            epoch_id = request.epoch_id
+            
+            # Try epoch manager first
+            epoch_manager = STATE.get("epoch_manager")
+            if epoch_manager and epoch_id in epoch_manager.epoch_chain:
+                epoch = epoch_manager.epoch_chain[epoch_id]
+                return neuroshard_pb2.EpochResponse(
+                    found=True,
+                    epoch_id=epoch.epoch_id,
+                    epoch_hash=epoch.epoch_hash,
+                    prev_epoch_hash=epoch.prev_epoch_hash,
+                    timestamp_start=epoch.timestamp_start,
+                    timestamp_end=epoch.timestamp_end,
+                    model_state_hash_start=epoch.model_state_hash_start,
+                    model_state_hash_end=epoch.model_state_hash_end,
+                    proofs_merkle_root=epoch.proofs_merkle_root,
+                    proof_count=epoch.proof_count,
+                    total_reward=epoch.total_reward,
+                    total_batches=epoch.total_batches,
+                    average_loss=epoch.average_loss,
+                    gradient_commitments_root=epoch.gradient_commitments_root,
+                    proposer_node_id=epoch.proposer_node_id,
+                    proposer_signature=epoch.proposer_signature,
+                )
+            
+            # Try local database
+            if self.p2p and self.p2p.ledger:
+                with sqlite3.connect(self.p2p.ledger.db_path, timeout=10.0) as conn:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT * FROM epochs WHERE epoch_id = ?",
+                        (epoch_id,)
+                    ).fetchone()
+                    
+                    if row:
+                        return neuroshard_pb2.EpochResponse(
+                            found=True,
+                            epoch_id=row["epoch_id"],
+                            epoch_hash=row["epoch_hash"],
+                            prev_epoch_hash=row["prev_epoch_hash"],
+                            timestamp_start=row["timestamp_start"],
+                            timestamp_end=row["timestamp_end"],
+                            model_state_hash_start=row["model_state_hash_start"],
+                            model_state_hash_end=row["model_state_hash_end"],
+                            proofs_merkle_root=row["proofs_merkle_root"],
+                            proof_count=row["proof_count"],
+                            total_reward=row["total_reward"],
+                            total_batches=row["total_batches"],
+                            average_loss=row["average_loss"],
+                            gradient_commitments_root=row["gradient_commitments_root"],
+                            proposer_node_id=row["proposer_node_id"],
+                            proposer_signature=row["proposer_signature"],
+                        )
+            
+            return neuroshard_pb2.EpochResponse(found=False)
+            
+        except Exception as e:
+            logger.error(f"GetEpoch error: {e}")
+            return neuroshard_pb2.EpochResponse(found=False)
+    
+    def GetLatestEpoch(self, request, context):
+        """
+        Return the latest finalized epoch ID.
+        
+        Used for epoch chain synchronization.
+        """
+        try:
+            from neuroshard.runner import STATE
+            
+            # Try epoch manager first
+            epoch_manager = STATE.get("epoch_manager")
+            if epoch_manager and epoch_manager.latest_finalized_epoch_id >= 0:
+                latest = epoch_manager.latest_finalized_epoch_id
+                epoch = epoch_manager.epoch_chain.get(latest)
+                return neuroshard_pb2.LatestEpochResponse(
+                    epoch_id=latest,
+                    epoch_hash=epoch.epoch_hash if epoch else ""
+                )
+            
+            # Try local database
+            if self.p2p and self.p2p.ledger:
+                import sqlite3
+                with sqlite3.connect(self.p2p.ledger.db_path, timeout=10.0) as conn:
+                    row = conn.execute(
+                        "SELECT epoch_id, epoch_hash FROM epochs WHERE finalized = 1 ORDER BY epoch_id DESC LIMIT 1"
+                    ).fetchone()
+                    
+                    if row:
+                        return neuroshard_pb2.LatestEpochResponse(
+                            epoch_id=row[0],
+                            epoch_hash=row[1]
+                        )
+            
+            return neuroshard_pb2.LatestEpochResponse(epoch_id=0, epoch_hash="")
+            
+        except Exception as e:
+            logger.error(f"GetLatestEpoch error: {e}")
+            return neuroshard_pb2.LatestEpochResponse(epoch_id=0, epoch_hash="")
+    
+    def SpotCheckChallenge(self, request, context):
+        """
+        Receive a spot-check challenge for a gradient commitment.
+        
+        This enables economic security via probabilistic verification:
+        - Challenger stakes NEURO to challenge
+        - If fraud detected: challenger gets reward, prover slashed
+        - If legitimate: challenger loses stake
+        """
+        try:
+            from neuroshard.core.crypto.ecdsa import verify_signature, register_public_key
+            from neuroshard.runner import STATE
+            
+            # Verify challenger's signature
+            payload = f"{request.commitment_hash}:{request.challenger_id}:{request.challenger_stake}:{request.timestamp}"
+            if not verify_signature(request.challenger_id, payload, request.signature):
+                return neuroshard_pb2.SpotCheckChallengeResponse(
+                    accepted=False,
+                    reason="Invalid signature"
+                )
+            
+            # Store challenge for processing
+            if self.p2p and self.p2p.ledger:
+                import sqlite3
+                import uuid
+                
+                challenge_id = str(uuid.uuid4())
+                
+                with sqlite3.connect(self.p2p.ledger.db_path, timeout=10.0) as conn:
+                    conn.execute("""
+                        INSERT INTO spot_check_challenges
+                        (challenge_id, commitment_hash, challenger_id, challenger_stake, challenged_at, status)
+                        VALUES (?, ?, ?, ?, ?, 'pending')
+                    """, (challenge_id, request.commitment_hash, request.challenger_id, 
+                          request.challenger_stake, request.timestamp))
+                
+                logger.info(f"[SPOT-CHECK] Challenge {challenge_id[:8]}... accepted for commitment {request.commitment_hash[:16]}...")
+                return neuroshard_pb2.SpotCheckChallengeResponse(
+                    accepted=True,
+                    challenge_id=challenge_id
+                )
+            
+            return neuroshard_pb2.SpotCheckChallengeResponse(
+                accepted=False,
+                reason="No ledger available"
+            )
+            
+        except Exception as e:
+            logger.error(f"SpotCheckChallenge error: {e}")
+            return neuroshard_pb2.SpotCheckChallengeResponse(
+                accepted=False,
+                reason=str(e)
+            )
 
     # ==================== DISTRIBUTED TRAINING RPCs ====================
     

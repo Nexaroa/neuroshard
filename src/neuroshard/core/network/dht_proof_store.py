@@ -526,3 +526,267 @@ class DHTProofStore:
             logger.error(f"Cross-validation error: {e}")
             return False, {"error": str(e)}
 
+
+# =============================================================================
+# DHT EPOCH STORE - Blockchain-like Epoch Chain Storage
+# =============================================================================
+
+class DHTEpochStore:
+    """
+    DHT-based storage for finalized epochs.
+    
+    This enables decentralized epoch chain verification:
+    - Any node can retrieve the epoch chain from DHT
+    - Epochs are cryptographically linked (prev_hash)
+    - Chain integrity can be verified without trusting any single node
+    
+    DHT Key Scheme:
+    - epoch:{epoch_id} -> Epoch JSON
+    - epoch_chain:latest -> Latest finalized epoch_id
+    - epoch_chain:genesis -> Genesis epoch hash
+    """
+    
+    def __init__(self, dht_protocol=None):
+        """Initialize DHT epoch store."""
+        self.dht = dht_protocol
+        self._epoch_cache: Dict[int, 'Epoch'] = {}
+    
+    def get_epoch_dht_key(self, epoch_id: int) -> int:
+        """Calculate DHT key for an epoch."""
+        key_str = f"epoch:{epoch_id}"
+        return int(hashlib.sha1(key_str.encode()).hexdigest(), 16)
+    
+    def get_latest_epoch_key(self) -> int:
+        """Get DHT key for latest epoch pointer."""
+        return int(hashlib.sha1(b"epoch_chain:latest").hexdigest(), 16)
+    
+    def get_genesis_key(self) -> int:
+        """Get DHT key for genesis epoch hash."""
+        return int(hashlib.sha1(b"epoch_chain:genesis").hexdigest(), 16)
+    
+    def store_epoch(self, epoch: 'Epoch', replication: int = 5) -> bool:
+        """
+        Store a finalized epoch in DHT.
+        
+        Epochs are immutable once finalized, so we use higher replication
+        for durability. This is similar to how blocks are stored in Bitcoin.
+        
+        Args:
+            epoch: The finalized epoch to store
+            replication: Number of nodes to replicate to (default: 5)
+            
+        Returns:
+            True if stored successfully
+        """
+        if not self.dht:
+            logger.warning("DHT not available - epoch not stored")
+            return False
+        
+        try:
+            # Store the epoch itself
+            epoch_key = self.get_epoch_dht_key(epoch.epoch_id)
+            epoch_json = epoch.to_json()
+            
+            # Find closest nodes
+            closest = self.dht.routing_table.find_closest(epoch_key, k=replication)
+            if not closest:
+                logger.warning(f"No nodes found to store epoch {epoch.epoch_id}")
+                return False
+            
+            # Store on all closest nodes
+            stored_count = 0
+            for node in closest:
+                try:
+                    success = self.dht.store_value_on_node(epoch_key, epoch_json, node)
+                    if success:
+                        stored_count += 1
+                except Exception as e:
+                    logger.debug(f"Failed to store epoch on {node}: {e}")
+            
+            # Update "latest" pointer
+            if stored_count > 0:
+                latest_key = self.get_latest_epoch_key()
+                self.dht.store_value(latest_key, str(epoch.epoch_id))
+                
+                # Cache locally
+                self._epoch_cache[epoch.epoch_id] = epoch
+                
+                logger.info(f"Epoch {epoch.epoch_id} stored on {stored_count}/{len(closest)} nodes")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Failed to store epoch {epoch.epoch_id}: {e}")
+            return False
+    
+    def get_epoch(self, epoch_id: int) -> Optional['Epoch']:
+        """
+        Retrieve an epoch from DHT.
+        
+        Args:
+            epoch_id: The epoch ID to retrieve
+            
+        Returns:
+            The Epoch if found, None otherwise
+        """
+        # Check cache first
+        if epoch_id in self._epoch_cache:
+            return self._epoch_cache[epoch_id]
+        
+        if not self.dht:
+            return None
+        
+        try:
+            epoch_key = self.get_epoch_dht_key(epoch_id)
+            epoch_json = self.dht.lookup_value(epoch_key)
+            
+            if not epoch_json:
+                return None
+            
+            # Import here to avoid circular imports
+            from neuroshard.core.consensus.epoch import Epoch
+            epoch = Epoch.from_json(epoch_json)
+            
+            # Cache it
+            self._epoch_cache[epoch_id] = epoch
+            
+            return epoch
+            
+        except Exception as e:
+            logger.error(f"Failed to get epoch {epoch_id}: {e}")
+            return None
+    
+    def get_latest_epoch_id(self) -> Optional[int]:
+        """Get the ID of the latest finalized epoch from DHT."""
+        if not self.dht:
+            return None
+        
+        try:
+            latest_key = self.get_latest_epoch_key()
+            value = self.dht.lookup_value(latest_key)
+            
+            if value:
+                return int(value)
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to get latest epoch ID: {e}")
+            return None
+    
+    def get_epoch_chain(
+        self,
+        start_id: int,
+        end_id: int,
+        verify: bool = True
+    ) -> Tuple[List['Epoch'], bool, str]:
+        """
+        Retrieve a range of epochs and optionally verify chain integrity.
+        
+        Args:
+            start_id: Starting epoch ID (inclusive)
+            end_id: Ending epoch ID (inclusive)
+            verify: Whether to verify chain integrity
+            
+        Returns:
+            (epochs, is_valid, error_message)
+        """
+        epochs = []
+        
+        for epoch_id in range(start_id, end_id + 1):
+            epoch = self.get_epoch(epoch_id)
+            if epoch:
+                epochs.append(epoch)
+            else:
+                return epochs, False, f"Missing epoch {epoch_id}"
+        
+        if not verify or len(epochs) < 2:
+            return epochs, True, ""
+        
+        # Verify chain integrity
+        is_valid, error = self.verify_chain_integrity(epochs)
+        return epochs, is_valid, error
+    
+    def verify_chain_integrity(self, epochs: List['Epoch']) -> Tuple[bool, str]:
+        """
+        Verify that a list of epochs forms a valid chain.
+        
+        Checks:
+        1. Each epoch's prev_hash matches previous epoch's hash
+        2. Model state shows progression (end of prev = start of current)
+        3. Timestamps are sequential
+        4. Epoch hashes are correctly computed
+        
+        Args:
+            epochs: List of epochs in order
+            
+        Returns:
+            (is_valid, error_message)
+        """
+        if not epochs:
+            return True, ""
+        
+        # Import here to avoid circular imports
+        from neuroshard.core.consensus.epoch import GENESIS_EPOCH_HASH
+        
+        for i, epoch in enumerate(epochs):
+            # Verify epoch hash is correctly computed
+            computed_hash = epoch.compute_epoch_hash()
+            if computed_hash != epoch.epoch_hash:
+                return False, f"Epoch {epoch.epoch_id}: hash mismatch (computed={computed_hash[:16]}... != stored={epoch.epoch_hash[:16]}...)"
+            
+            if i == 0:
+                # First epoch - check genesis or skip
+                continue
+            
+            prev_epoch = epochs[i - 1]
+            
+            # Check prev_hash linkage
+            if epoch.prev_epoch_hash != prev_epoch.epoch_hash:
+                return False, f"Epoch {epoch.epoch_id}: prev_hash broken (expected {prev_epoch.epoch_hash[:16]}...)"
+            
+            # Check model state progression
+            if epoch.model_state_hash_start != prev_epoch.model_state_hash_end:
+                return False, f"Epoch {epoch.epoch_id}: model state discontinuity"
+            
+            # Check timestamp ordering
+            if epoch.timestamp_start < prev_epoch.timestamp_end:
+                return False, f"Epoch {epoch.epoch_id}: timestamps overlap"
+        
+        return True, ""
+    
+    def sync_epoch_chain(
+        self,
+        local_latest: int,
+        target_latest: Optional[int] = None
+    ) -> Tuple[int, int, str]:
+        """
+        Sync local epoch chain with network.
+        
+        Args:
+            local_latest: Latest epoch ID in local storage
+            target_latest: Target epoch ID (None = get from DHT)
+            
+        Returns:
+            (synced_count, new_latest, status_message)
+        """
+        # Get target from DHT if not provided
+        if target_latest is None:
+            target_latest = self.get_latest_epoch_id()
+            if target_latest is None:
+                return 0, local_latest, "Could not determine latest epoch from network"
+        
+        if target_latest <= local_latest:
+            return 0, local_latest, "Already up to date"
+        
+        # Fetch missing epochs
+        synced = 0
+        for epoch_id in range(local_latest + 1, target_latest + 1):
+            epoch = self.get_epoch(epoch_id)
+            if epoch:
+                synced += 1
+            else:
+                return synced, local_latest + synced, f"Failed to sync epoch {epoch_id}"
+        
+        return synced, target_latest, f"Synced {synced} epochs"
+

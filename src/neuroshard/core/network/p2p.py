@@ -1291,3 +1291,256 @@ class P2PManager:
             if info.get("shard_range") == self.shard_range:
                 candidates.append(url)
         return candidates
+    
+    # =========================================================================
+    # EPOCH CHAIN GOSSIPING
+    # =========================================================================
+    
+    def gossip_epoch(self, epoch: 'Epoch'):
+        """
+        Gossip a finalized epoch to peers.
+        
+        Epochs are gossiped with higher priority than regular proofs because
+        they represent finalized state that all nodes should agree on.
+        
+        Args:
+            epoch: The finalized epoch to gossip
+        """
+        from protos import neuroshard_pb2
+        from protos import neuroshard_pb2_grpc
+        from neuroshard.core.network.connection_pool import get_channel
+        from urllib.parse import urlparse
+        
+        peers = list(self.known_peers.keys())
+        
+        if not peers:
+            logger.info(f"[EPOCH] No peers to gossip epoch {epoch.epoch_id}")
+            return
+        
+        # Higher fanout for epochs (important consensus data)
+        import math
+        fanout = min(int(math.sqrt(len(peers)) + 5), 50)
+        targets = random.sample(peers, min(len(peers), fanout))
+        
+        logger.info(f"[EPOCH] Gossiping epoch {epoch.epoch_id} to {len(targets)} peers")
+        
+        for target in targets:
+            threading.Thread(
+                target=self._send_epoch_to_peer,
+                args=(target, epoch),
+                daemon=True
+            ).start()
+    
+    def _send_epoch_to_peer(self, target_url: str, epoch: 'Epoch'):
+        """Send epoch announcement to a peer."""
+        from protos import neuroshard_pb2
+        from protos import neuroshard_pb2_grpc
+        from neuroshard.core.network.connection_pool import get_channel
+        from urllib.parse import urlparse
+        
+        try:
+            parsed = urlparse(target_url)
+            ip = parsed.hostname
+            port = (parsed.port or 80) + 1000  # gRPC port
+            
+            channel = get_channel(f"{ip}:{port}")
+            stub = neuroshard_pb2_grpc.NeuroShardServiceStub(channel)
+            
+            req = neuroshard_pb2.EpochAnnouncementRequest(
+                epoch_id=epoch.epoch_id,
+                epoch_hash=epoch.epoch_hash,
+                prev_epoch_hash=epoch.prev_epoch_hash,
+                proposer_node_id=epoch.proposer_node_id,
+                proposer_signature=epoch.proposer_signature,
+                proof_count=epoch.proof_count,
+                total_reward=epoch.total_reward,
+                timestamp_start=epoch.timestamp_start,
+                timestamp_end=epoch.timestamp_end,
+                model_state_hash_start=epoch.model_state_hash_start,
+                model_state_hash_end=epoch.model_state_hash_end,
+                proofs_merkle_root=epoch.proofs_merkle_root,
+                gradient_commitments_root=epoch.gradient_commitments_root,
+            )
+            
+            stub.AnnounceEpoch(req, timeout=5.0)
+            logger.debug(f"[EPOCH] Sent epoch {epoch.epoch_id} to {target_url}")
+            
+        except Exception as e:
+            logger.debug(f"[EPOCH] Failed to send to {target_url}: {e}")
+    
+    def request_epoch_from_peer(self, peer_url: str, epoch_id: int) -> Optional['Epoch']:
+        """
+        Request a specific epoch from a peer.
+        
+        Used for syncing missing epochs when joining the network.
+        
+        Args:
+            peer_url: Peer to request from
+            epoch_id: Epoch ID to request
+            
+        Returns:
+            The Epoch if successful, None otherwise
+        """
+        from protos import neuroshard_pb2
+        from protos import neuroshard_pb2_grpc
+        from neuroshard.core.network.connection_pool import get_channel
+        from urllib.parse import urlparse
+        
+        try:
+            parsed = urlparse(peer_url)
+            ip = parsed.hostname
+            port = (parsed.port or 80) + 1000
+            
+            channel = get_channel(f"{ip}:{port}")
+            stub = neuroshard_pb2_grpc.NeuroShardServiceStub(channel)
+            
+            req = neuroshard_pb2.EpochRequest(epoch_id=epoch_id)
+            resp = stub.GetEpoch(req, timeout=10.0)
+            
+            if resp.found:
+                from neuroshard.core.consensus.epoch import Epoch
+                epoch = Epoch(
+                    epoch_id=resp.epoch_id,
+                    epoch_hash=resp.epoch_hash,
+                    prev_epoch_hash=resp.prev_epoch_hash,
+                    timestamp_start=resp.timestamp_start,
+                    timestamp_end=resp.timestamp_end,
+                    model_state_hash_start=resp.model_state_hash_start,
+                    model_state_hash_end=resp.model_state_hash_end,
+                    proofs_merkle_root=resp.proofs_merkle_root,
+                    proof_count=resp.proof_count,
+                    total_reward=resp.total_reward,
+                    total_batches=resp.total_batches,
+                    average_loss=resp.average_loss,
+                    gradient_commitments_root=resp.gradient_commitments_root,
+                    proposer_node_id=resp.proposer_node_id,
+                    proposer_signature=resp.proposer_signature,
+                )
+                
+                # Verify epoch hash
+                if epoch.compute_epoch_hash() == epoch.epoch_hash:
+                    return epoch
+                else:
+                    logger.warning(f"[EPOCH] Invalid epoch hash from {peer_url}")
+                    
+            return None
+            
+        except Exception as e:
+            logger.debug(f"[EPOCH] Failed to get epoch {epoch_id} from {peer_url}: {e}")
+            return None
+    
+    def sync_epoch_chain(self, target_epoch_id: Optional[int] = None) -> Tuple[int, str]:
+        """
+        Sync epoch chain from peers.
+        
+        Args:
+            target_epoch_id: Target epoch to sync to (None = get latest from peers)
+            
+        Returns:
+            (synced_count, status_message)
+        """
+        if not self.ledger:
+            return 0, "No ledger available"
+        
+        # Get our latest epoch
+        local_latest = self._get_local_latest_epoch()
+        
+        # Get target from peers if not specified
+        if target_epoch_id is None:
+            target_epoch_id = self._get_network_latest_epoch()
+            if target_epoch_id is None:
+                return 0, "Could not determine network latest epoch"
+        
+        if target_epoch_id <= local_latest:
+            return 0, "Already up to date"
+        
+        # Fetch missing epochs from peers
+        synced = 0
+        peers = list(self.known_peers.keys())
+        
+        for epoch_id in range(local_latest + 1, target_epoch_id + 1):
+            # Try each peer until we get the epoch
+            for peer in random.sample(peers, min(len(peers), 3)):
+                epoch = self.request_epoch_from_peer(peer, epoch_id)
+                if epoch:
+                    # Store in local ledger
+                    self._store_epoch_locally(epoch)
+                    synced += 1
+                    break
+            else:
+                return synced, f"Failed to sync epoch {epoch_id}"
+        
+        return synced, f"Synced {synced} epochs"
+    
+    def _get_local_latest_epoch(self) -> int:
+        """Get latest epoch ID from local ledger."""
+        if not self.ledger:
+            return -1
+        
+        try:
+            import sqlite3
+            with sqlite3.connect(self.ledger.db_path) as conn:
+                result = conn.execute(
+                    "SELECT MAX(epoch_id) FROM epochs WHERE finalized = 1"
+                ).fetchone()
+                return result[0] if result and result[0] else -1
+        except:
+            return -1
+    
+    def _get_network_latest_epoch(self) -> Optional[int]:
+        """Query peers for latest epoch ID."""
+        peers = list(self.known_peers.keys())[:5]  # Sample 5 peers
+        
+        latest_ids = []
+        for peer in peers:
+            try:
+                from protos import neuroshard_pb2
+                from protos import neuroshard_pb2_grpc
+                from neuroshard.core.network.connection_pool import get_channel
+                from urllib.parse import urlparse
+                
+                parsed = urlparse(peer)
+                channel = get_channel(f"{parsed.hostname}:{(parsed.port or 80) + 1000}")
+                stub = neuroshard_pb2_grpc.NeuroShardServiceStub(channel)
+                
+                resp = stub.GetLatestEpoch(neuroshard_pb2.Empty(), timeout=3.0)
+                if resp.epoch_id > 0:
+                    latest_ids.append(resp.epoch_id)
+            except:
+                pass
+        
+        if latest_ids:
+            # Return the most commonly reported latest epoch
+            from collections import Counter
+            return Counter(latest_ids).most_common(1)[0][0]
+        
+        return None
+    
+    def _store_epoch_locally(self, epoch: 'Epoch'):
+        """Store epoch in local ledger database."""
+        if not self.ledger:
+            return
+        
+        try:
+            import sqlite3
+            with sqlite3.connect(self.ledger.db_path) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO epochs 
+                    (epoch_id, prev_epoch_hash, timestamp_start, timestamp_end,
+                     model_state_hash_start, model_state_hash_end, proofs_merkle_root,
+                     proof_count, total_reward, total_batches, average_loss,
+                     gradient_commitments_root, proposer_node_id, proposer_signature,
+                     epoch_hash, finalized, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                """, (
+                    epoch.epoch_id, epoch.prev_epoch_hash,
+                    epoch.timestamp_start, epoch.timestamp_end,
+                    epoch.model_state_hash_start, epoch.model_state_hash_end,
+                    epoch.proofs_merkle_root, epoch.proof_count, epoch.total_reward,
+                    epoch.total_batches, epoch.average_loss,
+                    epoch.gradient_commitments_root, epoch.proposer_node_id,
+                    epoch.proposer_signature, epoch.epoch_hash, time.time()
+                ))
+                logger.info(f"[EPOCH] Stored epoch {epoch.epoch_id} locally")
+        except Exception as e:
+            logger.error(f"[EPOCH] Failed to store epoch {epoch.epoch_id}: {e}")

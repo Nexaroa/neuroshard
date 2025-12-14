@@ -3194,6 +3194,22 @@ def run_node(
         STATE["has_lm_head"] = False
         STATE["wallet_id"] = P2P.ledger.node_id if P2P and P2P.ledger else None
         
+        # =========================================================================
+        # EPOCH MANAGER: Track and verify the chained epoch system
+        # =========================================================================
+        from neuroshard.core.consensus.epoch import EpochManager
+        
+        # Initialize epoch manager for the observer
+        epoch_manager = EpochManager(
+            node_id=STATE["node_id"],
+            crypto=P2P.ledger.crypto if P2P and P2P.ledger else None,
+            dht=P2P.dht if P2P else None,
+            ledger=P2P.ledger if P2P else None,
+        )
+        epoch_manager.start()
+        STATE["epoch_manager"] = epoch_manager
+        logger.info("[OBSERVER] Epoch manager started - tracking chained PoNW epochs")
+        
         # Start the gRPC server for receiving proof broadcasts
         # Observer mode: pass None for NEURO_NODE since we don't have a model
         start_grpc_background(port, None, P2P, None)
@@ -3204,6 +3220,7 @@ def run_node(
         logger.info("[OBSERVER] NeuroShard Observer Ready!")
         logger.info(f"   Dashboard: http://localhost:{port}/")
         logger.info(f"   Ledger API: http://localhost:{port}/api/ledger/")
+        logger.info(f"   Epoch Chain: Tracking at 60-second intervals")
         logger.info("=" * 50)
 
         # Start the HTTP server
@@ -3223,6 +3240,10 @@ def run_node(
                         proc = psutil.Process()
                         STATE["memory_mb"] = proc.memory_info().rss / (1024 * 1024)
                         STATE["system_cpu"] = psutil.cpu_percent()
+                        
+                        # Also update epoch stats
+                        if "epoch_manager" in STATE:
+                            STATE["epoch_info"] = STATE["epoch_manager"].get_current_epoch_info()
                     except:
                         pass
                     await asyncio_lib.sleep(30)
@@ -3240,8 +3261,39 @@ def run_node(
                         logger.debug(f"[OBSERVER] Announce error: {e}")
                     await asyncio_lib.sleep(30)  # Announce every 30 seconds
             
+            # Start background task for epoch chain verification
+            async def epoch_verification_loop():
+                """Periodically verify epoch chain integrity and sync from network."""
+                while True:
+                    try:
+                        if "epoch_manager" in STATE:
+                            em = STATE["epoch_manager"]
+                            
+                            # Get latest finalized epoch
+                            info = em.get_current_epoch_info()
+                            logger.info(
+                                f"[EPOCH] Current: #{info['epoch_id']}, "
+                                f"proofs: {info['proof_count']}, "
+                                f"finalized: {info['latest_finalized']}, "
+                                f"chain length: {info['chain_length']}"
+                            )
+                            
+                            # Verify recent epoch chain (last 10 epochs)
+                            if info['latest_finalized'] > 0:
+                                start_id = max(0, info['latest_finalized'] - 10)
+                                is_valid, error = em.verify_epoch_chain(start_id, info['latest_finalized'])
+                                if is_valid:
+                                    logger.info(f"[EPOCH] Chain verified: epochs {start_id}-{info['latest_finalized']} ✓")
+                                else:
+                                    logger.warning(f"[EPOCH] Chain verification FAILED: {error}")
+                    except Exception as e:
+                        logger.error(f"[EPOCH] Verification error: {e}")
+                    
+                    await asyncio_lib.sleep(120)  # Check every 2 minutes
+            
             asyncio_lib.create_task(update_stats())
             asyncio_lib.create_task(announce_loop())
+            asyncio_lib.create_task(epoch_verification_loop())
             await server.serve()
         
         asyncio_lib.run(run_observer())

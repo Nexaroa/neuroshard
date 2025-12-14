@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from protos import neuroshard_pb2 as neuroshard__pb2
+import neuroshard_pb2 as neuroshard__pb2
 
 GRPC_GENERATED_VERSION = '1.76.0'
 GRPC_VERSION = grpc.__version__
@@ -174,6 +174,26 @@ class NeuroShardServiceStub(object):
                 '/neuroshard.NeuroShardService/UpdatePeerCapacity',
                 request_serializer=neuroshard__pb2.UpdatePeerCapacityRequest.SerializeToString,
                 response_deserializer=neuroshard__pb2.UpdatePeerCapacityResponse.FromString,
+                _registered_method=True)
+        self.AnnounceEpoch = channel.unary_unary(
+                '/neuroshard.NeuroShardService/AnnounceEpoch',
+                request_serializer=neuroshard__pb2.EpochAnnouncementRequest.SerializeToString,
+                response_deserializer=neuroshard__pb2.EpochAnnouncementResponse.FromString,
+                _registered_method=True)
+        self.GetEpoch = channel.unary_unary(
+                '/neuroshard.NeuroShardService/GetEpoch',
+                request_serializer=neuroshard__pb2.EpochRequest.SerializeToString,
+                response_deserializer=neuroshard__pb2.EpochResponse.FromString,
+                _registered_method=True)
+        self.GetLatestEpoch = channel.unary_unary(
+                '/neuroshard.NeuroShardService/GetLatestEpoch',
+                request_serializer=neuroshard__pb2.Empty.SerializeToString,
+                response_deserializer=neuroshard__pb2.LatestEpochResponse.FromString,
+                _registered_method=True)
+        self.SpotCheckChallenge = channel.unary_unary(
+                '/neuroshard.NeuroShardService/SpotCheckChallenge',
+                request_serializer=neuroshard__pb2.SpotCheckChallengeRequest.SerializeToString,
+                response_deserializer=neuroshard__pb2.SpotCheckChallengeResponse.FromString,
                 _registered_method=True)
 
 
@@ -386,6 +406,36 @@ class NeuroShardServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def AnnounceEpoch(self, request, context):
+        """--- Chained Epoch System RPCs ---
+
+        Announce a finalized epoch to peers
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetEpoch(self, request, context):
+        """Request a specific epoch from peer
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetLatestEpoch(self, request, context):
+        """Get latest finalized epoch ID
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SpotCheckChallenge(self, request, context):
+        """Submit spot-check challenge for gradient commitment
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_NeuroShardServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -528,6 +578,26 @@ def add_NeuroShardServiceServicer_to_server(servicer, server):
                     servicer.UpdatePeerCapacity,
                     request_deserializer=neuroshard__pb2.UpdatePeerCapacityRequest.FromString,
                     response_serializer=neuroshard__pb2.UpdatePeerCapacityResponse.SerializeToString,
+            ),
+            'AnnounceEpoch': grpc.unary_unary_rpc_method_handler(
+                    servicer.AnnounceEpoch,
+                    request_deserializer=neuroshard__pb2.EpochAnnouncementRequest.FromString,
+                    response_serializer=neuroshard__pb2.EpochAnnouncementResponse.SerializeToString,
+            ),
+            'GetEpoch': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetEpoch,
+                    request_deserializer=neuroshard__pb2.EpochRequest.FromString,
+                    response_serializer=neuroshard__pb2.EpochResponse.SerializeToString,
+            ),
+            'GetLatestEpoch': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetLatestEpoch,
+                    request_deserializer=neuroshard__pb2.Empty.FromString,
+                    response_serializer=neuroshard__pb2.LatestEpochResponse.SerializeToString,
+            ),
+            'SpotCheckChallenge': grpc.unary_unary_rpc_method_handler(
+                    servicer.SpotCheckChallenge,
+                    request_deserializer=neuroshard__pb2.SpotCheckChallengeRequest.FromString,
+                    response_serializer=neuroshard__pb2.SpotCheckChallengeResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1287,6 +1357,114 @@ class NeuroShardService(object):
             '/neuroshard.NeuroShardService/UpdatePeerCapacity',
             neuroshard__pb2.UpdatePeerCapacityRequest.SerializeToString,
             neuroshard__pb2.UpdatePeerCapacityResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AnnounceEpoch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neuroshard.NeuroShardService/AnnounceEpoch',
+            neuroshard__pb2.EpochAnnouncementRequest.SerializeToString,
+            neuroshard__pb2.EpochAnnouncementResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetEpoch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neuroshard.NeuroShardService/GetEpoch',
+            neuroshard__pb2.EpochRequest.SerializeToString,
+            neuroshard__pb2.EpochResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetLatestEpoch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neuroshard.NeuroShardService/GetLatestEpoch',
+            neuroshard__pb2.Empty.SerializeToString,
+            neuroshard__pb2.LatestEpochResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SpotCheckChallenge(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neuroshard.NeuroShardService/SpotCheckChallenge',
+            neuroshard__pb2.SpotCheckChallengeRequest.SerializeToString,
+            neuroshard__pb2.SpotCheckChallengeResponse.FromString,
             options,
             channel_credentials,
             insecure,
