@@ -627,9 +627,10 @@ class EpochManager:
         return None
     
     def _epoch_dht_key(self, epoch_id: int) -> int:
-        """Compute DHT key for an epoch."""
+        """Compute DHT key for an epoch (160-bit for Kademlia compatibility)."""
         key_str = f"epoch:{epoch_id}"
-        return int(hashlib.sha256(key_str.encode()).hexdigest(), 16)
+        # Use SHA-1 for 160-bit key (Kademlia standard)
+        return int(hashlib.sha1(key_str.encode()).hexdigest(), 16)
     
     def _store_epoch_in_dht(self, epoch: Epoch) -> bool:
         """Store finalized epoch in DHT."""

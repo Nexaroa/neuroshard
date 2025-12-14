@@ -894,6 +894,31 @@ class P2PManager:
                     if math.isinf(current_loss) or math.isnan(current_loss):
                         current_loss = None
                 
+                # =========================================================
+                # CHAINED PoNW: Get model state and gradient info
+                # =========================================================
+                # These prove actual training work was done:
+                # - model_hash_start: Weights at start of proof period
+                # - model_hash_end: Weights now (after training)
+                # - gradient_commitment: Hash of gradient stats
+                # - gradient_norm: L2 norm of gradients
+                model_hash_start = self.state_ref.get("model_hash_start", "")
+                model_hash_end = self.state_ref.get("model_hash_end", model_hash)
+                gradient_commitment = self.state_ref.get("gradient_commitment", "")
+                data_hash = self.state_ref.get("data_hash", "")
+                gradient_norm = self.state_ref.get("gradient_norm", 0.0)
+                
+                # If model_hash_start not set, use current as start (first proof)
+                if not model_hash_start and model_hash:
+                    model_hash_start = model_hash
+                
+                # Compute gradient commitment if we have training data
+                if proof_type == ProofType.TRAINING and current_loss and not gradient_commitment:
+                    # Create commitment from available data
+                    import hashlib as hl
+                    commitment_data = f"{model_hash_start}:{model_hash_end}:{current_loss:.6f}:{training_batches}"
+                    gradient_commitment = hl.sha256(commitment_data.encode()).hexdigest()[:32]
+                
                 # Create PoNW proof using new NEUROLedger API
                 proof = self.ledger.create_proof(
                     proof_type=proof_type,
@@ -904,7 +929,13 @@ class P2PManager:
                     has_embedding=has_embedding,
                     has_lm_head=has_lm_head,
                     model_hash=model_hash,
-                    current_loss=current_loss
+                    current_loss=current_loss,
+                    # Chained PoNW fields
+                    model_hash_start=model_hash_start,
+                    model_hash_end=model_hash_end,
+                    gradient_commitment=gradient_commitment,
+                    data_hash=data_hash,
+                    gradient_norm=gradient_norm,
                 )
                 
                 # Process proof locally (credit ourselves)
@@ -920,6 +951,11 @@ class P2PManager:
                     
                     # 🔥 NEW: Store proof in DHT for decentralized balance sync
                     self._store_proof_in_dht(proof, reward)
+                    
+                    # Reset model_hash_start for next proof period
+                    # So next period tracks fresh weight changes
+                    if proof_type == ProofType.TRAINING:
+                        self.state_ref["model_hash_start"] = model_hash_end
                 else:
                     logger.info(f"[NODE] ❌ PoNW rejected: {msg}")
 

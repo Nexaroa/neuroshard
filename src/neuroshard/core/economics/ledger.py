@@ -709,7 +709,13 @@ class NEUROLedger:
         layers_held: int = 0,
         has_embedding: bool = False,
         has_lm_head: bool = False,
-        current_loss: Optional[float] = None
+        current_loss: Optional[float] = None,
+        # NEW: Chained PoNW fields
+        model_hash_start: str = "",
+        model_hash_end: str = "",
+        gradient_commitment: str = "",
+        data_hash: str = "",
+        gradient_norm: float = 0.0,
     ) -> PoNWProof:
         """
         Create a signed Proof of Neural Work.
@@ -717,6 +723,13 @@ class NEUROLedger:
         Rate Limiting Applied:
         - uptime_seconds capped at MAX_UPTIME_PER_PROOF
         - tokens_processed checked against rate limits
+        
+        Chained PoNW Fields (required for training proofs):
+        - model_hash_start: Hash of model weights BEFORE training
+        - model_hash_end: Hash of model weights AFTER training
+        - gradient_commitment: Hash of gradient statistics (spot-checkable)
+        - data_hash: Hash of training data (for reproducibility)
+        - gradient_norm: L2 norm of gradients (sanity check)
         """
         # Apply rate limits
         uptime_seconds = min(uptime_seconds, MAX_UPTIME_PER_PROOF)
@@ -724,7 +737,10 @@ class NEUROLedger:
         # Generate unique nonce
         nonce = hashlib.sha256(f"{time.time()}:{os.urandom(16).hex()}".encode()).hexdigest()[:16]
         
-        # CRITICAL: data_samples, model_hash, request_id match canonical_payload
+        # Compute epoch_id from current time (60-second epochs)
+        epoch_id = int(time.time() / 60)
+        
+        # CRITICAL: All fields must match canonical_payload for signature verification
         proof = PoNWProof(
             node_id=self.node_id,
             proof_type=proof_type.value,
@@ -738,7 +754,14 @@ class NEUROLedger:
             layers_held=layers_held,
             has_embedding=has_embedding,
             has_lm_head=has_lm_head,
-            current_loss=current_loss
+            current_loss=current_loss,
+            # Chained PoNW fields
+            epoch_id=epoch_id,
+            model_hash_start=model_hash_start,
+            model_hash_end=model_hash_end,
+            gradient_commitment=gradient_commitment,
+            data_hash=data_hash,
+            gradient_norm=gradient_norm,
         )
         
         # Sign the proof

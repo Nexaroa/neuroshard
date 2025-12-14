@@ -3923,9 +3923,18 @@ def run_node(
             last_tokens = current_tokens
             last_training_rounds = current_training
             
-            # Update model hash
+            # Update model hash for chained PoNW
             if NEURO_NODE.model and hasattr(NEURO_NODE, '_get_model_hash'):
-                STATE["model_hash"] = NEURO_NODE._get_model_hash()
+                current_hash = NEURO_NODE._get_model_hash()
+                
+                # Track model_hash_start at beginning of each proof period
+                # This proves weights changed during training
+                if "model_hash_start" not in STATE or not STATE.get("model_hash_start"):
+                    STATE["model_hash_start"] = current_hash
+                
+                # model_hash_end is always the current hash
+                STATE["model_hash"] = current_hash
+                STATE["model_hash_end"] = current_hash
             
             # =================================================================
             # HEARTBEAT (every 30 seconds)
