@@ -6,7 +6,7 @@ import hashlib
 import logging
 import os
 import sqlite3
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from enum import Enum
