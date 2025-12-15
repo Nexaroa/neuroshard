@@ -3656,6 +3656,16 @@ def run_node(
             genesis_loader=base_node.genesis_loader,
             dht_protocol=DHT_PROTOCOL,
         )
+        
+        # Set up callback for P2P to get fresh training stats
+        # This bypasses timing issues where STATE isn't updated yet
+        def get_fresh_training_stats():
+            if ASYNC_TRAINER:
+                return ASYNC_TRAINER.get_stats()
+            return None
+        
+        if P2P:
+            P2P.get_fresh_training_stats = get_fresh_training_stats
         logger.info("[ASYNC] AsyncTrainer initialized")
     
     # Initialize LayerGrowthManager for monitoring network growth
@@ -3881,6 +3891,15 @@ def run_node(
                                 genesis_loader=getattr(NEURO_NODE, 'genesis_loader', None),
                                 dht_protocol=DHT_PROTOCOL,
                             )
+                            
+                            # Set up callback for P2P to get fresh training stats
+                            if P2P and not P2P.get_fresh_training_stats:
+                                def _get_fresh_stats():
+                                    if ASYNC_TRAINER:
+                                        return ASYNC_TRAINER.get_stats()
+                                    return None
+                                P2P.get_fresh_training_stats = _get_fresh_stats
+                        
                         if not ASYNC_TRAINER.running:
                             logger.info("[ASYNC] Starting AsyncTrainer...")
                             ASYNC_TRAINER.start()

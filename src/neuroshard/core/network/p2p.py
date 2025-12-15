@@ -296,6 +296,10 @@ class P2PManager:
         # Reference to global state (injected by runner)
         self.state_ref = {}
         
+        # Callback to get fresh training stats (injected by runner)
+        # This bypasses the timing issue where state_ref isn't updated yet
+        self.get_fresh_training_stats = None
+        
         # --- DHT & Decentralization Init ---
         self.dht = None
         self.routing_table = None
@@ -887,6 +891,25 @@ class P2PManager:
                 has_lm_head = self.state_ref.get("has_lm_head", False)
                 model_hash = self.state_ref.get("model_hash", "")
                 current_loss = self.state_ref.get("current_loss", None)
+                
+                # =========================================================
+                # FRESH STATS: Get latest values directly from trainer
+                # =========================================================
+                # This bypasses the timing issue where state_ref isn't updated yet
+                if self.get_fresh_training_stats:
+                    try:
+                        fresh_stats = self.get_fresh_training_stats()
+                        if fresh_stats:
+                            # Use fresh values if available
+                            if fresh_stats.get("current_loss") is not None:
+                                current_loss = fresh_stats["current_loss"]
+                            if fresh_stats.get("model_hash_start"):
+                                self.state_ref["model_hash_start"] = fresh_stats["model_hash_start"]
+                            if fresh_stats.get("model_hash_end"):
+                                self.state_ref["model_hash_end"] = fresh_stats["model_hash_end"]
+                                model_hash = fresh_stats["model_hash_end"]
+                    except Exception as e:
+                        logger.debug(f"[PoNW] Failed to get fresh stats: {e}")
                 
                 # Sanitize loss (must be a valid float for storage)
                 if current_loss is not None:
