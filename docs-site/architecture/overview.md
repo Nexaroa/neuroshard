@@ -26,6 +26,11 @@ graph TB
         Ledger[NEURO Ledger] ~~~ PoNW[PoNW Verifier] ~~~ Market[Inference Market]
     end
 
+    subgraph Consensus ["Consensus Layer"]
+        direction LR
+        EpochMgr[Epoch Manager] ~~~ ChainedPoNW[Chained PoNW] ~~~ SpotCheck[Spot-Check Verifier]
+    end
+
     UI --> Core
     UI --> Net
     Core --> Eco
@@ -135,6 +140,49 @@ class NEUROLedger:
     db_path: str  # SQLite
     crypto: NodeCrypto  # ECDSA
     inference_market: InferenceMarket
+```
+
+### Epoch Manager
+
+Blockchain-like epoch chaining for PoNW integrity.
+
+**Key Features**:
+- 60-second epochs (Unix minute-based)
+- Cryptographic chaining (prev_epoch_hash)
+- Model state commitments (hash before/after training)
+- Stake-weighted proposer selection
+- DHT-based epoch storage
+
+```python
+class EpochManager:
+    epoch_duration: int = 60  # seconds
+    current_epoch_id: int     # int(time.time() / 60)
+    pending_proofs: Dict[int, List[PoNWProof]]
+    epoch_chain: Dict[int, Epoch]
+    
+    def accept_proof(self, proof: PoNWProof) -> bool
+    def finalize_epoch(self, epoch_id: int) -> Epoch
+    def verify_chain_integrity(self, start: int, end: int) -> bool
+```
+
+### Chained PoNW
+
+Ensures training work is cryptographically verifiable.
+
+**Key Features**:
+- Model hash tracking (start/end)
+- Gradient commitments (spot-checkable)
+- Epoch-bound proofs (prevents epoch-hopping)
+- Slashing for fake training
+
+```python
+@dataclass
+class PoNWProof:
+    # ... existing fields ...
+    epoch_id: int              # Which epoch
+    model_hash_start: str      # Weights before training
+    model_hash_end: str        # Weights after training
+    gradient_commitment: str   # Spot-checkable proof
 ```
 
 ## Data Flow

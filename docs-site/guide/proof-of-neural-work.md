@@ -51,6 +51,15 @@ class PoNWProof:
     has_lm_head: bool         # Is Validator?
     model_hash: str           # Hash of model state
     
+    # Chained PoNW (v0.2.34+)
+    epoch_id: int             # Unix minute (globally synchronized)
+    model_hash_start: str     # Weights BEFORE training (must differ from end)
+    model_hash_end: str       # Weights AFTER training (proves work done)
+    gradient_commitment: str  # Spot-checkable proof of gradient computation
+    data_hash: str            # Hash of training data used
+    gradient_norm: float      # L2 norm of gradients (sanity check)
+    current_loss: float       # Training loss (must be > 0)
+    
     # Marketplace (for inference)
     request_id: str           # Links to InferenceRequest
     
@@ -60,7 +69,7 @@ class PoNWProof:
 
 ### Canonical Payload
 
-The proof is signed over a deterministic string:
+The proof is signed over a deterministic string including all chained PoNW fields:
 
 ```python
 def canonical_payload(self) -> str:
@@ -68,9 +77,16 @@ def canonical_payload(self) -> str:
         f"{self.node_id}:{self.proof_type}:{self.timestamp:.6f}:{self.nonce}:"
         f"{self.uptime_seconds:.1f}:{self.tokens_processed}:{self.training_batches}:"
         f"{self.data_samples}:{self.request_id or ''}:"
-        f"{self.model_hash}:{self.layers_held}"
+        f"{self.model_hash}:{self.layers_held}:"
+        # Chained PoNW fields (v0.2.34+)
+        f"{self.epoch_id}:{self.model_hash_start}:{self.model_hash_end}:"
+        f"{self.gradient_commitment}"
     )
 ```
+
+::: warning Version Compatibility
+Proofs with mismatched `canonical_payload` formats will fail signature verification. Ensure all nodes are running v0.2.34+ for chained PoNW.
+:::
 
 ## Cryptographic Security
 
@@ -326,13 +342,140 @@ def calculate_reward(proof: PoNWProof) -> float:
     return base_reward * stake_multiplier * role_multiplier
 ```
 
+## Chained PoNW (Blockchain-like Integrity)
+
+NeuroShard implements **Chained Proof of Neural Work** - a blockchain-like structure that ensures cryptographic integrity across epochs.
+
+### Epoch Structure
+
+Epochs are analogous to blocks in a blockchain:
+
+```python
+@dataclass
+class Epoch:
+    epoch_id: int                    # Unix minute (globally synchronized)
+    prev_epoch_hash: str             # Chain integrity (like blockchain)
+    
+    # Model State Progression
+    model_state_hash_start: str      # Model weights at epoch start
+    model_state_hash_end: str        # Model weights at epoch end
+    
+    # Proof Aggregation
+    proofs_merkle_root: str          # All proofs in this epoch
+    gradient_commitments_root: str   # Spot-checkable gradient proofs
+    
+    # Rewards
+    total_reward: float              # NEURO minted this epoch
+    
+    # Finalization
+    proposer_node_id: str            # Proposer (stake-weighted selection)
+    proposer_signature: str          # Cryptographic signature
+    epoch_hash: str                  # Hash of this epoch
+```
+
+### Why Unix Minutes for Epochs?
+
+```python
+epoch_id = int(time.time() / 60)  # Current minute since 1970
+```
+
+**Benefits**:
+- **Globally Synchronized**: All nodes compute the same epoch ID from their clocks
+- **No Coordinator**: Decentralized consensus on "current epoch"
+- **Clock Skew Tolerance**: ±1 epoch accepted (handles network latency)
+- **Human-Readable**: Epoch 29430583 = December 15, 2025, ~8:43 PM UTC
+
+### Model State Commitments
+
+Every training proof must include model hash tracking:
+
+```python
+proof = create_proof(
+    proof_type=ProofType.TRAINING,
+    training_batches=60,
+    model_hash_start="abc123...",  # Weights BEFORE training
+    model_hash_end="def456...",    # Weights AFTER training
+    gradient_commitment="ghi789...", # Spot-checkable proof
+)
+```
+
+**Verification Rules**:
+1. `model_hash_start != model_hash_end` — Weights actually changed
+2. `gradient_commitment` present — Can be spot-checked
+3. `current_loss > 0` — Training computed actual loss
+
+### Gradient Commitments (Nonce Equivalent)
+
+In Proof of Work, the nonce proves computational effort. In Chained PoNW, the **gradient commitment** serves the same purpose:
+
+```python
+@dataclass
+class GradientCommitment:
+    model_hash: str      # Which model version
+    data_hash: str       # Which training data
+    gradient_norm: float # L2 norm of gradients
+    loss_value: float    # Training loss achieved
+    
+    def compute_hash(self) -> str:
+        """Deterministic hash for verification."""
+        payload = f"{self.model_hash}:{self.data_hash}:{self.gradient_norm:.6f}:{self.loss_value:.6f}"
+        return hashlib.sha256(payload.encode()).hexdigest()[:32]
+```
+
+**Spot-Check Verification**:
+1. Verifier requests the exact batch and model state
+2. Re-runs training step
+3. Compares gradient commitment hash
+4. Mismatch → Slash prover's stake
+
+### Epoch Chain Verification
+
+```python
+def verify_epoch_chain(start_id: int, end_id: int) -> bool:
+    """Verify integrity of the epoch chain."""
+    prev_epoch = None
+    
+    for epoch_id in range(start_id, end_id + 1):
+        epoch = get_epoch(epoch_id)
+        
+        # 1. Verify epoch hash is correctly computed
+        if epoch.compute_epoch_hash() != epoch.epoch_hash:
+            return False, "Hash mismatch"
+        
+        # 2. Verify chain link (like blockchain prev_hash)
+        if prev_epoch:
+            if epoch.prev_epoch_hash != prev_epoch.epoch_hash:
+                return False, "Chain broken"
+            # Model state must progress
+            if epoch.model_state_hash_start != prev_epoch.model_state_hash_end:
+                return False, "State discontinuity"
+        
+        # 3. Verify proposer signature
+        if not epoch.verify_signature(get_public_key(epoch.proposer_node_id)):
+            return False, "Invalid signature"
+        
+        prev_epoch = epoch
+    
+    return True, "Chain verified"
+```
+
+### Security Properties
+
+| Property | How Achieved |
+|----------|--------------|
+| Immutability | Each epoch hashes previous epoch (can't rewrite history) |
+| Training Proof | model_hash_start ≠ model_hash_end (weights changed) |
+| Spot-Checkable | Gradient commitments can be re-verified |
+| Byzantine Tolerance | Stake-weighted proposer selection |
+| Global Consensus | Unix-minute epochs (no coordinator) |
+
 ## Attack Prevention
 
 ### Freeloading
-Cannot earn rewards without running the model and computing real gradients.
+Cannot earn rewards without running the model and computing real gradients. **Model hash must change**.
 
 ### Inflation
-Token counts are cross-validated against actual computation time.
+Token counts are cross-validated against actual computation time. **Gradient commitments are spot-checked**.
 
 ### Sybil
 Staking requirement (100 NEURO for Validators) makes fake nodes expensive.
@@ -341,7 +484,13 @@ Staking requirement (100 NEURO for Validators) makes fake nodes expensive.
 Robust aggregation and statistical verification reject malicious gradients.
 
 ### Replay Attacks
-Timestamp windows and signature uniqueness prevent proof reuse.
+Timestamp windows and signature uniqueness prevent proof reuse. **Epoch chaining prevents epoch-hopping**.
+
+### Fake Training
+**NEW**: Training proofs now require:
+- `model_hash_start != model_hash_end` (weights changed)
+- `gradient_commitment` present (spot-checkable)
+- `current_loss > 0` (forward pass happened)
 
 ## Transparency Guarantee
 
