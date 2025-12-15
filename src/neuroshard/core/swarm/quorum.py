@@ -1499,7 +1499,9 @@ class QuorumTrainer:
             raise ValueError(f"Node {node_id} is not a member of quorum {quorum.quorum_id}")
         
         self.is_initiator = self.member.role == QuorumRole.INITIATOR
-        self.is_finisher = self.member.role == QuorumRole.FINISHER
+        # In a solo quorum, the initiator is ALSO the finisher
+        self.is_finisher = (self.member.role == QuorumRole.FINISHER or 
+                           len(quorum.members) == 1)
         
         # DiLoCo state
         self.initial_weights: Dict[str, Any] = {}
