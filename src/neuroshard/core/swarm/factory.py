@@ -804,7 +804,7 @@ class SwarmEnabledDynamicNode:
         """
         import zlib
         import random
-        from protos import neuroshard_pb2, neuroshard_pb2_grpc
+        from neuroshard.protos import neuroshard_pb2, neuroshard_pb2_grpc
         from neuroshard.core.network.connection_pool import get_channel
         from urllib.parse import urlparse
         

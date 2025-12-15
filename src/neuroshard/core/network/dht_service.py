@@ -3,8 +3,8 @@ import time
 import threading
 from typing import List, Optional
 
-from protos import neuroshard_pb2
-from protos import neuroshard_pb2_grpc
+from neuroshard.protos import neuroshard_pb2
+from neuroshard.protos import neuroshard_pb2_grpc
 from neuroshard.core.network.dht import Node, RoutingTable, KBucket
 
 logger = logging.getLogger(__name__)

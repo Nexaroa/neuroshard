@@ -8,8 +8,8 @@ from concurrent import futures
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, asdict, field
 
-from protos import neuroshard_pb2
-from protos import neuroshard_pb2_grpc
+from neuroshard.protos import neuroshard_pb2
+from neuroshard.protos import neuroshard_pb2_grpc
 from neuroshard.core.network.dht import Node, RoutingTable, ID_BITS
 from neuroshard.core.network.dht_service import node_to_proto, proto_to_node
 from neuroshard.core.network.connection_pool import get_channel

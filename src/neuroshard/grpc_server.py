@@ -19,8 +19,8 @@ from typing import Optional, Union
 import logging
 
 # Import generated protobuf code
-from protos import neuroshard_pb2
-from protos import neuroshard_pb2_grpc
+from neuroshard.protos import neuroshard_pb2
+from neuroshard.protos import neuroshard_pb2_grpc
 
 from neuroshard.utils.serialization import deserialize_tensor, serialize_tensor
 from neuroshard.core.network.p2p import P2PManager

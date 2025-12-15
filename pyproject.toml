@@ -105,7 +105,7 @@ version = {attr = "neuroshard.version.__version__"}
 
 [tool.setuptools.package-data]
 "neuroshard.ui" = ["templates/*.html", "static/**/*"]
-"protos" = ["*.proto"]
+"neuroshard.protos" = ["*.proto"]
 
 [tool.black]
 line-length = 100

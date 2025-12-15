@@ -9,7 +9,7 @@ from typing import List, Dict, Optional, Set
 from concurrent.futures import ThreadPoolExecutor
 
 from neuroshard.core.network.p2p import P2PManager
-from protos import neuroshard_pb2, neuroshard_pb2_grpc
+from neuroshard.protos import neuroshard_pb2, neuroshard_pb2_grpc
 import grpc
 
 logger = logging.getLogger(__name__)

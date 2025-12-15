@@ -25,8 +25,8 @@ from collections import defaultdict
 
 # Try importing proto definitions
 try:
-    from protos import neuroshard_pb2
-    from protos import neuroshard_pb2_grpc
+    from neuroshard.protos import neuroshard_pb2
+    from neuroshard.protos import neuroshard_pb2_grpc
     GRPC_AVAILABLE = True
 except ImportError:
     GRPC_AVAILABLE = False

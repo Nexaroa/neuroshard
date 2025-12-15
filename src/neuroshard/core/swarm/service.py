@@ -318,7 +318,7 @@ class SwarmServiceMixin:
         """
         try:
             import numpy as np
-            from protos import neuroshard_pb2
+            from neuroshard.protos import neuroshard_pb2
             
             # Deserialize activation
             hidden_states = torch.from_numpy(
@@ -357,7 +357,7 @@ class SwarmServiceMixin:
                 
         except Exception as e:
             logger.error(f"SwarmForward error: {e}")
-            from protos import neuroshard_pb2
+            from neuroshard.protos import neuroshard_pb2
             return neuroshard_pb2.SwarmForwardResponse(
                 success=False,
                 request_id=getattr(request, 'request_id', ''),
@@ -371,7 +371,7 @@ class SwarmServiceMixin:
         Used by peers for routing decisions.
         """
         try:
-            from protos import neuroshard_pb2
+            from neuroshard.protos import neuroshard_pb2
             
             # Get buffer stats
             inbound_stats = self.inbound_buffer.get_stats()
@@ -408,7 +408,7 @@ class SwarmServiceMixin:
             
         except Exception as e:
             logger.error(f"GetSwarmStatus error: {e}")
-            from protos import neuroshard_pb2
+            from neuroshard.protos import neuroshard_pb2
             return neuroshard_pb2.SwarmStatusResponse(
                 node_id=self.swarm_node_id,
                 error_message=str(e),
@@ -421,7 +421,7 @@ class SwarmServiceMixin:
         Used when UDP heartbeat is blocked by firewalls.
         """
         try:
-            from protos import neuroshard_pb2
+            from neuroshard.protos import neuroshard_pb2
             
             # Update router's peer cache
             peer = PeerCandidate(
@@ -441,7 +441,7 @@ class SwarmServiceMixin:
             
         except Exception as e:
             logger.error(f"UpdatePeerCapacity error: {e}")
-            from protos import neuroshard_pb2
+            from neuroshard.protos import neuroshard_pb2
             return neuroshard_pb2.UpdatePeerCapacityResponse(
                 success=False,
                 error_message=str(e),
@@ -457,7 +457,7 @@ class SwarmServiceMixin:
         Can be called from PipelineForward() to enable swarm mode.
         """
         import numpy as np
-        from protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2
         
         try:
             # Deserialize hidden states

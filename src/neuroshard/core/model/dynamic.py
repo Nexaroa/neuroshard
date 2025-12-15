@@ -2085,8 +2085,8 @@ class DynamicNeuroNode:
         try:
             from neuroshard.core.network.connection_pool import get_channel
             from urllib.parse import urlparse
-            from protos import neuroshard_pb2 as pb2
-            from protos import neuroshard_pb2_grpc as pb2_grpc
+            from neuroshard.protos import neuroshard_pb2 as pb2
+            from neuroshard.protos import neuroshard_pb2_grpc as pb2_grpc
             
             # Parse HTTP URL and derive gRPC address (HTTP port + 1000)
             parsed = urlparse(next_hop_url)

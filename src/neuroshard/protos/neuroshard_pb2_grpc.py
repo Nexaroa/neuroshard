@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from . import neuroshard_pb2 as neuroshard__pb2
+from neuroshard.protos import neuroshard_pb2 as neuroshard__pb2
 
 GRPC_GENERATED_VERSION = '1.76.0'
 GRPC_VERSION = grpc.__version__

@@ -742,8 +742,8 @@ class P2PManager:
 
     def _send_stake_to_peer(self, target_url: str, amount: float, locked_until: float):
         """Send stake update to a peer via gRPC."""
-        from protos import neuroshard_pb2
-        from protos import neuroshard_pb2_grpc
+        from neuroshard.protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2_grpc
         from neuroshard.core.network.connection_pool import get_channel
         from urllib.parse import urlparse
         
@@ -793,8 +793,8 @@ class P2PManager:
 
     def _gossip_transaction(self, recipient_id: str, amount: float, signature: str, tx_hash: str):
         """Gossip transaction to peers."""
-        from protos import neuroshard_pb2
-        from protos import neuroshard_pb2_grpc
+        from neuroshard.protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2_grpc
         from neuroshard.core.network.connection_pool import get_channel
         from urllib.parse import urlparse
         
@@ -840,11 +840,11 @@ class P2PManager:
     def _gossip_loop(self):
         """Periodically create Proof of Neural Work and gossip to peers."""
         try:
-            from protos import neuroshard_pb2
-            from protos import neuroshard_pb2_grpc
+            from neuroshard.protos import neuroshard_pb2
+            from neuroshard.protos import neuroshard_pb2_grpc
             from neuroshard.core.network.connection_pool import get_channel
         except Exception as e:
-            logger.error(f"[PoNW] Failed to import protos: {e}")
+            logger.error(f"[PoNW] Failed to import neuroshard.protos: {e}")
             return
         
         logger.info("[PoNW] Gossip loop started (will generate first proof in 60s)")
@@ -1022,8 +1022,8 @@ class P2PManager:
 
     def _send_proof_to_peer(self, target_url: str, proof: PoNWProof):
         """Send PoNW proof to a peer via gRPC."""
-        from protos import neuroshard_pb2
-        from protos import neuroshard_pb2_grpc
+        from neuroshard.protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2_grpc
         from neuroshard.core.network.connection_pool import get_channel
         from urllib.parse import urlparse
         
@@ -1376,8 +1376,8 @@ class P2PManager:
         Args:
             epoch: The finalized epoch to gossip
         """
-        from protos import neuroshard_pb2
-        from protos import neuroshard_pb2_grpc
+        from neuroshard.protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2_grpc
         from neuroshard.core.network.connection_pool import get_channel
         from urllib.parse import urlparse
         
@@ -1403,8 +1403,8 @@ class P2PManager:
     
     def _send_epoch_to_peer(self, target_url: str, epoch: 'Epoch'):
         """Send epoch announcement to a peer."""
-        from protos import neuroshard_pb2
-        from protos import neuroshard_pb2_grpc
+        from neuroshard.protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2_grpc
         from neuroshard.core.network.connection_pool import get_channel
         from urllib.parse import urlparse
         
@@ -1451,8 +1451,8 @@ class P2PManager:
         Returns:
             The Epoch if successful, None otherwise
         """
-        from protos import neuroshard_pb2
-        from protos import neuroshard_pb2_grpc
+        from neuroshard.protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2_grpc
         from neuroshard.core.network.connection_pool import get_channel
         from urllib.parse import urlparse
         
@@ -1564,8 +1564,8 @@ class P2PManager:
         latest_ids = []
         for peer in peers:
             try:
-                from protos import neuroshard_pb2
-                from protos import neuroshard_pb2_grpc
+                from neuroshard.protos import neuroshard_pb2
+                from neuroshard.protos import neuroshard_pb2_grpc
                 from neuroshard.core.network.connection_pool import get_channel
                 from urllib.parse import urlparse
                 
