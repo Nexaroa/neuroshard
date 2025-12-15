@@ -173,6 +173,14 @@ message GossipProofRequest {
     string speed_tier = 19;      // Node's speed tier (tier1, tier2, etc.)
     string quorum_id = 20;       // Current quorum ID (if in a quorum)
     string contribution_mode = 21; // Current contribution mode (pipeline, async, etc.)
+    
+    // Chained PoNW fields - CRITICAL for canonical_payload signature verification
+    int64 epoch_id = 22;              // Epoch ID (timestamp / 60)
+    string model_hash_start = 23;     // Model hash before training
+    string model_hash_end = 24;       // Model hash after training
+    string gradient_commitment = 25;  // Hash of gradient norms (proof of work)
+    string data_hash = 26;            // Hash of training data used
+    double gradient_norm = 27;        // Average gradient norm
 }
 
 message GossipProofResponse {

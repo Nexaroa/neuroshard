@@ -148,6 +148,7 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 register_public_key(request.node_id, request.public_key)
             
             # Reconstruct the proof object
+            # CRITICAL: Include ALL fields that are in canonical_payload for signature verification
             proof = PoNWProof(
                 node_id=request.node_id,
                 proof_type=request.proof_type,
@@ -164,6 +165,13 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 current_loss=request.current_loss if request.current_loss != 0.0 else None,
                 request_id=request.request_id if request.request_id else None,
                 signature=request.signature,
+                # Chained PoNW fields - CRITICAL for canonical_payload signature verification
+                epoch_id=request.epoch_id,
+                model_hash_start=request.model_hash_start if request.model_hash_start else "",
+                model_hash_end=request.model_hash_end if request.model_hash_end else "",
+                gradient_commitment=request.gradient_commitment if request.gradient_commitment else "",
+                data_hash=request.data_hash if request.data_hash else "",
+                gradient_norm=request.gradient_norm if request.gradient_norm != 0.0 else None,
             )
             
             # Verify and process the proof using our ledger

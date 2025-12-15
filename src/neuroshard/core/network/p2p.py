@@ -1055,7 +1055,14 @@ class P2PManager:
                 data_samples=proof.data_samples,
                 model_hash=proof.model_hash,
                 request_id=proof.request_id or "",
-                current_loss=proof.current_loss if proof.current_loss is not None else 0.0
+                current_loss=proof.current_loss if proof.current_loss is not None else 0.0,
+                # Chained PoNW fields - CRITICAL for canonical_payload signature verification
+                epoch_id=proof.epoch_id,
+                model_hash_start=proof.model_hash_start or "",
+                model_hash_end=proof.model_hash_end or "",
+                gradient_commitment=proof.gradient_commitment or "",
+                data_hash=proof.data_hash or "",
+                gradient_norm=proof.gradient_norm if proof.gradient_norm is not None else 0.0
             )
             
             stub.GossipProof(req, timeout=3.0)
