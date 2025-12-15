@@ -2051,8 +2051,15 @@ class AsyncTrainer:
         self.current_loss: Optional[float] = None
         self.last_gradient_submission_time: Optional[float] = None
         
+        # Model hash tracking for chained PoNW
+        self.model_hash_start: str = ""
+        self.model_hash_end: str = ""
+        
         # Snapshot initial weights
         self._snapshot_weights()
+        
+        # Capture initial model hash
+        self.model_hash_start = self._compute_model_hash()
         
         logger.info(f"AsyncTrainer initialized for node {node_id[:16]}...")
     
@@ -2063,6 +2070,27 @@ class AsyncTrainer:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.initial_weights[name] = param.data.clone()
+    
+    def _compute_model_hash(self) -> str:
+        """Compute a hash of model weights for chained PoNW verification."""
+        import torch
+        import hashlib
+        
+        hasher = hashlib.sha256()
+        
+        # Sample some parameters for speed (full hash too slow)
+        params = list(self.model.named_parameters())
+        sample_indices = [0, len(params)//4, len(params)//2, 3*len(params)//4, len(params)-1]
+        
+        for idx in sample_indices:
+            if 0 <= idx < len(params):
+                name, param = params[idx]
+                hasher.update(name.encode())
+                # Use a sample of the parameter data for speed
+                flat = param.data.flatten()[:1000]
+                hasher.update(flat.cpu().numpy().tobytes())
+        
+        return hasher.hexdigest()[:16]
     
     def start(self):
         """Start the async training loop."""
@@ -2183,9 +2211,11 @@ class AsyncTrainer:
                 if data_not_ready_count > 0 and len(losses) == 0:
                     logger.info(f"[ASYNC] Data not ready ({data_not_ready_count} attempts) - waiting for shard download")
                 
-                # Update current loss
+                # Update current loss and model hash
                 if losses:
                     self.current_loss = sum(losses) / len(losses)
+                    # Capture model hash AFTER training (weights changed)
+                    self.model_hash_end = self._compute_model_hash()
                     logger.info(f"[ASYNC] Completed {len(losses)} steps, avg_loss={self.current_loss:.4f}")
                 
                 # Compute pseudo-gradient
@@ -2275,4 +2305,12 @@ class AsyncTrainer:
             "current_loss": self.current_loss,
             "last_submission": self.last_gradient_submission_time,
             "is_async": True,
+            # Chained PoNW: model state tracking
+            "model_hash_start": self.model_hash_start,
+            "model_hash_end": self.model_hash_end,
         }
+    
+    def reset_proof_period(self):
+        """Reset tracking for next proof period (called after proof submission)."""
+        # model_hash_end becomes the new start for next period
+        self.model_hash_start = self.model_hash_end

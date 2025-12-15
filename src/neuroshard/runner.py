@@ -3903,6 +3903,25 @@ def run_node(
                     STATE["async_batches"] = current_async_batches
                     STATE["async_syncs"] = async_stats["total_syncs"]
                     STATE["current_loss"] = async_stats["current_loss"]
+                    
+                    # Chained PoNW: Get model hashes from async trainer
+                    # Note: After proof submission, p2p.py resets STATE["model_hash_start"]
+                    # We need to sync this back to ASYNC_TRAINER
+                    state_start = STATE.get("model_hash_start", "")
+                    trainer_start = async_stats.get("model_hash_start", "")
+                    
+                    # If state was reset by p2p.py (to model_hash_end), sync to trainer
+                    if state_start and state_start != trainer_start:
+                        # p2p.py reset the start hash - update trainer
+                        ASYNC_TRAINER.model_hash_start = state_start
+                    elif trainer_start:
+                        # Use trainer's start hash
+                        STATE["model_hash_start"] = trainer_start
+                    
+                    if async_stats.get("model_hash_end"):
+                        STATE["model_hash_end"] = async_stats["model_hash_end"]
+                        STATE["model_hash"] = async_stats["model_hash_end"]
+                    
                     # Add DELTA batches (not cumulative) - P2P resets training_batches after each proof
                     batch_delta = current_async_batches - last_async_batches
                     if batch_delta > 0:
@@ -3924,17 +3943,19 @@ def run_node(
             last_training_rounds = current_training
             
             # Update model hash for chained PoNW
+            # SKIP if ASYNC_TRAINER already provided hashes (more accurate)
             if NEURO_NODE.model and hasattr(NEURO_NODE, '_get_model_hash'):
-                current_hash = NEURO_NODE._get_model_hash()
-                
-                # Track model_hash_start at beginning of each proof period
-                # This proves weights changed during training
-                if "model_hash_start" not in STATE or not STATE.get("model_hash_start"):
-                    STATE["model_hash_start"] = current_hash
-                
-                # model_hash_end is always the current hash
-                STATE["model_hash"] = current_hash
-                STATE["model_hash_end"] = current_hash
+                if not (ASYNC_TRAINER and ASYNC_TRAINER.running and STATE.get("model_hash_end")):
+                    # Only compute hash if ASYNC_TRAINER didn't provide one
+                    current_hash = NEURO_NODE._get_model_hash()
+                    
+                    # Track model_hash_start at beginning of each proof period
+                    if "model_hash_start" not in STATE or not STATE.get("model_hash_start"):
+                        STATE["model_hash_start"] = current_hash
+                    
+                    # model_hash_end is always the current hash
+                    STATE["model_hash"] = current_hash
+                    STATE["model_hash_end"] = current_hash
             
             # =================================================================
             # HEARTBEAT (every 30 seconds)
