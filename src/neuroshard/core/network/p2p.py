@@ -1012,7 +1012,7 @@ class P2PManager:
                     import math
                     fanout = min(int(math.sqrt(len(peers)) + 3), 30)
                     targets = random.sample(peers, min(len(peers), fanout))
-                    logger.info(f"PoNW: Gossiping to {len(targets)} peers")
+                    logger.info(f"PoNW: Gossiping to {len(targets)} peers: {targets[:5]}")
                     
                     for target in targets:
                         threading.Thread(target=self._send_proof_to_peer, args=(target, proof)).start()
@@ -1032,6 +1032,8 @@ class P2PManager:
             ip = parsed.hostname
             # gRPC port = HTTP port + 1000
             port = (parsed.port or 80) + 1000
+            
+            logger.info(f"[GOSSIP] Sending proof to {ip}:{port}")
             
             channel = get_channel(f"{ip}:{port}")
             stub = neuroshard_pb2_grpc.NeuroShardServiceStub(channel)
@@ -1065,8 +1067,10 @@ class P2PManager:
                 gradient_norm=proof.gradient_norm if proof.gradient_norm is not None else 0.0
             )
             
-            stub.GossipProof(req, timeout=3.0)
-        except:
+            response = stub.GossipProof(req, timeout=3.0)
+            logger.info(f"[GOSSIP] Proof sent to {ip}:{port}, accepted={response.accepted}")
+        except Exception as e:
+            logger.warning(f"[GOSSIP] Failed to send proof to {ip}:{port}: {e}")
             pass # Gossip is best-effort
 
     def _sync_with_new_peer(self, peer_url: str):
