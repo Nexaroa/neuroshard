@@ -900,11 +900,15 @@ class P2PManager:
                     try:
                         fresh_stats = self.get_fresh_training_stats()
                         if fresh_stats:
-                            # Use fresh values if available
+                            # Use fresh loss if available
                             if fresh_stats.get("current_loss") is not None:
                                 current_loss = fresh_stats["current_loss"]
-                            if fresh_stats.get("model_hash_start"):
+                            # ONLY set model_hash_start if we don't have one yet
+                            # After a proof, P2P sets model_hash_start = model_hash_end
+                            # We don't want to overwrite that with stale value from trainer
+                            if fresh_stats.get("model_hash_start") and not self.state_ref.get("model_hash_start"):
                                 self.state_ref["model_hash_start"] = fresh_stats["model_hash_start"]
+                            # Always get fresh model_hash_end (current weights after training)
                             if fresh_stats.get("model_hash_end"):
                                 self.state_ref["model_hash_end"] = fresh_stats["model_hash_end"]
                                 model_hash = fresh_stats["model_hash_end"]
