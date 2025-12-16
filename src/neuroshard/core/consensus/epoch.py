@@ -639,8 +639,9 @@ class EpochManager:
         
         try:
             dht_key = self._epoch_dht_key(epoch.epoch_id)
-            self.dht.store_value(dht_key, epoch.to_json())
-            logger.info(f"Stored epoch {epoch.epoch_id} in DHT")
+            # DHTProtocol uses direct storage access
+            self.dht.storage[dht_key] = epoch.to_json()
+            logger.debug(f"Stored epoch {epoch.epoch_id} in DHT")
             return True
         except Exception as e:
             logger.warning(f"Failed to store epoch {epoch.epoch_id} in DHT: {e}")
