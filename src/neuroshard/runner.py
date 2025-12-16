@@ -116,11 +116,12 @@ def request_shutdown():
             logger.error(f"[NODE] QuorumTrainer shutdown error: {e}")
     
     # Leave current quorum gracefully
-    if CURRENT_QUORUM and QUORUM_REGISTRY:
+    if CURRENT_QUORUM and QUORUM_FORMATION:
         try:
             logger.info(f"[NODE] Leaving quorum {CURRENT_QUORUM.quorum_id[:8]}...")
-            # Leave quorum will be handled by registry
-            QUORUM_REGISTRY.leave_quorum(CURRENT_QUORUM.quorum_id, NEURO_NODE.node_id if NEURO_NODE else "")
+            # Leave quorum via formation service (has the leave_quorum method)
+            node_id = NEURO_NODE.node_id if NEURO_NODE else ""
+            QUORUM_FORMATION.leave_quorum(node_id, CURRENT_QUORUM.quorum_id)
         except Exception as e:
             logger.error(f"[NODE] Quorum leave error: {e}")
     
@@ -163,15 +164,16 @@ def request_shutdown():
         except Exception as e:
             logger.error(f"[NODE] Failed to save checkpoint: {e}")
         
-        # Wait for any ongoing async saves to complete
+        # Wait for any ongoing async saves to complete (if lock exists)
         try:
             from neuroshard.core.model.dynamic import DynamicNeuroNode
-            # Try to acquire the lock (will wait if async save in progress)
-            if DynamicNeuroNode._checkpoint_save_lock.acquire(timeout=30):
-                DynamicNeuroNode._checkpoint_save_lock.release()
-                logger.info("[NODE] All checkpoint saves completed.")
+            if hasattr(DynamicNeuroNode, '_checkpoint_save_lock'):
+                # Try to acquire the lock (will wait if async save in progress)
+                if DynamicNeuroNode._checkpoint_save_lock.acquire(timeout=30):
+                    DynamicNeuroNode._checkpoint_save_lock.release()
+                    logger.info("[NODE] All checkpoint saves completed.")
         except Exception as e:
-            logger.warning(f"[NODE] Could not wait for checkpoint save: {e}")
+            logger.debug(f"[NODE] Checkpoint lock not available: {e}")
         
         # CRITICAL: Free memory by deleting model and data
         try:
