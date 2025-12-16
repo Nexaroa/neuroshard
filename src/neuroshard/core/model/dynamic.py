@@ -2393,7 +2393,10 @@ class DynamicNeuroNode:
             input_ids = self.tokenizer.encode(prompt)
             input_tensor = torch.tensor([input_ids], device=self.device)
             
-            generated = list(input_ids)
+            # Track all tokens (input + generated) for context
+            all_tokens = list(input_ids)
+            # Track only NEW tokens for output
+            generated_tokens = []
             
             for _ in range(max_tokens):
                 with torch.no_grad():
@@ -2402,14 +2405,16 @@ class DynamicNeuroNode:
                     probs = torch.softmax(next_logits, dim=-1)
                     next_token = torch.multinomial(probs, 1).item()
                 
-                generated.append(next_token)
-                input_tensor = torch.tensor([generated], device=self.device)
+                all_tokens.append(next_token)
+                generated_tokens.append(next_token)
+                input_tensor = torch.tensor([all_tokens], device=self.device)
                 
                 # Stop on EOS
                 if next_token == self.tokenizer.eos_token_id:
                     break
             
-            return self.tokenizer.decode(generated)
+            # Return ONLY the generated tokens, not the input prompt
+            return self.tokenizer.decode(generated_tokens)
         except Exception as e:
             logger.warning(f"Generation error: {e}")
             return f"[Generation error: {e}]"
