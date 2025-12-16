@@ -370,12 +370,22 @@ sequenceDiagram
 
 | Metric | Value |
 |--------|-------|
-| Active source | fineweb-edu |
-| Shards created | 128+ (growing) |
-| Tokens processed | 320M+ |
-| Tokenizer vocab | 2,771 (2,505 BPE merges) |
-| Shard creation rate | ~4.7s/shard |
-| Target shards | 600,000 |
+| Active sources | Multiple (see `genesis_ctl.sh status`) |
+| Total shards | **Growing** (check manifest for latest) |
+| Total tokens | **Growing** |
+| Tokenizer vocab | **Dynamic** (`current_vocab_size` in tokenizer.json) |
+| Max vocab | 10M (effectively unlimited) |
+| Target shards | 600,000+ |
+
+::: tip Live Status
+Check current progress with:
+```bash
+./scripts/genesis_ctl.sh status
+# Or query CDN directly:
+curl -s https://dwquwt9gkkeil.cloudfront.net/manifest.json | jq
+curl -s https://dwquwt9gkkeil.cloudfront.net/tokenizer.json | jq '{vocab_size, next_merge_id: .next_merge_id, sources: .sources_contributed}'
+```
+:::
 
 ## Monitoring
 
