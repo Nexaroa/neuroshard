@@ -2398,10 +2398,20 @@ class DynamicNeuroNode:
             # Track only NEW tokens for output
             generated_tokens = []
             
+            # Get valid vocab size from tokenizer (tokens beyond this don't exist yet)
+            valid_vocab_size = self.tokenizer.current_vocab_size
+            
             for _ in range(max_tokens):
                 with torch.no_grad():
                     logits = self.forward(input_tensor)
                     next_logits = logits[0, -1, :] / temperature
+                    
+                    # CRITICAL: Mask tokens beyond tokenizer's current vocabulary
+                    # The model has pre-allocated capacity for vocab growth, but
+                    # tokens beyond current_vocab_size don't exist in tokenizer yet
+                    if valid_vocab_size < next_logits.size(-1):
+                        next_logits[valid_vocab_size:] = float('-inf')
+                    
                     probs = torch.softmax(next_logits, dim=-1)
                     next_token = torch.multinomial(probs, 1).item()
                 
