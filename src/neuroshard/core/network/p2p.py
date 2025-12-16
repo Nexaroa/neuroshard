@@ -1024,8 +1024,7 @@ class P2PManager:
                         pass  # Best effort
                 
                 # Remove self from peer list
-                my_url = f"http://{self.public_ip}:{self.port}"
-                peers_set.discard(my_url)
+                peers_set.discard(self.my_url)
                 peers = list(peers_set)
                 
                 if not peers:
