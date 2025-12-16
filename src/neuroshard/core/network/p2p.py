@@ -300,6 +300,10 @@ class P2PManager:
         # This bypasses the timing issue where state_ref isn't updated yet
         self.get_fresh_training_stats = None
         
+        # Callback to notify AsyncTrainer when a proof is accepted
+        # This triggers reset_proof_period() so model_hash_start is fresh
+        self.on_proof_accepted = None
+        
         # --- DHT & Decentralization Init ---
         self.dht = None
         self.routing_table = None
@@ -931,6 +935,13 @@ class P2PManager:
                 # - gradient_norm: L2 norm of gradients
                 model_hash_start = self.state_ref.get("model_hash_start", "")
                 model_hash_end = self.state_ref.get("model_hash_end", model_hash)
+                
+                # Skip training proof if no training happened (hashes are equal)
+                # This happens if gossip loop fires before AsyncTrainer completes a round
+                if proof_type == ProofType.TRAINING and model_hash_start and model_hash_end:
+                    if model_hash_start == model_hash_end:
+                        logger.info("[PoNW] Skipping proof - training round not complete yet (waiting for model weight changes)")
+                        continue
                 gradient_commitment = self.state_ref.get("gradient_commitment", "")
                 data_hash = self.state_ref.get("data_hash", "")
                 gradient_norm = self.state_ref.get("gradient_norm", 0.0)
@@ -983,14 +994,20 @@ class P2PManager:
                     # So next period tracks fresh weight changes
                     if proof_type == ProofType.TRAINING:
                         self.state_ref["model_hash_start"] = model_hash_end
+                        # Notify AsyncTrainer to reset its internal tracking
+                        if self.on_proof_accepted:
+                            try:
+                                self.on_proof_accepted()
+                            except Exception as e:
+                                logger.debug(f"on_proof_accepted callback error: {e}")
                 else:
                     logger.info(f"[NODE] ❌ PoNW rejected: {msg}")
 
-                # Gossip to random peers
-                peers = list(self.known_peers.keys())
+                # Gossip to random peers (deduplicated)
+                peers_set = set(self.known_peers.keys())
                 if self.routing_table:
                     for n in self.routing_table.get_all_nodes():
-                        peers.append(f"http://{n.ip}:{n.port}")
+                        peers_set.add(f"http://{n.ip}:{n.port}")
                 
                 # Also look for proof receivers (observers) in DHT
                 if self.dht:
@@ -1002,11 +1019,14 @@ class P2PManager:
                         if proof_receivers:
                             receivers = json.loads(proof_receivers)
                             for receiver in receivers:
-                                peer_url = f"http://{receiver}"
-                                if peer_url not in peers:
-                                    peers.append(peer_url)
+                                peers_set.add(f"http://{receiver}")
                     except Exception:
                         pass  # Best effort
+                
+                # Remove self from peer list
+                my_url = f"http://{self.public_ip}:{self.port}"
+                peers_set.discard(my_url)
+                peers = list(peers_set)
                 
                 if not peers:
                     logger.info("PoNW: Solo mining (no peers to gossip)")

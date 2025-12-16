@@ -3664,8 +3664,14 @@ def run_node(
                 return ASYNC_TRAINER.get_stats()
             return None
         
+        # Callback to notify AsyncTrainer when a proof is accepted
+        def on_proof_accepted():
+            if ASYNC_TRAINER:
+                ASYNC_TRAINER.reset_proof_period()
+        
         if P2P:
             P2P.get_fresh_training_stats = get_fresh_training_stats
+            P2P.on_proof_accepted = on_proof_accepted
         logger.info("[ASYNC] AsyncTrainer initialized")
     
     # Initialize LayerGrowthManager for monitoring network growth
@@ -3899,6 +3905,13 @@ def run_node(
                                         return ASYNC_TRAINER.get_stats()
                                     return None
                                 P2P.get_fresh_training_stats = _get_fresh_stats
+                            
+                            # Set up callback for proof acceptance notification
+                            if P2P and not P2P.on_proof_accepted:
+                                def _on_proof_accepted():
+                                    if ASYNC_TRAINER:
+                                        ASYNC_TRAINER.reset_proof_period()
+                                P2P.on_proof_accepted = _on_proof_accepted
                         
                         if not ASYNC_TRAINER.running:
                             logger.info("[ASYNC] Starting AsyncTrainer...")
