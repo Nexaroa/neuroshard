@@ -195,6 +195,21 @@ class NeuroShardServiceStub(object):
                 request_serializer=neuroshard__pb2.SpotCheckChallengeRequest.SerializeToString,
                 response_deserializer=neuroshard__pb2.SpotCheckChallengeResponse.FromString,
                 _registered_method=True)
+        self.ExpertForward = channel.unary_unary(
+                '/neuroshard.NeuroShardService/ExpertForward',
+                request_serializer=neuroshard__pb2.ExpertForwardRequest.SerializeToString,
+                response_deserializer=neuroshard__pb2.ExpertForwardResponse.FromString,
+                _registered_method=True)
+        self.GetExpertStatus = channel.unary_unary(
+                '/neuroshard.NeuroShardService/GetExpertStatus',
+                request_serializer=neuroshard__pb2.ExpertStatusRequest.SerializeToString,
+                response_deserializer=neuroshard__pb2.ExpertStatusResponse.FromString,
+                _registered_method=True)
+        self.AnnounceExpert = channel.unary_unary(
+                '/neuroshard.NeuroShardService/AnnounceExpert',
+                request_serializer=neuroshard__pb2.AnnounceExpertRequest.SerializeToString,
+                response_deserializer=neuroshard__pb2.AnnounceExpertResponse.FromString,
+                _registered_method=True)
 
 
 class NeuroShardServiceServicer(object):
@@ -436,6 +451,29 @@ class NeuroShardServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ExpertForward(self, request, context):
+        """--- Mixture of Experts (MoE) RPCs ---
+
+        Forward activations to a remote expert
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetExpertStatus(self, request, context):
+        """Get expert status for routing decisions
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AnnounceExpert(self, request, context):
+        """Announce expert availability to network
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_NeuroShardServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -598,6 +636,21 @@ def add_NeuroShardServiceServicer_to_server(servicer, server):
                     servicer.SpotCheckChallenge,
                     request_deserializer=neuroshard__pb2.SpotCheckChallengeRequest.FromString,
                     response_serializer=neuroshard__pb2.SpotCheckChallengeResponse.SerializeToString,
+            ),
+            'ExpertForward': grpc.unary_unary_rpc_method_handler(
+                    servicer.ExpertForward,
+                    request_deserializer=neuroshard__pb2.ExpertForwardRequest.FromString,
+                    response_serializer=neuroshard__pb2.ExpertForwardResponse.SerializeToString,
+            ),
+            'GetExpertStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetExpertStatus,
+                    request_deserializer=neuroshard__pb2.ExpertStatusRequest.FromString,
+                    response_serializer=neuroshard__pb2.ExpertStatusResponse.SerializeToString,
+            ),
+            'AnnounceExpert': grpc.unary_unary_rpc_method_handler(
+                    servicer.AnnounceExpert,
+                    request_deserializer=neuroshard__pb2.AnnounceExpertRequest.FromString,
+                    response_serializer=neuroshard__pb2.AnnounceExpertResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1465,6 +1518,87 @@ class NeuroShardService(object):
             '/neuroshard.NeuroShardService/SpotCheckChallenge',
             neuroshard__pb2.SpotCheckChallengeRequest.SerializeToString,
             neuroshard__pb2.SpotCheckChallengeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ExpertForward(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neuroshard.NeuroShardService/ExpertForward',
+            neuroshard__pb2.ExpertForwardRequest.SerializeToString,
+            neuroshard__pb2.ExpertForwardResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetExpertStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neuroshard.NeuroShardService/GetExpertStatus',
+            neuroshard__pb2.ExpertStatusRequest.SerializeToString,
+            neuroshard__pb2.ExpertStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AnnounceExpert(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/neuroshard.NeuroShardService/AnnounceExpert',
+            neuroshard__pb2.AnnounceExpertRequest.SerializeToString,
+            neuroshard__pb2.AnnounceExpertResponse.FromString,
             options,
             channel_credentials,
             insecure,
