@@ -3281,13 +3281,14 @@ def run_node(
                             )
                             
                             # Verify recent epoch chain (last 10 epochs)
+                            # Note: Gap-tolerant - empty epochs are expected and don't break the chain
                             if info['latest_finalized'] > 0:
                                 start_id = max(0, info['latest_finalized'] - 10)
-                                is_valid, error = em.verify_epoch_chain(start_id, info['latest_finalized'])
+                                is_valid, result_msg = em.verify_epoch_chain(start_id, info['latest_finalized'])
                                 if is_valid:
-                                    logger.info(f"[EPOCH] Chain verified: epochs {start_id}-{info['latest_finalized']} ✓")
+                                    logger.debug(f"[EPOCH] Chain verified: epochs {start_id}-{info['latest_finalized']} ✓ ({result_msg})")
                                 else:
-                                    logger.warning(f"[EPOCH] Chain verification FAILED: {error}")
+                                    logger.warning(f"[EPOCH] Chain verification FAILED: {result_msg}")
                     except Exception as e:
                         logger.error(f"[EPOCH] Verification error: {e}")
                     

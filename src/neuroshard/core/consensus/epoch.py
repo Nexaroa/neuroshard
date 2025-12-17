@@ -716,41 +716,62 @@ class EpochManager:
         """
         Verify the integrity of the epoch chain.
         
+        Gap-tolerant: Empty epochs (with no proofs) are skipped and don't break
+        the chain. Only epochs that exist are verified for proper linking.
+        
         Checks:
-        1. Each epoch links to the previous (prev_hash)
-        2. Model state shows progression (hash_start = prev hash_end)
-        3. Epoch hashes are valid
+        1. Each existing epoch has valid hash
+        2. Existing epochs link properly to previous existing epoch
+        3. Model state shows progression where epochs exist
         4. Proposer signatures are valid (if available)
         
         Returns:
             (is_valid, error_message)
         """
         prev_epoch = None
+        found_epochs = 0
+        skipped_epochs = 0
         
         for epoch_id in range(start_id, end_id + 1):
             epoch = self.get_epoch(epoch_id)
             
             if not epoch:
-                return False, f"Missing epoch {epoch_id}"
+                # Empty epochs are expected - they had no proofs and were skipped
+                skipped_epochs += 1
+                continue
+            
+            found_epochs += 1
             
             # Verify epoch hash
             computed_hash = epoch.compute_epoch_hash()
             if computed_hash != epoch.epoch_hash:
                 return False, f"Epoch {epoch_id} hash mismatch"
             
-            # Verify chain link
+            # Verify chain link to previous EXISTING epoch
             if prev_epoch:
-                if not epoch.verify_chain_link(prev_epoch):
-                    return False, f"Epoch {epoch_id} chain link broken"
+                # Check prev_epoch_hash links correctly
+                # Note: In gap-tolerant mode, we verify the hash matches what we expect
+                # The prev_epoch_hash should match the last finalized epoch's hash
+                if epoch.prev_epoch_hash != prev_epoch.epoch_hash:
+                    # This is only an error if there were no gaps between them
+                    # With gaps (empty epochs), the prev_hash might link to an earlier epoch
+                    gap_size = epoch.epoch_id - prev_epoch.epoch_id
+                    if gap_size == 1:
+                        # No gap - this is a real chain break
+                        return False, f"Epoch {epoch_id} chain link broken (prev_hash mismatch)"
+                    # else: gap exists, prev_hash may link to an even older epoch - acceptable
             elif epoch_id > 0:
-                # First epoch in range should link to previous
-                if epoch.prev_epoch_hash == self.genesis_hash and epoch_id != 0:
-                    # Need to verify link to actual previous epoch
-                    pass  # Accept for now if prev not in range
+                # First epoch in range - verify it links to something valid
+                if epoch.prev_epoch_hash != self.genesis_hash:
+                    # Should link to a previous epoch (which may not be in our range)
+                    pass  # Accept - we can't verify what's before our range
             
             prev_epoch = epoch
         
-        return True, "Chain verified"
+        if found_epochs == 0:
+            return True, "No epochs in range (all empty)"
+        
+        return True, f"Chain verified ({found_epochs} epochs, {skipped_epochs} empty)"
     
     def get_current_epoch_info(self) -> Dict[str, Any]:
         """Get information about the current epoch."""

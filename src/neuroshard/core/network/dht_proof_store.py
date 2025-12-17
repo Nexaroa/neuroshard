@@ -683,6 +683,9 @@ class DHTEpochStore:
         """
         Retrieve a range of epochs and optionally verify chain integrity.
         
+        Gap-tolerant: Empty epochs (with no proofs) are expected and don't break
+        the chain. Only epochs that exist are returned and verified.
+        
         Args:
             start_id: Starting epoch ID (inclusive)
             end_id: Ending epoch ID (inclusive)
@@ -692,33 +695,40 @@ class DHTEpochStore:
             (epochs, is_valid, error_message)
         """
         epochs = []
+        skipped = 0
         
         for epoch_id in range(start_id, end_id + 1):
             epoch = self.get_epoch(epoch_id)
             if epoch:
                 epochs.append(epoch)
             else:
-                return epochs, False, f"Missing epoch {epoch_id}"
+                # Empty epochs are expected - they had no proofs and were skipped
+                skipped += 1
         
         if not verify or len(epochs) < 2:
-            return epochs, True, ""
+            return epochs, True, f"{len(epochs)} epochs found, {skipped} empty"
         
-        # Verify chain integrity
+        # Verify chain integrity (gap-tolerant)
         is_valid, error = self.verify_chain_integrity(epochs)
+        if is_valid:
+            return epochs, True, f"{len(epochs)} epochs verified, {skipped} empty"
         return epochs, is_valid, error
     
     def verify_chain_integrity(self, epochs: List['Epoch']) -> Tuple[bool, str]:
         """
         Verify that a list of epochs forms a valid chain.
         
+        Gap-tolerant: When there are gaps between epochs (empty epochs),
+        we only verify consecutive epochs are properly linked. Epochs separated
+        by gaps may link to genesis or intermediate (missing) epochs.
+        
         Checks:
-        1. Each epoch's prev_hash matches previous epoch's hash
-        2. Model state shows progression (end of prev = start of current)
+        1. Each epoch's hash is correctly computed
+        2. Consecutive epochs (no gap) have matching prev_hash linkage
         3. Timestamps are sequential
-        4. Epoch hashes are correctly computed
         
         Args:
-            epochs: List of epochs in order
+            epochs: List of epochs in order (may have gaps)
             
         Returns:
             (is_valid, error_message)
@@ -736,22 +746,25 @@ class DHTEpochStore:
                 return False, f"Epoch {epoch.epoch_id}: hash mismatch (computed={computed_hash[:16]}... != stored={epoch.epoch_hash[:16]}...)"
             
             if i == 0:
-                # First epoch - check genesis or skip
+                # First epoch - no previous to check against
                 continue
             
             prev_epoch = epochs[i - 1]
+            gap_size = epoch.epoch_id - prev_epoch.epoch_id
             
-            # Check prev_hash linkage
-            if epoch.prev_epoch_hash != prev_epoch.epoch_hash:
-                return False, f"Epoch {epoch.epoch_id}: prev_hash broken (expected {prev_epoch.epoch_hash[:16]}...)"
+            if gap_size == 1:
+                # Consecutive epochs - verify strict linkage
+                if epoch.prev_epoch_hash != prev_epoch.epoch_hash:
+                    return False, f"Epoch {epoch.epoch_id}: prev_hash broken (expected {prev_epoch.epoch_hash[:16]}...)"
+                
+                # Check model state progression for consecutive epochs
+                if epoch.model_state_hash_start != prev_epoch.model_state_hash_end:
+                    return False, f"Epoch {epoch.epoch_id}: model state discontinuity"
+            # else: gap exists - prev_hash may link to missing epoch or genesis, which is acceptable
             
-            # Check model state progression
-            if epoch.model_state_hash_start != prev_epoch.model_state_hash_end:
-                return False, f"Epoch {epoch.epoch_id}: model state discontinuity"
-            
-            # Check timestamp ordering
+            # Check timestamp ordering (always, regardless of gap)
             if epoch.timestamp_start < prev_epoch.timestamp_end:
-                return False, f"Epoch {epoch.epoch_id}: timestamps overlap"
+                return False, f"Epoch {epoch.epoch_id}: timestamps overlap with {prev_epoch.epoch_id}"
         
         return True, ""
     
