@@ -1,6 +1,8 @@
 # Mixture of Experts (MoE)
 
-NeuroShard implements a **Distributed Mixture of Experts** architecture that enables sparse computation across the decentralized network. Unlike traditional MoE implementations where all experts reside on a single machine, NeuroShard distributes experts across nodes, enabling massive model scaling with proportional compute costs.
+MoE is the **INHERENT architecture** of NeuroShard. There is no legacy dense mode - every layer is an MoE layer. This enables massive model scaling with proportional compute costs.
+
+> **Why MoE is mandatory:** Dense layers can't scale to frontier model sizes. MoE is how models like GPT-4, Mixtral, and DeepSeek scale efficiently. NeuroShard's infrastructure (DiLoCo, gRPC) natively supports distributed MoE.
 
 ## Overview
 
@@ -49,6 +51,63 @@ NeuroShard implements a **Distributed Mixture of Experts** architecture that ena
 - Total parameters: 8 × 7B = **56B**
 - Active parameters per token: (2/8) × 7B ≈ **1.75B**
 - Compute scales with k/N (top-k / total experts)
+
+## Router Synchronization
+
+A critical question for distributed MoE: **How do router weights stay in sync across nodes?**
+
+### The Solution: DiLoCo Sync
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                    Router Weight Synchronization                    │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Node A                 Node B                 Node C               │
+│  ┌─────────┐            ┌─────────┐            ┌─────────┐         │
+│  │ Router  │            │ Router  │            │ Router  │         │
+│  │ (copy)  │            │ (copy)  │            │ (copy)  │         │
+│  └────┬────┘            └────┬────┘            └────┬────┘         │
+│       │                      │                      │               │
+│       │    ┌─────────────────┼──────────────────┐   │               │
+│       └────►     DiLoCo Pseudo-Gradient Sync    ◄───┘               │
+│            │  (includes router.gate.weight)     │                   │
+│            └────────────────────────────────────┘                   │
+│                                                                     │
+│  Router weights: ~6KB per layer (768d × 8 experts × 4 bytes)        │
+│  Synced every: 500 training steps (DiLoCo inner loop)               │
+│  Method: Pseudo-gradient aggregation (w_initial - w_current)        │
+│                                                                     │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Properties
+
+1. **Router is Small**: Only `hidden_dim × num_experts` parameters (~6KB/layer)
+2. **Part of named_parameters()**: Automatically included in DiLoCo sync
+3. **Gradients Computed Locally**: We have router logits + weighted outputs
+4. **Eventual Consistency**: Routers converge via DiLoCo aggregation
+
+### Why This Works
+
+```python
+# In DiLoCo sync, router weights are naturally included:
+pseudo_gradients = {}
+for name, param in model.named_parameters():
+    # This includes "layer.moe.router.gate.weight"
+    pseudo_gradients[name] = initial_weights[name] - param.data
+
+# All nodes submit pseudo-gradients → aggregated → applied
+# Result: Router weights converge to consensus
+```
+
+### Divergence Handling
+
+Short-term divergence is **acceptable** because:
+- Routers train on similar data (Genesis dataset)
+- DiLoCo syncs every 500 steps (~10 minutes)
+- Load balancing loss encourages similar routing patterns
+- Different routing = different expert utilization = scarcity bonuses redistribute
 
 ## How It Works
 
@@ -287,6 +346,36 @@ $ neuroshard --device cuda --memory 8000
 [INFO] Training reward: 1.35× (avg scarcity bonus)
 ```
 
+## Tokenizer & Training Data Compatibility
+
+**Q: Does MoE require retraining the tokenizer or generating new training data?**
+
+**A: NO!** MoE is a model architecture change, not a data/vocab change.
+
+| Component | MoE Impact |
+|-----------|------------|
+| Tokenizer | ✅ No change - same BPE tokenizer |
+| Vocabulary | ✅ No change - same vocab works |
+| Genesis data | ✅ No change - same training shards |
+| Training loop | ⚠️ Minor change - add aux loss |
+
+The existing genesis pipeline (`genesis_ctl.sh`, `genesis_parallel.py`) works exactly the same. MoE only changes:
+- FFN layers → MoE layers (model architecture)
+- Training loss → loss + aux_loss (load balancing)
+
+```python
+# Training with MoE (only change is adding aux_loss)
+loss = cross_entropy(logits, labels)
+
+# Add MoE auxiliary loss for load balancing
+moe_aux = model.get_moe_aux_loss()  # ~0.01-0.1
+if moe_aux is not None:
+    loss = loss + moe_aux
+
+loss.backward()
+optimizer.step()
+```
+
 ## Future Work
 
 1. **Expert routing optimization**: ML-based routing to minimize cross-node calls
@@ -296,5 +385,5 @@ $ neuroshard --device cuda --memory 8000
 
 ---
 
-*MoE enables NeuroShard to scale to frontier model sizes while keeping compute costs proportional to the active parameter count.*
+*MoE is the ONLY architecture in NeuroShard. It enables scaling to frontier model sizes while keeping compute costs proportional to the active parameter count.*
 

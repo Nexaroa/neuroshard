@@ -599,8 +599,8 @@ class DynamicLayerPool:
     
     MIN_REPLICAS = 2  # Minimum redundancy for fault tolerance
     
-    # MoE Configuration
-    MOE_ENABLED = True              # Enable Mixture of Experts
+    # MoE Configuration - ALWAYS ENABLED (inherent design)
+    # No legacy/fallback - MoE is the ONLY architecture for NeuroShard
     NUM_EXPERTS_PER_LAYER = 8       # Experts per MoE layer
     EXPERTS_PER_TOKEN = 2           # Top-k routing
     TARGET_EXPERT_REPLICAS = 2      # Redundancy per expert
@@ -1123,8 +1123,7 @@ class DynamicLayerPool:
         Returns:
             Dict mapping layer_id -> list of expert_ids assigned
         """
-        if not self.MOE_ENABLED:
-            return {}
+        # MoE is always enabled - no check needed
         
         with self.lock:
             assigned = {}
@@ -1208,7 +1207,7 @@ class DynamicLayerPool:
     def get_moe_config(self) -> Dict[str, Any]:
         """Get MoE configuration."""
         return {
-            "enabled": self.MOE_ENABLED,
+            "enabled": True,  # MoE is ALWAYS enabled
             "num_experts": self.NUM_EXPERTS_PER_LAYER,
             "experts_per_token": self.EXPERTS_PER_TOKEN,
             "target_replicas": self.TARGET_EXPERT_REPLICAS,
@@ -1288,15 +1287,16 @@ class DynamicNeuroLLM(nn.Module):
         self._on_layers_changed = None
         
         # =====================================================================
-        # MoE CONFIGURATION
+        # MoE CONFIGURATION - ALWAYS ENABLED (no legacy dense mode)
         # =====================================================================
-        self.moe_enabled = layer_pool.MOE_ENABLED
+        # MoE is the inherent architecture of NeuroShard. There is no fallback.
+        # Router weights are synced via DiLoCo along with expert weights.
+        self.moe_enabled = True  # Always True - MoE is the only architecture
         self.my_experts: Dict[int, List[int]] = {}  # layer_id -> [expert_ids]
         self.moe_aux_losses: List[Dict] = []  # Collected MoE aux losses
         
-        moe_status = "MoE enabled" if self.moe_enabled else "Dense model"
         logger.info(f"DynamicNeuroLLM initialized for node {node_id[:8]}... "
-                   f"with {self.architecture.num_layers}L × {self.architecture.hidden_dim}H architecture ({moe_status})")
+                   f"with {self.architecture.num_layers}L × {self.architecture.hidden_dim}H MoE architecture")
     
     def initialize_layers(self, layer_ids: List[int]):
         """Initialize the layers assigned to this node."""
@@ -1315,60 +1315,52 @@ class DynamicNeuroLLM(nn.Module):
         )
         
         # =====================================================================
-        # MoE LAYER INITIALIZATION
+        # MoE LAYER INITIALIZATION (MANDATORY - no fallback)
         # =====================================================================
-        if self.moe_enabled:
-            try:
-                from neuroshard.core.model.moe import MoEDecoderLayer, MoEConfig, create_moe_config
-                
-                # Get expert assignments for this node
-                available_memory = self.layer_pool.node_capacities.get(self.node_id, 4000)
-                self.my_experts = self.layer_pool.assign_experts_to_node(
-                    self.node_id, layer_ids, available_memory
-                )
-                
-                # Initialize MoE layers
-                for layer_id in layer_ids:
-                    local_expert_ids = self.my_experts.get(layer_id, [])
-                    
-                    moe_config = create_moe_config(
-                        hidden_dim=self.architecture.hidden_dim,
-                        intermediate_dim=self.architecture.intermediate_dim,
-                        num_experts=self.layer_pool.NUM_EXPERTS_PER_LAYER,
-                        top_k=self.layer_pool.EXPERTS_PER_TOKEN,
-                        local_expert_ids=local_expert_ids,
-                    )
-                    
-                    layer = MoEDecoderLayer(
-                        hidden_dim=self.architecture.hidden_dim,
-                        num_heads=self.architecture.num_heads,
-                        num_kv_heads=self.architecture.num_kv_heads,
-                        intermediate_dim=self.architecture.intermediate_dim,
-                        max_seq_len=self.architecture.max_seq_len,
-                        layer_idx=layer_id,
-                        moe_config=moe_config,
-                        rope_theta=self.architecture.rope_theta,
-                        attention_dropout=self.architecture.dropout,
-                    )
-                    
-                    # Initialize local experts
-                    layer.moe.initialize_local_experts(local_expert_ids)
-                    layer.to(self.device)
-                    self.my_layers[layer_id] = layer
-                
-                total_experts = sum(len(v) for v in self.my_experts.values())
-                logger.info(f"[MoE] Initialized {len(layer_ids)} MoE layers with {total_experts} local experts")
-                
-            except ImportError as e:
-                logger.warning(f"[MoE] MoE import failed, falling back to dense layers: {e}")
-                self.moe_enabled = False
+        # MoE is the inherent architecture. All layers are MoE layers.
+        # Each node holds a subset of experts per layer.
+        # Router weights are part of the layer and synced via DiLoCo.
+        from neuroshard.core.model.moe import MoEDecoderLayer, MoEConfig, create_moe_config
         
-        # Fall back to dense layers if MoE not enabled or failed
-        if not self.moe_enabled:
-            for layer_id in layer_ids:
-                layer = NeuroDecoderLayer(config, layer_id)
-                layer.to(self.device)
-                self.my_layers[layer_id] = layer
+        # Get expert assignments for this node based on memory capacity
+        available_memory = self.layer_pool.node_capacities.get(self.node_id, 4000)
+        self.my_experts = self.layer_pool.assign_experts_to_node(
+            self.node_id, layer_ids, available_memory
+        )
+        
+        # Initialize MoE layers - EVERY layer is an MoE layer
+        for layer_id in layer_ids:
+            local_expert_ids = self.my_experts.get(layer_id, [])
+            
+            moe_config = create_moe_config(
+                hidden_dim=self.architecture.hidden_dim,
+                intermediate_dim=self.architecture.intermediate_dim,
+                num_experts=self.layer_pool.NUM_EXPERTS_PER_LAYER,
+                top_k=self.layer_pool.EXPERTS_PER_TOKEN,
+                local_expert_ids=local_expert_ids,
+            )
+            
+            layer = MoEDecoderLayer(
+                hidden_dim=self.architecture.hidden_dim,
+                num_heads=self.architecture.num_heads,
+                num_kv_heads=self.architecture.num_kv_heads,
+                intermediate_dim=self.architecture.intermediate_dim,
+                max_seq_len=self.architecture.max_seq_len,
+                layer_idx=layer_id,
+                moe_config=moe_config,
+                rope_theta=self.architecture.rope_theta,
+                attention_dropout=self.architecture.dropout,
+            )
+            
+            # Initialize local experts (router is always initialized)
+            # Router weights will be synced across nodes via DiLoCo
+            layer.moe.initialize_local_experts(local_expert_ids)
+            layer.to(self.device)
+            self.my_layers[layer_id] = layer
+        
+        total_experts = sum(len(v) for v in self.my_experts.values())
+        logger.info(f"[MoE] Initialized {len(layer_ids)} MoE layers with {total_experts} local experts")
+        logger.info(f"[MoE] Router weights will be synced via DiLoCo (size: ~{self.architecture.hidden_dim * self.layer_pool.NUM_EXPERTS_PER_LAYER * 4 // 1024}KB/layer)")
         
         self.my_layer_ids = sorted(layer_ids)
         
@@ -1390,7 +1382,7 @@ class DynamicNeuroLLM(nn.Module):
             self.has_lm_head = True
             logger.info(f"Initialized LM head: {self.vocab_capacity} outputs")
         
-        moe_str = f", MoE experts={sum(len(v) for v in self.my_experts.values())}" if self.moe_enabled else ""
+        moe_str = f", MoE experts={sum(len(v) for v in self.my_experts.values())}"
         logger.info(f"Initialized {len(layer_ids)} layers: {layer_ids}, "
                    f"arch={self.architecture.num_layers}L×{self.architecture.hidden_dim}H, "
                    f"embedding={self.has_embedding}, head={self.has_lm_head}{moe_str}")
@@ -1411,28 +1403,21 @@ class DynamicNeuroLLM(nn.Module):
         for layer_id in self.my_layer_ids:
             layer = self.my_layers[layer_id]
             
-            if self.moe_enabled and hasattr(layer, 'moe'):
-                # MoE layer returns (hidden_states, cache, moe_aux_data)
-                result = layer(
-                    hidden_states, 
-                    attention_mask=attention_mask,
-                    remote_expert_forward=remote_expert_forward
-                )
-                if isinstance(result, tuple) and len(result) == 3:
-                    hidden_states, _, moe_aux = result
-                    if moe_aux and 'aux_losses' in moe_aux:
-                        self.moe_aux_losses.append(moe_aux['aux_losses'])
-                elif isinstance(result, tuple):
-                    hidden_states = result[0]
-                else:
-                    hidden_states = result
+            # All layers are MoE - collect aux losses for load balancing
+            # MoE layers return (hidden_states, cache, moe_aux_data)
+            result = layer(
+                hidden_states, 
+                attention_mask=attention_mask,
+                remote_expert_forward=remote_expert_forward
+            )
+            if isinstance(result, tuple) and len(result) == 3:
+                hidden_states, _, moe_aux = result
+                if moe_aux and 'aux_losses' in moe_aux:
+                    self.moe_aux_losses.append(moe_aux['aux_losses'])
+            elif isinstance(result, tuple):
+                hidden_states = result[0]
             else:
-                # Dense layer returns (hidden_states, cache) tuple
-                result = layer(hidden_states, attention_mask=attention_mask)
-                if isinstance(result, tuple):
-                    hidden_states = result[0]
-                else:
-                    hidden_states = result
+                hidden_states = result
         return hidden_states
     
     def get_moe_aux_loss(self) -> Optional[torch.Tensor]:
@@ -1448,9 +1433,7 @@ class DynamicNeuroLLM(nn.Module):
     
     def get_expert_utilization_stats(self) -> Dict[int, Dict[int, float]]:
         """Get expert utilization for all MoE layers."""
-        if not self.moe_enabled:
-            return {}
-        
+        # All layers are MoE - always collect stats
         stats = {}
         for layer_id in self.my_layer_ids:
             layer = self.my_layers[layer_id]
@@ -2519,13 +2502,14 @@ class DynamicNeuroNode:
             "vocab_capacity": self.model.vocab_capacity,
             "training_rounds": self.total_training_rounds,
             "timestamp": time.time(),
-            # MoE state
-            "moe_enabled": self.model.moe_enabled if hasattr(self.model, 'moe_enabled') else False,
+            # MoE state (always enabled - inherent architecture)
+            "moe_enabled": True,  # Always True - MoE is the only architecture
             "my_experts": self.model.my_experts if hasattr(self.model, 'my_experts') else {},
+            # Router weights are saved as part of layer state_dict above
         }
         
         torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Checkpoint saved: {checkpoint_path.name} (MoE={checkpoint['moe_enabled']})")
+        logger.info(f"Checkpoint saved: {checkpoint_path.name} (MoE architecture)")
     
     def forward_pipeline(self, hidden_states: torch.Tensor, session_id: str,
                         source_layer: int, is_training: bool = False,

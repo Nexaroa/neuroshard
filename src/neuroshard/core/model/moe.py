@@ -1,24 +1,38 @@
 """
 Decentralized Mixture of Experts (MoE) for NeuroShard
 
-This module implements sparse Mixture of Experts layers designed for
-distributed training across heterogeneous nodes. Key innovations:
+This is the INHERENT architecture of NeuroShard. There is no fallback to dense.
+MoE enables massive model scaling with proportional compute costs.
 
-1. DECENTRALIZED EXPERT DISTRIBUTION: Each node holds a subset of experts
-2. DYNAMIC ROUTING: Router runs locally, experts can be local or remote
-3. LOAD BALANCING: Auxiliary loss + capacity limits prevent routing collapse
-4. SCARCITY REWARDS: Under-replicated experts earn bonus NEURO
+Key Design Decisions:
 
-Architecture:
-- Each MoE layer has N experts (default 8)
-- Router (small network) decides which experts to use for each token
-- Top-k routing (typically k=2) selects k experts per token
-- Expert output is weighted sum of selected expert outputs
+1. ROUTER SYNCHRONIZATION:
+   - Router weights are SMALL (~6KB per layer for 768d × 8 experts)
+   - Every node holding an MoE layer has a COPY of the router
+   - Router weights are synced via DiLoCo (part of named_parameters)
+   - This ensures all nodes route tokens consistently
+   
+2. ROUTER GRADIENT COMPUTATION:
+   - Router gradients are computed LOCALLY (no remote calls needed)
+   - We have: router logits + weighted expert outputs
+   - Backward through softmax only needs local tensors
+   - Expert gradients flow separately (local or via gRPC)
 
-Example scaling:
-- 8 nodes with 8 experts each = 64 total experts
-- 8x7B base model = ~56B total params but only 13B compute per token
-- More nodes = more experts = larger effective model
+3. EXPERT DISTRIBUTION:
+   - Each node holds a subset of experts per layer
+   - Under-replicated experts earn scarcity bonuses
+   - Load balancing loss prevents routing collapse
+
+4. SCALING PROPERTIES:
+   - 8 nodes × 8 experts/layer = 64 total experts
+   - Total params: 8 × 7B = 56B
+   - Active params per token: 2/8 × 7B = 1.75B (top-2 routing)
+   - Compute scales with k/N (top-k / total experts)
+
+Why MoE is MANDATORY (no legacy dense mode):
+- Dense layers can't scale to frontier model sizes
+- MoE is how models like GPT-4, Mixtral scale efficiently
+- The infrastructure (DiLoCo, gRPC) supports it natively
 """
 
 import torch
@@ -396,6 +410,34 @@ class DistributedMoELayer(nn.Module):
         """Reset expert utilization statistics."""
         self.expert_counts.zero_()
         self.total_tokens.zero_()
+    
+    def get_router_stats(self) -> Dict[str, Any]:
+        """
+        Get router statistics for monitoring and debugging.
+        
+        Router weights are synced via DiLoCo automatically because:
+        1. self.router is an nn.Module attribute
+        2. DiLoCo uses model.named_parameters() which includes router.gate
+        3. Pseudo-gradients include router weight updates
+        
+        Returns:
+            Dict with router weight stats and sync info
+        """
+        router_weight = self.router.gate.weight
+        return {
+            "router_weight_norm": router_weight.data.norm().item(),
+            "router_weight_mean": router_weight.data.mean().item(),
+            "router_weight_std": router_weight.data.std().item(),
+            "router_shape": list(router_weight.shape),
+            "router_size_bytes": router_weight.numel() * 4,  # float32
+            "router_requires_grad": router_weight.requires_grad,
+            "num_experts": self.config.num_experts,
+            "local_experts": self._local_expert_ids,
+        }
+    
+    def get_router_parameter_name(self) -> str:
+        """Get the parameter name for the router weights (for DiLoCo tracking)."""
+        return "router.gate.weight"
 
 
 # =============================================================================
