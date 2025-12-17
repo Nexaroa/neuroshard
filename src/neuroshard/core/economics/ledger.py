@@ -183,6 +183,12 @@ class PoNWProof:
     # Gradient statistics for verification
     gradient_norm: float = 0.0    # L2 norm of gradients (sanity check)
     
+    # =========================================================================
+    # MoE Expert Tracking (Mixture of Experts)
+    # =========================================================================
+    moe_expert_count: int = 0     # Number of experts held by this node
+    moe_scarcity_avg: float = 1.0 # Average scarcity bonus across held experts
+    
     # Signature
     signature: str = ""
     
@@ -1278,9 +1284,22 @@ class NEUROLedger:
         reputation_bonus = 1.0 + (reputation * REPUTATION_BONUS_MAX)
         
         # =====================================================================
-        # 9. FINAL REWARD
+        # 9. MOE EXPERT SCARCITY BONUS
         # =====================================================================
-        total_reward = base_reward * stake_multiplier * role_multiplier * reputation_bonus
+        # Nodes holding under-replicated experts receive bonus rewards.
+        # This incentivizes a balanced distribution of experts across the network.
+        # Scarcity bonus is up to 1.5x for experts with no replicas.
+        moe_scarcity_bonus = 1.0
+        
+        if hasattr(proof, 'moe_expert_count') and proof.moe_expert_count > 0:
+            # If proof includes MoE scarcity bonus, use it
+            if hasattr(proof, 'moe_scarcity_avg') and proof.moe_scarcity_avg > 0:
+                moe_scarcity_bonus = proof.moe_scarcity_avg
+        
+        # =====================================================================
+        # 10. FINAL REWARD
+        # =====================================================================
+        total_reward = base_reward * stake_multiplier * role_multiplier * reputation_bonus * moe_scarcity_bonus
         
         return total_reward
     

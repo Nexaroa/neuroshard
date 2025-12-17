@@ -599,6 +599,12 @@ class DynamicLayerPool:
     
     MIN_REPLICAS = 2  # Minimum redundancy for fault tolerance
     
+    # MoE Configuration
+    MOE_ENABLED = True              # Enable Mixture of Experts
+    NUM_EXPERTS_PER_LAYER = 8       # Experts per MoE layer
+    EXPERTS_PER_TOKEN = 2           # Top-k routing
+    TARGET_EXPERT_REPLICAS = 2      # Redundancy per expert
+    
     def __init__(self, dht_protocol=None):
         self.layer_assignments: Dict[int, List[LayerAssignment]] = {}
         self.node_capacities: Dict[str, float] = {}
@@ -621,7 +627,22 @@ class DynamicLayerPool:
         self.CHECKPOINT_DIR = Path.home() / ".neuroshard" / "checkpoints"
         self.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         
-        logger.info("DynamicLayerPool initialized with dynamic width + depth scaling")
+        # =====================================================================
+        # MoE EXPERT ASSIGNMENT
+        # =====================================================================
+        # Tracks which node holds which expert for each layer
+        # Structure: {layer_id: {expert_id: [node_id, ...]}}
+        self.expert_assignments: Dict[int, Dict[int, List[str]]] = {}
+        
+        # Node to expert mapping (reverse lookup)
+        # Structure: {node_id: {layer_id: [expert_id, ...]}}
+        self.node_experts: Dict[str, Dict[int, List[int]]] = {}
+        
+        # Expert utilization tracking (for load balancing)
+        # Structure: {layer_id: {expert_id: utilization_fraction}}
+        self.expert_utilization: Dict[int, Dict[int, float]] = {}
+        
+        logger.info("DynamicLayerPool initialized with dynamic width + depth scaling + MoE support")
     
     def _get_checkpoint_path(self, node_id: str) -> Optional[Path]:
         """Get checkpoint path for a node."""
@@ -1075,6 +1096,161 @@ class DynamicLayerPool:
                     del self._last_heartbeat[node_id]
 
         return stale_nodes
+    
+    # =========================================================================
+    # MoE EXPERT ASSIGNMENT METHODS
+    # =========================================================================
+    
+    def assign_experts_to_node(
+        self,
+        node_id: str,
+        layer_ids: List[int],
+        available_memory_mb: float
+    ) -> Dict[int, List[int]]:
+        """
+        Assign MoE experts to a node based on its layer assignments.
+        
+        Strategy:
+        1. For each layer this node holds, assign experts
+        2. Prioritize under-replicated experts (scarcity bonus)
+        3. Limit by memory (each expert takes ~3x hidden_dim x intermediate_dim bytes)
+        
+        Args:
+            node_id: Node identifier
+            layer_ids: Layers this node holds
+            available_memory_mb: Memory available for experts
+            
+        Returns:
+            Dict mapping layer_id -> list of expert_ids assigned
+        """
+        if not self.MOE_ENABLED:
+            return {}
+        
+        with self.lock:
+            assigned = {}
+            
+            # Estimate memory per expert (in MB)
+            # Expert = 3 x hidden_dim x intermediate_dim x 4 bytes (float32)
+            if self.current_architecture:
+                hidden = self.current_architecture.hidden_dim
+                inter = self.current_architecture.intermediate_dim
+                expert_memory_mb = (3 * hidden * inter * 4) / (1024 * 1024)
+            else:
+                expert_memory_mb = 50  # Conservative estimate
+            
+            # How many experts can this node hold per layer?
+            max_experts_per_layer = max(1, int(available_memory_mb * 0.3 / expert_memory_mb))
+            max_experts_per_layer = min(max_experts_per_layer, self.NUM_EXPERTS_PER_LAYER)
+            
+            for layer_id in layer_ids:
+                # Initialize layer's expert assignments if needed
+                if layer_id not in self.expert_assignments:
+                    self.expert_assignments[layer_id] = {
+                        i: [] for i in range(self.NUM_EXPERTS_PER_LAYER)
+                    }
+                
+                # Find under-replicated experts for this layer
+                expert_counts = [
+                    (exp_id, len(self.expert_assignments[layer_id].get(exp_id, [])))
+                    for exp_id in range(self.NUM_EXPERTS_PER_LAYER)
+                ]
+                # Sort by count (ascending) to prioritize under-replicated
+                expert_counts.sort(key=lambda x: x[1])
+                
+                # Assign experts to this node
+                layer_experts = []
+                for exp_id, count in expert_counts:
+                    if len(layer_experts) >= max_experts_per_layer:
+                        break
+                    # Assign if under-replicated or we need more
+                    if count < self.TARGET_EXPERT_REPLICAS or len(layer_experts) == 0:
+                        layer_experts.append(exp_id)
+                        self.expert_assignments[layer_id][exp_id].append(node_id)
+                
+                assigned[layer_id] = layer_experts
+            
+            # Update node's expert registry
+            self.node_experts[node_id] = assigned
+            
+            # Log assignment
+            total_experts = sum(len(v) for v in assigned.values())
+            logger.info(f"[MoE] Assigned {total_experts} experts to node {node_id[:8]} across {len(layer_ids)} layers")
+            
+            return assigned
+    
+    def get_expert_holders(self, layer_id: int, expert_id: int) -> List[str]:
+        """Get nodes holding a specific expert."""
+        with self.lock:
+            return self.expert_assignments.get(layer_id, {}).get(expert_id, [])
+    
+    def get_expert_scarcity_bonus(self, layer_id: int, expert_id: int) -> float:
+        """
+        Calculate scarcity bonus for an expert.
+        
+        Under-replicated experts earn up to 1.5x bonus.
+        """
+        with self.lock:
+            holders = self.expert_assignments.get(layer_id, {}).get(expert_id, [])
+            num_replicas = len(holders)
+            
+            if num_replicas >= self.TARGET_EXPERT_REPLICAS:
+                return 1.0  # No bonus
+            
+            # Bonus scales with scarcity
+            scarcity_factor = (self.TARGET_EXPERT_REPLICAS - num_replicas) / self.TARGET_EXPERT_REPLICAS
+            return 1.0 + 0.5 * scarcity_factor
+    
+    def get_node_experts(self, node_id: str) -> Dict[int, List[int]]:
+        """Get all experts held by a node."""
+        with self.lock:
+            return self.node_experts.get(node_id, {})
+    
+    def get_moe_config(self) -> Dict[str, Any]:
+        """Get MoE configuration."""
+        return {
+            "enabled": self.MOE_ENABLED,
+            "num_experts": self.NUM_EXPERTS_PER_LAYER,
+            "experts_per_token": self.EXPERTS_PER_TOKEN,
+            "target_replicas": self.TARGET_EXPERT_REPLICAS,
+        }
+    
+    def get_layer_expert_status(self, layer_id: int) -> Dict[int, Dict]:
+        """Get status of all experts in a layer."""
+        with self.lock:
+            if layer_id not in self.expert_assignments:
+                return {}
+            
+            status = {}
+            for expert_id in range(self.NUM_EXPERTS_PER_LAYER):
+                holders = self.expert_assignments[layer_id].get(expert_id, [])
+                utilization = self.expert_utilization.get(layer_id, {}).get(expert_id, 0.0)
+                status[expert_id] = {
+                    'replicas': len(holders),
+                    'holders': [h[:8] for h in holders],
+                    'utilization': utilization,
+                    'scarcity_bonus': self.get_expert_scarcity_bonus(layer_id, expert_id),
+                }
+            return status
+    
+    def update_expert_utilization(self, layer_id: int, expert_id: int, utilization: float):
+        """Update utilization for an expert."""
+        with self.lock:
+            if layer_id not in self.expert_utilization:
+                self.expert_utilization[layer_id] = {}
+            self.expert_utilization[layer_id][expert_id] = utilization
+    
+    def remove_node_experts(self, node_id: str):
+        """Remove all expert assignments for a node."""
+        with self.lock:
+            if node_id in self.node_experts:
+                for layer_id, expert_ids in self.node_experts[node_id].items():
+                    for expert_id in expert_ids:
+                        if layer_id in self.expert_assignments:
+                            if expert_id in self.expert_assignments[layer_id]:
+                                holders = self.expert_assignments[layer_id][expert_id]
+                                if node_id in holders:
+                                    holders.remove(node_id)
+                del self.node_experts[node_id]
 
 
 class DynamicNeuroLLM(nn.Module):
@@ -1111,8 +1287,16 @@ class DynamicNeuroLLM(nn.Module):
         self._p2p_manager = None
         self._on_layers_changed = None
         
+        # =====================================================================
+        # MoE CONFIGURATION
+        # =====================================================================
+        self.moe_enabled = layer_pool.MOE_ENABLED
+        self.my_experts: Dict[int, List[int]] = {}  # layer_id -> [expert_ids]
+        self.moe_aux_losses: List[Dict] = []  # Collected MoE aux losses
+        
+        moe_status = "MoE enabled" if self.moe_enabled else "Dense model"
         logger.info(f"DynamicNeuroLLM initialized for node {node_id[:8]}... "
-                   f"with {self.architecture.num_layers}L × {self.architecture.hidden_dim}H architecture")
+                   f"with {self.architecture.num_layers}L × {self.architecture.hidden_dim}H architecture ({moe_status})")
     
     def initialize_layers(self, layer_ids: List[int]):
         """Initialize the layers assigned to this node."""
@@ -1130,11 +1314,61 @@ class DynamicNeuroLLM(nn.Module):
             rope_theta=self.architecture.rope_theta,
         )
         
-        # Initialize transformer layers
-        for layer_id in layer_ids:
-            layer = NeuroDecoderLayer(config, layer_id)
-            layer.to(self.device)
-            self.my_layers[layer_id] = layer
+        # =====================================================================
+        # MoE LAYER INITIALIZATION
+        # =====================================================================
+        if self.moe_enabled:
+            try:
+                from neuroshard.core.model.moe import MoEDecoderLayer, MoEConfig, create_moe_config
+                
+                # Get expert assignments for this node
+                available_memory = self.layer_pool.node_capacities.get(self.node_id, 4000)
+                self.my_experts = self.layer_pool.assign_experts_to_node(
+                    self.node_id, layer_ids, available_memory
+                )
+                
+                # Initialize MoE layers
+                for layer_id in layer_ids:
+                    local_expert_ids = self.my_experts.get(layer_id, [])
+                    
+                    moe_config = create_moe_config(
+                        hidden_dim=self.architecture.hidden_dim,
+                        intermediate_dim=self.architecture.intermediate_dim,
+                        num_experts=self.layer_pool.NUM_EXPERTS_PER_LAYER,
+                        top_k=self.layer_pool.EXPERTS_PER_TOKEN,
+                        local_expert_ids=local_expert_ids,
+                    )
+                    
+                    layer = MoEDecoderLayer(
+                        hidden_dim=self.architecture.hidden_dim,
+                        num_heads=self.architecture.num_heads,
+                        num_kv_heads=self.architecture.num_kv_heads,
+                        intermediate_dim=self.architecture.intermediate_dim,
+                        max_seq_len=self.architecture.max_seq_len,
+                        layer_idx=layer_id,
+                        moe_config=moe_config,
+                        rope_theta=self.architecture.rope_theta,
+                        attention_dropout=self.architecture.dropout,
+                    )
+                    
+                    # Initialize local experts
+                    layer.moe.initialize_local_experts(local_expert_ids)
+                    layer.to(self.device)
+                    self.my_layers[layer_id] = layer
+                
+                total_experts = sum(len(v) for v in self.my_experts.values())
+                logger.info(f"[MoE] Initialized {len(layer_ids)} MoE layers with {total_experts} local experts")
+                
+            except ImportError as e:
+                logger.warning(f"[MoE] MoE import failed, falling back to dense layers: {e}")
+                self.moe_enabled = False
+        
+        # Fall back to dense layers if MoE not enabled or failed
+        if not self.moe_enabled:
+            for layer_id in layer_ids:
+                layer = NeuroDecoderLayer(config, layer_id)
+                layer.to(self.device)
+                self.my_layers[layer_id] = layer
         
         self.my_layer_ids = sorted(layer_ids)
         
@@ -1156,9 +1390,10 @@ class DynamicNeuroLLM(nn.Module):
             self.has_lm_head = True
             logger.info(f"Initialized LM head: {self.vocab_capacity} outputs")
         
+        moe_str = f", MoE experts={sum(len(v) for v in self.my_experts.values())}" if self.moe_enabled else ""
         logger.info(f"Initialized {len(layer_ids)} layers: {layer_ids}, "
                    f"arch={self.architecture.num_layers}L×{self.architecture.hidden_dim}H, "
-                   f"embedding={self.has_embedding}, head={self.has_lm_head}")
+                   f"embedding={self.has_embedding}, head={self.has_lm_head}{moe_str}")
     
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Convert token IDs to embeddings."""
@@ -1167,17 +1402,61 @@ class DynamicNeuroLLM(nn.Module):
         return self.embedding(input_ids)
     
     def forward_my_layers(self, hidden_states: torch.Tensor,
-                          attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                          attention_mask: Optional[torch.Tensor] = None,
+                          remote_expert_forward: Optional[callable] = None) -> torch.Tensor:
         """Forward through only my layers."""
+        # Clear previous aux losses
+        self.moe_aux_losses = []
+        
         for layer_id in self.my_layer_ids:
             layer = self.my_layers[layer_id]
-            result = layer(hidden_states, attention_mask=attention_mask)
-            # Handle layers that return (hidden_states, cache) tuple
-            if isinstance(result, tuple):
-                hidden_states = result[0]
+            
+            if self.moe_enabled and hasattr(layer, 'moe'):
+                # MoE layer returns (hidden_states, cache, moe_aux_data)
+                result = layer(
+                    hidden_states, 
+                    attention_mask=attention_mask,
+                    remote_expert_forward=remote_expert_forward
+                )
+                if isinstance(result, tuple) and len(result) == 3:
+                    hidden_states, _, moe_aux = result
+                    if moe_aux and 'aux_losses' in moe_aux:
+                        self.moe_aux_losses.append(moe_aux['aux_losses'])
+                elif isinstance(result, tuple):
+                    hidden_states = result[0]
+                else:
+                    hidden_states = result
             else:
-                hidden_states = result
+                # Dense layer returns (hidden_states, cache) tuple
+                result = layer(hidden_states, attention_mask=attention_mask)
+                if isinstance(result, tuple):
+                    hidden_states = result[0]
+                else:
+                    hidden_states = result
         return hidden_states
+    
+    def get_moe_aux_loss(self) -> Optional[torch.Tensor]:
+        """Get combined MoE auxiliary loss for training."""
+        if not self.moe_aux_losses:
+            return None
+        
+        total_aux = torch.tensor(0.0, device=self.device)
+        for aux in self.moe_aux_losses:
+            total_aux = total_aux + aux.get('load_balancing_loss', 0)
+            total_aux = total_aux + aux.get('router_z_loss', 0)
+        return total_aux
+    
+    def get_expert_utilization_stats(self) -> Dict[int, Dict[int, float]]:
+        """Get expert utilization for all MoE layers."""
+        if not self.moe_enabled:
+            return {}
+        
+        stats = {}
+        for layer_id in self.my_layer_ids:
+            layer = self.my_layers[layer_id]
+            if hasattr(layer, 'moe') and hasattr(layer.moe, 'get_expert_utilization'):
+                stats[layer_id] = layer.moe.get_expert_utilization()
+        return stats
     
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute output logits."""
@@ -2239,11 +2518,14 @@ class DynamicNeuroNode:
             },
             "vocab_capacity": self.model.vocab_capacity,
             "training_rounds": self.total_training_rounds,
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            # MoE state
+            "moe_enabled": self.model.moe_enabled if hasattr(self.model, 'moe_enabled') else False,
+            "my_experts": self.model.my_experts if hasattr(self.model, 'my_experts') else {},
         }
         
         torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Checkpoint saved: {checkpoint_path.name}")
+        logger.info(f"Checkpoint saved: {checkpoint_path.name} (MoE={checkpoint['moe_enabled']})")
     
     def forward_pipeline(self, hidden_states: torch.Tensor, session_id: str,
                         source_layer: int, is_training: bool = False,

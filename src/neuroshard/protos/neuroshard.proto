@@ -107,6 +107,17 @@ service NeuroShardService {
     
     // Submit spot-check challenge for gradient commitment
     rpc SpotCheckChallenge (SpotCheckChallengeRequest) returns (SpotCheckChallengeResponse);
+    
+    // --- Mixture of Experts (MoE) RPCs ---
+    
+    // Forward activations to a remote expert
+    rpc ExpertForward (ExpertForwardRequest) returns (ExpertForwardResponse);
+    
+    // Get expert status for routing decisions
+    rpc GetExpertStatus (ExpertStatusRequest) returns (ExpertStatusResponse);
+    
+    // Announce expert availability to network
+    rpc AnnounceExpert (AnnounceExpertRequest) returns (AnnounceExpertResponse);
 }
 
 message InferenceRequest {
@@ -851,4 +862,70 @@ message SpotCheckChallengeResponse {
     bool accepted = 1;
     string challenge_id = 2;
     string reason = 3;
+}
+
+// =============================================================================
+// MIXTURE OF EXPERTS (MoE) MESSAGES
+// =============================================================================
+
+// Request to forward activations through a remote expert
+message ExpertForwardRequest {
+    string request_id = 1;
+    int32 layer_id = 2;              // Which transformer layer
+    int32 expert_id = 3;             // Which expert in the layer
+    
+    bytes activations = 4;           // Serialized input tensor
+    repeated int64 shape = 5;        // Tensor shape [num_tokens, hidden_dim]
+    string dtype = 6;                // float32, float16, bfloat16
+    
+    bool requires_grad = 7;          // For training
+    string sender_url = 8;           // For gradient routing
+    string session_id = 9;           // Training session
+}
+
+message ExpertForwardResponse {
+    string request_id = 1;
+    bool success = 2;
+    string error_message = 3;
+    
+    bytes output = 4;                // Serialized output tensor
+    repeated int64 shape = 5;
+    
+    float utilization = 6;           // Current expert utilization (0-1)
+    int32 queue_depth = 7;           // Pending requests
+}
+
+// Request expert status for routing decisions
+message ExpertStatusRequest {
+    int32 layer_id = 1;
+    int32 expert_id = 2;
+}
+
+message ExpertStatusResponse {
+    bool available = 1;
+    float utilization = 2;           // 0-1 current load
+    int32 queue_depth = 3;           // Pending requests
+    float capacity = 4;              // Tokens/second capacity
+    int32 replicas = 5;              // Number of replicas in network
+}
+
+// Announce expert availability
+message AnnounceExpertRequest {
+    string node_id = 1;
+    string node_url = 2;
+    string grpc_addr = 3;
+    
+    int32 layer_id = 4;
+    int32 expert_id = 5;
+    
+    float capacity = 6;              // Tokens/second
+    float utilization = 7;           // Current load 0-1
+    double timestamp = 8;
+}
+
+message AnnounceExpertResponse {
+    bool accepted = 1;
+    string reason = 2;
+    int32 total_replicas = 3;        // How many nodes have this expert
+    float scarcity_bonus = 4;        // Reward multiplier for holding
 }

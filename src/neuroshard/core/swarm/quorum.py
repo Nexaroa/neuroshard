@@ -2178,6 +2178,12 @@ class AsyncTrainer:
                             ignore_index=-100
                         )
                         
+                        # Add MoE auxiliary loss if MoE is enabled
+                        if hasattr(self.model, 'moe_enabled') and self.model.moe_enabled:
+                            moe_aux = self.model.get_moe_aux_loss()
+                            if moe_aux is not None:
+                                loss = loss + moe_aux
+                        
                         # Backward pass
                         self.optimizer.zero_grad()
                         loss.backward()

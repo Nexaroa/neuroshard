@@ -1444,6 +1444,186 @@ class NeuroShardServiceServicer(DHTServiceMixin, neuroshard_pb2_grpc.NeuroShardS
                 reason=str(e)
             )
 
+    # ==================== MIXTURE OF EXPERTS (MoE) RPCs ====================
+    
+    def ExpertForward(self, request, context):
+        """
+        Forward activations through a specific expert.
+        
+        This enables distributed MoE where experts are spread across nodes.
+        The router runs locally, but expert computation may be remote.
+        """
+        try:
+            import numpy as np
+            
+            layer_id = request.layer_id
+            expert_id = request.expert_id
+            
+            # Check if we have this expert
+            if not self.is_dynamic_node:
+                return neuroshard_pb2.ExpertForwardResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    error_message="Not a dynamic node"
+                )
+            
+            # Check if expert is available on this node
+            if not hasattr(self.model, 'my_experts'):
+                return neuroshard_pb2.ExpertForwardResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    error_message="MoE not enabled on this node"
+                )
+            
+            my_experts = self.model.my_experts.get(layer_id, [])
+            if expert_id not in my_experts:
+                return neuroshard_pb2.ExpertForwardResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    error_message=f"Expert {expert_id} not on this node (have {my_experts})"
+                )
+            
+            # Deserialize input tensor
+            activations = torch.from_numpy(
+                np.frombuffer(request.activations, dtype=np.float32)
+            ).reshape(list(request.shape))
+            
+            # Get the layer and run expert
+            layer = self.model.my_layers.get(layer_id)
+            if layer is None or not hasattr(layer, 'moe'):
+                return neuroshard_pb2.ExpertForwardResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    error_message=f"Layer {layer_id} not found or not MoE"
+                )
+            
+            # Forward through the specific expert
+            moe = layer.moe
+            if str(expert_id) not in moe.local_experts:
+                return neuroshard_pb2.ExpertForwardResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    error_message=f"Expert {expert_id} not initialized"
+                )
+            
+            # Move to device and forward
+            activations = activations.to(self.model.device)
+            with torch.no_grad():
+                expert = moe.local_experts[str(expert_id)]
+                output = expert(activations)
+            
+            # Serialize output
+            output_np = output.cpu().numpy().astype(np.float32)
+            output_bytes = output_np.tobytes()
+            
+            # Get utilization stats
+            utilization = moe.expert_counts[expert_id].item() / max(1, moe.total_tokens.item())
+            
+            logger.debug(f"[MoE] ExpertForward: layer={layer_id}, expert={expert_id}, "
+                        f"shape={list(activations.shape)}")
+            
+            return neuroshard_pb2.ExpertForwardResponse(
+                request_id=request.request_id,
+                success=True,
+                output=output_bytes,
+                shape=list(output.shape),
+                utilization=utilization,
+                queue_depth=0
+            )
+            
+        except Exception as e:
+            logger.error(f"ExpertForward error: {e}")
+            return neuroshard_pb2.ExpertForwardResponse(
+                request_id=request.request_id,
+                success=False,
+                error_message=str(e)
+            )
+    
+    def GetExpertStatus(self, request, context):
+        """Get status of a specific expert for routing decisions."""
+        try:
+            layer_id = request.layer_id
+            expert_id = request.expert_id
+            
+            if not self.is_dynamic_node or not hasattr(self.model, 'my_experts'):
+                return neuroshard_pb2.ExpertStatusResponse(available=False)
+            
+            my_experts = self.model.my_experts.get(layer_id, [])
+            available = expert_id in my_experts
+            
+            utilization = 0.0
+            queue_depth = 0
+            
+            if available and layer_id in self.model.my_layers:
+                layer = self.model.my_layers[layer_id]
+                if hasattr(layer, 'moe'):
+                    moe = layer.moe
+                    if moe.total_tokens.item() > 0:
+                        utilization = moe.expert_counts[expert_id].item() / moe.total_tokens.item()
+            
+            # Get replica count from layer pool
+            replicas = 1
+            if hasattr(self.model, 'layer_pool'):
+                holders = self.model.layer_pool.get_expert_holders(layer_id, expert_id)
+                replicas = len(holders)
+            
+            return neuroshard_pb2.ExpertStatusResponse(
+                available=available,
+                utilization=utilization,
+                queue_depth=queue_depth,
+                capacity=1000.0,  # tokens/second estimate
+                replicas=replicas
+            )
+            
+        except Exception as e:
+            logger.error(f"GetExpertStatus error: {e}")
+            return neuroshard_pb2.ExpertStatusResponse(available=False)
+    
+    def AnnounceExpert(self, request, context):
+        """Receive expert availability announcement."""
+        try:
+            from neuroshard.core.model.dynamic import ExpertAssignment
+            
+            layer_id = request.layer_id
+            expert_id = request.expert_id
+            node_id = request.node_id
+            
+            # Update layer pool with expert info
+            if hasattr(self.model, 'layer_pool'):
+                # The layer pool will track this for routing
+                self.model.layer_pool.expert_assignments.setdefault(layer_id, {})
+                self.model.layer_pool.expert_assignments[layer_id].setdefault(expert_id, [])
+                
+                # Add this node if not already tracked
+                holders = self.model.layer_pool.expert_assignments[layer_id][expert_id]
+                if node_id not in holders:
+                    holders.append(node_id)
+                
+                # Calculate scarcity bonus
+                scarcity_bonus = self.model.layer_pool.get_expert_scarcity_bonus(layer_id, expert_id)
+                total_replicas = len(holders)
+                
+                logger.debug(f"[MoE] Expert announced: layer={layer_id}, expert={expert_id}, "
+                            f"node={node_id[:8]}, replicas={total_replicas}, bonus={scarcity_bonus:.2f}")
+                
+                return neuroshard_pb2.AnnounceExpertResponse(
+                    accepted=True,
+                    total_replicas=total_replicas,
+                    scarcity_bonus=scarcity_bonus
+                )
+            
+            return neuroshard_pb2.AnnounceExpertResponse(
+                accepted=False,
+                reason="No layer pool available"
+            )
+            
+        except Exception as e:
+            logger.error(f"AnnounceExpert error: {e}")
+            return neuroshard_pb2.AnnounceExpertResponse(
+                accepted=False,
+                reason=str(e)
+            )
+
 
 def serve_grpc(port: int, model, p2p: P2PManager, swap_controller=None):
     """Start the gRPC server."""

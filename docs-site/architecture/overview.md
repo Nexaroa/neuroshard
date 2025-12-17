@@ -45,6 +45,7 @@ The neural network model, distributed across nodes.
 
 **Key Features**:
 - Transformer architecture with RMSNorm, RoPE, GQA, SwiGLU
+- **Distributed Mixture of Experts (MoE)** for sparse computation
 - Dynamic depth and width based on network capacity
 - Sharded across nodes via Layer Pool
 - Checkpoint-based persistence
@@ -53,6 +54,7 @@ The neural network model, distributed across nodes.
 class DynamicNeuroLLM:
     architecture: ModelArchitecture  # Dynamic config
     my_layers: Dict[int, nn.Module]  # Only layers we hold
+    my_experts: Dict[int, List[int]] # MoE experts per layer
     embedding: nn.Embedding          # If Driver
     lm_head: nn.Linear              # If Validator
 ```
@@ -259,6 +261,7 @@ graph TD
 ## Next Steps
 
 - [NeuroLLM Model](/architecture/neurollm) — Model architecture
+- [Mixture of Experts](/architecture/mixture-of-experts) — Distributed MoE for sparse computation
 - [Genesis Data Pipeline](/architecture/genesis-data) — How training data is prepared and distributed
 - [Tokenization (BPE)](/architecture/tokenization) — Byte Pair Encoding tokenizer
 - [Dynamic Scaling](/architecture/dynamic-scaling) — How scaling works
