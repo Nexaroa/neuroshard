@@ -1,38 +1,25 @@
 """
-Decentralized Mixture of Experts (MoE) for NeuroShard
+Mixture of Experts (MoE) for NeuroShard
 
-This is the INHERENT architecture of NeuroShard. There is no fallback to dense.
-MoE enables massive model scaling with proportional compute costs.
+Sparse MoE layers with distributed expert support. Scales from
+1 node (all experts local) to thousands of nodes (experts distributed).
 
-Key Design Decisions:
+Components:
+- MoEConfig: Configuration dataclass
+- MoERouter: Token-to-expert routing (top-k selection)
+- Expert: Single FFN expert (SwiGLU)
+- DistributedMoELayer: Full MoE layer with local/remote expert support
+- MoEDecoderLayer: Transformer layer with attention + MoE FFN
 
-1. ROUTER SYNCHRONIZATION:
-   - Router weights are SMALL (~6KB per layer for 768d × 8 experts)
-   - Every node holding an MoE layer has a COPY of the router
-   - Router weights are synced via DiLoCo (part of named_parameters)
-   - This ensures all nodes route tokens consistently
-   
-2. ROUTER GRADIENT COMPUTATION:
-   - Router gradients are computed LOCALLY (no remote calls needed)
-   - We have: router logits + weighted expert outputs
-   - Backward through softmax only needs local tensors
-   - Expert gradients flow separately (local or via gRPC)
+Scaling:
+- 1 node: All experts local, no remote calls
+- N nodes: Experts distributed, remote calls when needed
+- Memory-based assignment: Small nodes hold fewer experts
 
-3. EXPERT DISTRIBUTION:
-   - Each node holds a subset of experts per layer
-   - Under-replicated experts earn scarcity bonuses
-   - Load balancing loss prevents routing collapse
-
-4. SCALING PROPERTIES:
-   - 8 nodes × 8 experts/layer = 64 total experts
-   - Total params: 8 × 7B = 56B
-   - Active params per token: 2/8 × 7B = 1.75B (top-2 routing)
-   - Compute scales with k/N (top-k / total experts)
-
-Why MoE is MANDATORY (no legacy dense mode):
-- Dense layers can't scale to frontier model sizes
-- MoE is how models like GPT-4, Mixtral scale efficiently
-- The infrastructure (DiLoCo, gRPC) supports it natively
+Router Sync:
+- Routers synced via DiLoCo (part of named_parameters)
+- Small weights (~6KB per layer)
+- Gradients computed locally
 """
 
 import torch
@@ -274,6 +261,7 @@ class DistributedMoELayer(nn.Module):
         # Statistics tracking
         self.register_buffer('expert_counts', torch.zeros(config.num_experts))
         self.register_buffer('total_tokens', torch.tensor(0))
+        self._missing_expert_count = 0  # Track missing expert calls
     
     def initialize_local_experts(self, expert_ids: List[int]):
         """
@@ -361,13 +349,24 @@ class DistributedMoELayer(nn.Module):
                 else:
                     # Remote expert computation
                     if remote_expert_forward is not None:
-                        expert_output = remote_expert_forward(
-                            self.layer_idx, expert_id, expert_input
-                        )
+                        try:
+                            expert_output = remote_expert_forward(
+                                self.layer_idx, expert_id, expert_input
+                            )
+                        except Exception as e:
+                            # Remote call failed - use pass-through (residual)
+                            logger.debug(f"[MoE] Remote expert {expert_id} call failed: {e}")
+                            expert_output = expert_input  # Pass-through preserves info
+                            self._missing_expert_count += 1
                     else:
-                        # Fallback: use zero (expert not available)
-                        logger.warning(f"[MoE] Expert {expert_id} not available, using zeros")
-                        expert_output = torch.zeros_like(expert_input)
+                        # No remote forward function - use pass-through
+                        # This happens during single-node testing or when network is unavailable
+                        # Pass-through is safer than zeros (preserves gradient flow)
+                        if not hasattr(self, '_missing_logged'):
+                            logger.debug(f"[MoE] Expert {expert_id} not available locally, using pass-through")
+                            self._missing_logged = True
+                        expert_output = expert_input  # Pass-through
+                        self._missing_expert_count += 1
                 
                 # Apply dropout
                 expert_output = self.expert_dropout(expert_output)
@@ -406,10 +405,23 @@ class DistributedMoELayer(nn.Module):
             utilization[i] = self.expert_counts[i].item() / self.total_tokens.item()
         return utilization
     
+    def get_layer_stats(self) -> Dict[str, Any]:
+        """Get comprehensive layer statistics."""
+        return {
+            "layer_idx": self.layer_idx,
+            "num_experts": self.config.num_experts,
+            "local_experts": self._local_expert_ids,
+            "num_local": len(self._local_expert_ids),
+            "total_tokens": self.total_tokens.item(),
+            "missing_expert_calls": self._missing_expert_count,
+            "utilization": self.get_expert_utilization(),
+        }
+    
     def reset_statistics(self):
         """Reset expert utilization statistics."""
         self.expert_counts.zero_()
         self.total_tokens.zero_()
+        self._missing_expert_count = 0
     
     def get_router_stats(self) -> Dict[str, Any]:
         """

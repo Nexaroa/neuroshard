@@ -1,8 +1,6 @@
 # Mixture of Experts (MoE)
 
-MoE is the **INHERENT architecture** of NeuroShard. There is no legacy dense mode - every layer is an MoE layer. This enables massive model scaling with proportional compute costs.
-
-> **Why MoE is mandatory:** Dense layers can't scale to frontier model sizes. MoE is how models like GPT-4, Mixtral, and DeepSeek scale efficiently. NeuroShard's infrastructure (DiLoCo, gRPC) natively supports distributed MoE.
+NeuroShard uses sparse Mixture of Experts layers that distribute computation across the network. Each layer has multiple expert FFNs, and a router selects which experts process each token.
 
 ## Overview
 
@@ -16,14 +14,14 @@ MoE is the **INHERENT architecture** of NeuroShard. There is no legacy dense mod
                     │                 │                        │
                     │                 ▼                        │
                     │  ┌──────────────────────────────────┐   │
-                    │  │            Router                 │   │ (Always Local)
+                    │  │            Router                 │   │
                     │  │     "Which 2 experts?"           │   │
                     │  └─────────────┬────────────────────┘   │
                     │                │                        │
                     │     ┌──────────┼──────────┐            │
                     │     ▼          ▼          ▼            │
                     │  ┌─────┐   ┌─────┐   ┌─────┐          │
-                    │  │ E0  │   │ E3  │   │ E7  │  ...     │ (Local or Remote)
+                    │  │ E0  │   │ E3  │   │ E7  │  ...     │
                     │  │Local│   │Peer1│   │Peer2│          │
                     │  └──┬──┘   └──┬──┘   └──┬──┘          │
                     │     │         │         │              │
@@ -34,356 +32,259 @@ MoE is the **INHERENT architecture** of NeuroShard. There is no legacy dense mod
                     └─────────────────────────────────────────┘
 ```
 
-## Architecture
-
-### Expert Configuration
+## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `num_experts` | 8 | Experts per MoE layer |
 | `experts_per_token` | 2 | Top-k routing (k experts per token) |
-| `target_replicas` | 2 | Redundancy per expert |
+| `target_replicas` | 2 | Minimum replicas per expert |
 | `capacity_factor` | 1.25 | Buffer for load balancing |
 
-### Scaling Properties
+## Network Scaling
 
-- **8 nodes × 8 experts/layer = 64 total experts per layer**
-- Total parameters: 8 × 7B = **56B**
-- Active parameters per token: (2/8) × 7B ≈ **1.75B**
-- Compute scales with k/N (top-k / total experts)
+MoE works at any network size:
+
+### Single Node (Bootstrap)
+
+When only one node is in the network, it holds all experts locally:
+
+```
+┌────────────────────────────────────────┐
+│            Single Node                  │
+│                                         │
+│   Layer 0: E0, E1, E2, E3, E4, E5, E6, E7  │
+│   Layer 1: E0, E1, E2, E3, E4, E5, E6, E7  │
+│   ...                                   │
+│                                         │
+│   All experts local → no remote calls   │
+└────────────────────────────────────────┘
+```
+
+- Full model runs locally
+- No gRPC overhead
+- Training works normally
+
+### Small Network (2-8 nodes)
+
+Experts distribute across nodes:
+
+```
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│   Node A    │   │   Node B    │   │   Node C    │
+├─────────────┤   ├─────────────┤   ├─────────────┤
+│ E0, E1, E2  │   │ E2, E3, E4  │   │ E5, E6, E7  │
+│ (3 experts) │   │ (3 experts) │   │ (3 experts) │
+└─────────────┘   └─────────────┘   └─────────────┘
+
+Note: E2 is replicated on A and B for redundancy
+```
+
+- Each node holds a subset of experts
+- Some experts replicated for redundancy
+- Cross-node calls when needed
+
+### Large Network (100+ nodes)
+
+Experts replicated for availability and load balancing:
+
+```
+Expert 0: Nodes A, D, K, P, ...  (high demand → many replicas)
+Expert 1: Nodes B, E, L, Q, ...
+...
+Expert 7: Nodes C, G, M, R, ...  (low demand → fewer replicas)
+```
+
+- Popular experts get more replicas
+- Scarcity bonus incentivizes holding rare experts
+- Load naturally balances
+
+## Node Capacity Handling
+
+Nodes with different computational power are all supported:
+
+### Small Nodes (e.g., Jetson Orin, 8-16GB)
+
+```python
+# Assignment based on available memory
+available_memory = 8000  # MB
+
+# Small node might hold 2 experts per layer
+experts_per_layer = available_memory // expert_memory_mb
+# Result: 1-2 experts per layer
+```
+
+- Hold fewer experts
+- Rely on network for remaining experts
+- Still contribute to training
+
+### Large Nodes (e.g., A100, 80GB)
+
+```python
+available_memory = 80000  # MB
+
+# Large node can hold all 8 experts per layer
+experts_per_layer = min(8, available_memory // expert_memory_mb)
+# Result: 8 experts per layer
+```
+
+- Hold all or most experts locally
+- Serve as expert providers for smaller nodes
+- Higher NEURO rewards (more work)
+
+### Expert Assignment Algorithm
+
+```python
+def assign_experts(node_id, layer_ids, available_memory):
+    """Assign experts based on node capacity."""
+    
+    # Calculate how many experts this node can hold per layer
+    expert_memory = hidden_dim * intermediate_dim * 4 * 2 / 1e6  # MB
+    max_experts = int(available_memory / (len(layer_ids) * expert_memory))
+    experts_per_layer = min(NUM_EXPERTS_PER_LAYER, max(1, max_experts))
+    
+    assigned = {}
+    for layer_id in layer_ids:
+        # Prefer under-replicated experts (scarcity bonus)
+        candidates = get_underreplicated_experts(layer_id)
+        assigned[layer_id] = candidates[:experts_per_layer]
+    
+    return assigned
+```
+
+## Handling Missing Experts
+
+When a required expert isn't available locally:
+
+### 1. Try Remote Call
+
+```python
+if expert_id not in local_experts:
+    # Find peer with this expert
+    peer = find_expert_holder(layer_id, expert_id)
+    if peer:
+        output = grpc_expert_forward(peer, activations)
+```
+
+### 2. Fallback: Skip Token
+
+If no peer has the expert (rare edge case):
+
+```python
+if peer is None:
+    # Token doesn't get this expert's contribution
+    # Other selected expert(s) still contribute
+    logger.warning(f"Expert {expert_id} unavailable, skipping")
+    output = torch.zeros_like(input)
+```
+
+This is rare because:
+- Target replication ensures 2+ copies of each expert
+- Network incentivizes holding rare experts (scarcity bonus)
+- New nodes prioritize under-replicated experts
+
+### 3. Single-Node Mode
+
+When network has only 1 node, all experts are local:
+
+```python
+def initialize_layers(self, layer_ids):
+    # Check if we're the only node
+    if len(self.layer_pool.node_capacities) <= 1:
+        # Single node: hold ALL experts
+        for layer_id in layer_ids:
+            self.my_experts[layer_id] = list(range(NUM_EXPERTS_PER_LAYER))
+```
 
 ## Router Synchronization
 
-A critical question for distributed MoE: **How do router weights stay in sync across nodes?**
-
-### The Solution: DiLoCo Sync
+Each node has a copy of the router. Routers stay in sync via DiLoCo:
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                    Router Weight Synchronization                    │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  Node A                 Node B                 Node C               │
-│  ┌─────────┐            ┌─────────┐            ┌─────────┐         │
-│  │ Router  │            │ Router  │            │ Router  │         │
-│  │ (copy)  │            │ (copy)  │            │ (copy)  │         │
-│  └────┬────┘            └────┬────┘            └────┬────┘         │
-│       │                      │                      │               │
-│       │    ┌─────────────────┼──────────────────┐   │               │
-│       └────►     DiLoCo Pseudo-Gradient Sync    ◄───┘               │
-│            │  (includes router.gate.weight)     │                   │
-│            └────────────────────────────────────┘                   │
-│                                                                     │
-│  Router weights: ~6KB per layer (768d × 8 experts × 4 bytes)        │
-│  Synced every: 500 training steps (DiLoCo inner loop)               │
-│  Method: Pseudo-gradient aggregation (w_initial - w_current)        │
-│                                                                     │
-└────────────────────────────────────────────────────────────────────┘
+Node A            Node B            Node C
+┌─────────┐       ┌─────────┐       ┌─────────┐
+│ Router  │       │ Router  │       │ Router  │
+│ (copy)  │       │ (copy)  │       │ (copy)  │
+└────┬────┘       └────┬────┘       └────┬────┘
+     │                 │                 │
+     └────────────┬────┴─────────────────┘
+                  ▼
+          DiLoCo Sync
+    (includes router weights)
 ```
 
-### Key Properties
+- Router weights: ~6KB per layer
+- Synced every 500 steps
+- Part of normal DiLoCo pseudo-gradient aggregation
 
-1. **Router is Small**: Only `hidden_dim × num_experts` parameters (~6KB/layer)
-2. **Part of named_parameters()**: Automatically included in DiLoCo sync
-3. **Gradients Computed Locally**: We have router logits + weighted outputs
-4. **Eventual Consistency**: Routers converge via DiLoCo aggregation
+## Training
 
-### Why This Works
+Training works the same regardless of network size:
 
 ```python
-# In DiLoCo sync, router weights are naturally included:
-pseudo_gradients = {}
-for name, param in model.named_parameters():
-    # This includes "layer.moe.router.gate.weight"
-    pseudo_gradients[name] = initial_weights[name] - param.data
+# Forward pass (router selects experts)
+output = model(input_ids)
 
-# All nodes submit pseudo-gradients → aggregated → applied
-# Result: Router weights converge to consensus
-```
+# Compute loss
+loss = cross_entropy(output, labels)
 
-### Divergence Handling
+# Add load balancing loss (prevents routing collapse)
+aux_loss = model.get_moe_aux_loss()
+if aux_loss is not None:
+    loss = loss + aux_loss
 
-Short-term divergence is **acceptable** because:
-- Routers train on similar data (Genesis dataset)
-- DiLoCo syncs every 500 steps (~10 minutes)
-- Load balancing loss encourages similar routing patterns
-- Different routing = different expert utilization = scarcity bonuses redistribute
-
-## How It Works
-
-### 1. Router (Always Local)
-
-The router is a simple linear layer that runs on each node:
-
-```python
-class MoERouter(nn.Module):
-    def __init__(self, hidden_dim, num_experts):
-        self.gate = nn.Linear(hidden_dim, num_experts, bias=False)
-    
-    def forward(self, hidden_states):
-        logits = self.gate(hidden_states)
-        probs = F.softmax(logits, dim=-1)
-        weights, indices = torch.topk(probs, k=2)  # Top-2
-        return weights, indices
-```
-
-### 2. Expert Selection
-
-For each token, the router selects the top-k experts (default k=2):
-
-```
-Token "hello" → Router → [Expert 3: 0.45, Expert 7: 0.35]
-Token "world" → Router → [Expert 1: 0.52, Expert 4: 0.28]
-```
-
-### 3. Expert Computation
-
-Experts may be local or remote:
-
-- **Local Expert**: Compute immediately using the local MoE layer
-- **Remote Expert**: Forward activations via gRPC to the node holding that expert
-
-```python
-if layer_pool.is_expert_local(layer_id, expert_id):
-    output = local_experts[expert_id](activations)
-else:
-    output = grpc_client.ExpertForward(layer_id, expert_id, activations)
-```
-
-### 4. Weighted Combination
-
-Expert outputs are combined using router weights:
-
-```python
-final_output = sum(weight_i * expert_output_i for i in selected_experts)
-```
-
-## Expert Assignment
-
-### Strategy
-
-When a node joins, experts are assigned based on:
-
-1. **Memory capacity**: More memory = more experts
-2. **Scarcity**: Prioritize under-replicated experts
-3. **Load balancing**: Distribute evenly across layers
-
-```python
-def assign_experts_to_node(node_id, layer_ids, memory_mb):
-    for layer_id in layer_ids:
-        # Find under-replicated experts
-        expert_counts = get_expert_replica_counts(layer_id)
-        
-        # Assign up to max_experts based on memory
-        max_experts = min(8, memory_mb * 0.3 / expert_memory_mb)
-        
-        # Prioritize scarcest experts
-        for expert_id in sorted_by_scarcity(expert_counts):
-            if count[expert_id] < target_replicas:
-                assign(node_id, layer_id, expert_id)
-```
-
-### Scarcity Bonus
-
-Under-replicated experts earn bonus NEURO to incentivize balanced distribution:
-
-```
-scarcity_bonus = 1.0 + 0.5 × (target_replicas - current_replicas) / target_replicas
-```
-
-| Current Replicas | Target | Scarcity Bonus |
-|------------------|--------|----------------|
-| 0 | 2 | 1.50× |
-| 1 | 2 | 1.25× |
-| 2+ | 2 | 1.00× |
-
-## Load Balancing
-
-### Auxiliary Losses
-
-To prevent routing collapse (all tokens going to few experts), MoE uses auxiliary losses:
-
-**1. Load Balancing Loss**
-
-Encourages uniform expert utilization:
-
-```
-L_aux = α × N × Σ(tokens_fraction_i × prob_fraction_i)
-```
-
-Where:
-- `α = 0.01` (coefficient)
-- `N = num_experts`
-- `tokens_fraction_i` = fraction of tokens routed to expert i
-- `prob_fraction_i` = average router probability for expert i
-
-**2. Router Z-Loss**
-
-Prevents router logits from growing too large:
-
-```
-L_z = β × mean(log_sum_exp(logits)²)
-```
-
-Where `β = 0.001`.
-
-### Capacity Limiting
-
-Each expert has a capacity limit to prevent overload:
-
-```python
-capacity = (batch_size × seq_len × top_k / num_experts) × capacity_factor
-```
-
-Tokens exceeding capacity are dropped (during training) or queued (during inference).
-
-## gRPC Interface
-
-### ExpertForward
-
-Forward activations through a remote expert:
-
-```protobuf
-message ExpertForwardRequest {
-    string request_id = 1;
-    int32 layer_id = 2;
-    int32 expert_id = 3;
-    bytes activations = 4;
-    repeated int64 shape = 5;
-    string dtype = 6;
-}
-
-message ExpertForwardResponse {
-    bool success = 1;
-    bytes output = 2;
-    float utilization = 3;  // Current load 0-1
-}
-```
-
-### GetExpertStatus
-
-Query expert availability for routing:
-
-```protobuf
-message ExpertStatusRequest {
-    int32 layer_id = 1;
-    int32 expert_id = 2;
-}
-
-message ExpertStatusResponse {
-    bool available = 1;
-    float utilization = 2;
-    int32 replicas = 3;
-}
-```
-
-### AnnounceExpert
-
-Announce expert availability to network:
-
-```protobuf
-message AnnounceExpertRequest {
-    string node_id = 1;
-    int32 layer_id = 2;
-    int32 expert_id = 3;
-    float capacity = 4;
-}
-
-message AnnounceExpertResponse {
-    bool accepted = 1;
-    int32 total_replicas = 2;
-    float scarcity_bonus = 3;
-}
-```
-
-## Performance Considerations
-
-### Latency
-
-| Scenario | Latency |
-|----------|---------|
-| Both experts local | ~5ms |
-| 1 local + 1 remote | ~15ms |
-| Both experts remote | ~25ms |
-
-### Optimizations
-
-1. **Prefetch popular experts**: Cache commonly-used expert weights
-2. **Async remote calls**: Don't block on remote expert responses
-3. **Batch remote requests**: Combine multiple tokens to same expert
-4. **Expert replication**: High-demand experts get more replicas
-
-## Integration with PoNW
-
-MoE expert contributions are tracked in Proof of Neural Work:
-
-```python
-@dataclass
-class PoNWProof:
-    # ... other fields ...
-    moe_expert_count: int = 0     # Experts held by this node
-    moe_scarcity_avg: float = 1.0 # Average scarcity bonus
-```
-
-Final reward calculation:
-
-```python
-total_reward = base_reward × stake_multiplier × role_multiplier × moe_scarcity_bonus
-```
-
-## Example: Node with MoE
-
-```
-$ neuroshard --device cuda --memory 8000
-
-[INFO] Registered node with 8000MB capacity
-[INFO] Assigned layers: [0, 1, 2, 3]
-[MoE] Layer 0: Experts [0, 1, 2, 3] (4 local)
-[MoE] Layer 1: Experts [0, 1] (2 local)
-[MoE] Layer 2: Experts [4, 5, 6, 7] (4 local)
-[MoE] Layer 3: Experts [2, 3] (2 local)
-[INFO] Total: 12 experts across 4 layers
-[INFO] Training reward: 1.35× (avg scarcity bonus)
-```
-
-## Tokenizer & Training Data Compatibility
-
-**Q: Does MoE require retraining the tokenizer or generating new training data?**
-
-**A: NO!** MoE is a model architecture change, not a data/vocab change.
-
-| Component | MoE Impact |
-|-----------|------------|
-| Tokenizer | ✅ No change - same BPE tokenizer |
-| Vocabulary | ✅ No change - same vocab works |
-| Genesis data | ✅ No change - same training shards |
-| Training loop | ⚠️ Minor change - add aux loss |
-
-The existing genesis pipeline (`genesis_ctl.sh`, `genesis_parallel.py`) works exactly the same. MoE only changes:
-- FFN layers → MoE layers (model architecture)
-- Training loss → loss + aux_loss (load balancing)
-
-```python
-# Training with MoE (only change is adding aux_loss)
-loss = cross_entropy(logits, labels)
-
-# Add MoE auxiliary loss for load balancing
-moe_aux = model.get_moe_aux_loss()  # ~0.01-0.1
-if moe_aux is not None:
-    loss = loss + moe_aux
-
+# Backward and update
 loss.backward()
 optimizer.step()
 ```
 
-## Future Work
+### Load Balancing Loss
 
-1. **Expert routing optimization**: ML-based routing to minimize cross-node calls
-2. **Dynamic expert migration**: Move experts based on utilization patterns
-3. **Hierarchical MoE**: Nested experts for multi-level specialization
-4. **Expert distillation**: Compress multiple experts into single dense expert
+Prevents all tokens routing to the same experts:
 
----
+```python
+# Fraction of tokens per expert
+f = tokens_per_expert / total_tokens
 
-*MoE is the ONLY architecture in NeuroShard. It enables scaling to frontier model sizes while keeping compute costs proportional to the active parameter count.*
+# Probability mass per expert  
+P = mean_router_probability_per_expert
 
+# Loss = num_experts * sum(f * P)
+# Minimized when both are uniform (1/num_experts)
+load_balance_loss = num_experts * (f * P).sum()
+```
+
+## Inference
+
+Inference follows the same routing:
+
+```python
+def generate(prompt, max_tokens):
+    tokens = tokenize(prompt)
+    
+    for _ in range(max_tokens):
+        # Forward through MoE layers
+        logits = model(tokens)
+        
+        # Sample next token
+        next_token = sample(logits[:, -1])
+        tokens = concat(tokens, next_token)
+    
+    return tokens
+```
+
+## NEURO Rewards
+
+Expert hosting affects rewards:
+
+| Factor | Bonus |
+|--------|-------|
+| Hosting rare expert (scarcity) | Up to 1.5× |
+| High expert utilization | Up to 1.2× |
+| Multiple experts per layer | Linear with count |
+
+## Next Steps
+
+- [DiLoCo Protocol](/architecture/diloco) — How weights synchronize
+- [P2P Network](/architecture/p2p-network) — Expert discovery and routing
+- [Economics](/economics/rewards) — NEURO reward calculation

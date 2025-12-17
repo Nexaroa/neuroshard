@@ -1108,12 +1108,13 @@ class DynamicLayerPool:
         available_memory_mb: float
     ) -> Dict[int, List[int]]:
         """
-        Assign MoE experts to a node based on its layer assignments.
+        Assign MoE experts to a node based on its capacity and network state.
         
-        Strategy:
-        1. For each layer this node holds, assign experts
-        2. Prioritize under-replicated experts (scarcity bonus)
-        3. Limit by memory (each expert takes ~3x hidden_dim x intermediate_dim bytes)
+        Handles all network sizes:
+        - 1 node: Holds ALL experts (full model locally)
+        - Small node: Holds subset based on memory, uses remote for rest
+        - Large node: Can hold all experts per layer
+        - Large network: Experts distributed with replication
         
         Args:
             node_id: Node identifier
@@ -1123,13 +1124,47 @@ class DynamicLayerPool:
         Returns:
             Dict mapping layer_id -> list of expert_ids assigned
         """
-        # MoE is always enabled - no check needed
-        
         with self.lock:
             assigned = {}
             
+            # =================================================================
+            # SINGLE NODE DETECTION
+            # =================================================================
+            # When only one node is in the network, it must hold ALL experts
+            # to enable training/inference without remote calls.
+            num_nodes = len(self.node_capacities)
+            is_single_node = num_nodes <= 1
+            
+            if is_single_node:
+                logger.info(f"[MoE] Single-node mode: assigning ALL experts locally")
+                for layer_id in layer_ids:
+                    # Initialize layer's expert assignments
+                    if layer_id not in self.expert_assignments:
+                        self.expert_assignments[layer_id] = {
+                            i: [] for i in range(self.NUM_EXPERTS_PER_LAYER)
+                        }
+                    
+                    # Assign ALL experts to this node
+                    layer_experts = list(range(self.NUM_EXPERTS_PER_LAYER))
+                    for exp_id in layer_experts:
+                        if node_id not in self.expert_assignments[layer_id][exp_id]:
+                            self.expert_assignments[layer_id][exp_id].append(node_id)
+                    
+                    assigned[layer_id] = layer_experts
+                
+                self.node_experts[node_id] = assigned
+                total_experts = sum(len(v) for v in assigned.values())
+                logger.info(f"[MoE] Single-node: {total_experts} experts across {len(layer_ids)} layers")
+                return assigned
+            
+            # =================================================================
+            # MULTI-NODE: MEMORY-BASED ASSIGNMENT
+            # =================================================================
             # Estimate memory per expert (in MB)
             # Expert = 3 x hidden_dim x intermediate_dim x 4 bytes (float32)
+            # - gate_proj: hidden_dim x intermediate_dim
+            # - up_proj: hidden_dim x intermediate_dim
+            # - down_proj: intermediate_dim x hidden_dim
             if self.current_architecture:
                 hidden = self.current_architecture.hidden_dim
                 inter = self.current_architecture.intermediate_dim
@@ -1137,10 +1172,28 @@ class DynamicLayerPool:
             else:
                 expert_memory_mb = 50  # Conservative estimate
             
-            # How many experts can this node hold per layer?
-            max_experts_per_layer = max(1, int(available_memory_mb * 0.3 / expert_memory_mb))
+            # =================================================================
+            # CAPACITY CALCULATION
+            # =================================================================
+            # Reserve 30% of expert-available memory for overhead/activations
+            # Divide remaining by number of layers × expert size
+            usable_memory = available_memory_mb * 0.7
+            total_expert_memory_needed = len(layer_ids) * expert_memory_mb
+            
+            if total_expert_memory_needed > 0:
+                max_experts_per_layer = max(1, int(usable_memory / (len(layer_ids) * expert_memory_mb)))
+            else:
+                max_experts_per_layer = self.NUM_EXPERTS_PER_LAYER
+            
             max_experts_per_layer = min(max_experts_per_layer, self.NUM_EXPERTS_PER_LAYER)
             
+            # Log capacity
+            node_type = "small" if max_experts_per_layer < self.NUM_EXPERTS_PER_LAYER else "large"
+            logger.info(f"[MoE] Node {node_id[:8]} ({node_type}): {max_experts_per_layer}/{self.NUM_EXPERTS_PER_LAYER} experts/layer, {available_memory_mb:.0f}MB available")
+            
+            # =================================================================
+            # EXPERT ASSIGNMENT
+            # =================================================================
             for layer_id in layer_ids:
                 # Initialize layer's expert assignments if needed
                 if layer_id not in self.expert_assignments:
@@ -1149,20 +1202,28 @@ class DynamicLayerPool:
                     }
                 
                 # Find under-replicated experts for this layer
+                # Prioritize experts with fewer replicas (scarcity bonus)
                 expert_counts = [
                     (exp_id, len(self.expert_assignments[layer_id].get(exp_id, [])))
                     for exp_id in range(self.NUM_EXPERTS_PER_LAYER)
                 ]
-                # Sort by count (ascending) to prioritize under-replicated
+                # Sort by replica count (ascending) to prioritize under-replicated
                 expert_counts.sort(key=lambda x: x[1])
                 
                 # Assign experts to this node
                 layer_experts = []
-                for exp_id, count in expert_counts:
+                for exp_id, replica_count in expert_counts:
                     if len(layer_experts) >= max_experts_per_layer:
                         break
-                    # Assign if under-replicated or we need more
-                    if count < self.TARGET_EXPERT_REPLICAS or len(layer_experts) == 0:
+                    
+                    # Skip if this node already has this expert
+                    if node_id in self.expert_assignments[layer_id][exp_id]:
+                        continue
+                    
+                    # Assign if:
+                    # 1. Under-replicated (below target), OR
+                    # 2. We haven't assigned any experts yet (every node needs at least 1)
+                    if replica_count < self.TARGET_EXPERT_REPLICAS or len(layer_experts) == 0:
                         layer_experts.append(exp_id)
                         self.expert_assignments[layer_id][exp_id].append(node_id)
                 
@@ -1181,6 +1242,34 @@ class DynamicLayerPool:
         """Get nodes holding a specific expert."""
         with self.lock:
             return self.expert_assignments.get(layer_id, {}).get(expert_id, [])
+    
+    def get_best_expert_holder(self, layer_id: int, expert_id: int, exclude_node: str = None) -> Optional[str]:
+        """
+        Get the best node to route an expert request to.
+        
+        Considers:
+        - Node availability
+        - Current load (if tracked)
+        - Avoids the requesting node itself
+        
+        For large networks with many replicas, this provides load balancing.
+        """
+        with self.lock:
+            holders = self.expert_assignments.get(layer_id, {}).get(expert_id, [])
+            if not holders:
+                return None
+            
+            # Filter out the requesting node
+            candidates = [h for h in holders if h != exclude_node]
+            if not candidates:
+                return None
+            
+            # For now, use round-robin. In future, consider load metrics.
+            # Simple approach: hash (layer_id, expert_id, time_bucket) to pick
+            import time
+            time_bucket = int(time.time() / 10)  # 10-second buckets
+            idx = hash((layer_id, expert_id, time_bucket)) % len(candidates)
+            return candidates[idx]
     
     def get_expert_scarcity_bonus(self, layer_id: int, expert_id: int) -> float:
         """
@@ -1287,11 +1376,9 @@ class DynamicNeuroLLM(nn.Module):
         self._on_layers_changed = None
         
         # =====================================================================
-        # MoE CONFIGURATION - ALWAYS ENABLED (no legacy dense mode)
+        # MoE CONFIGURATION
         # =====================================================================
-        # MoE is the inherent architecture of NeuroShard. There is no fallback.
-        # Router weights are synced via DiLoCo along with expert weights.
-        self.moe_enabled = True  # Always True - MoE is the only architecture
+        self.moe_enabled = True
         self.my_experts: Dict[int, List[int]] = {}  # layer_id -> [expert_ids]
         self.moe_aux_losses: List[Dict] = []  # Collected MoE aux losses
         
@@ -1315,11 +1402,8 @@ class DynamicNeuroLLM(nn.Module):
         )
         
         # =====================================================================
-        # MoE LAYER INITIALIZATION (MANDATORY - no fallback)
+        # MoE LAYER INITIALIZATION
         # =====================================================================
-        # MoE is the inherent architecture. All layers are MoE layers.
-        # Each node holds a subset of experts per layer.
-        # Router weights are part of the layer and synced via DiLoCo.
         from neuroshard.core.model.moe import MoEDecoderLayer, MoEConfig, create_moe_config
         
         # Get expert assignments for this node based on memory capacity
@@ -1359,8 +1443,7 @@ class DynamicNeuroLLM(nn.Module):
             self.my_layers[layer_id] = layer
         
         total_experts = sum(len(v) for v in self.my_experts.values())
-        logger.info(f"[MoE] Initialized {len(layer_ids)} MoE layers with {total_experts} local experts")
-        logger.info(f"[MoE] Router weights will be synced via DiLoCo (size: ~{self.architecture.hidden_dim * self.layer_pool.NUM_EXPERTS_PER_LAYER * 4 // 1024}KB/layer)")
+        logger.info(f"[MoE] Initialized {len(layer_ids)} layers with {total_experts} local experts")
         
         self.my_layer_ids = sorted(layer_ids)
         
@@ -2502,14 +2585,13 @@ class DynamicNeuroNode:
             "vocab_capacity": self.model.vocab_capacity,
             "training_rounds": self.total_training_rounds,
             "timestamp": time.time(),
-            # MoE state (always enabled - inherent architecture)
-            "moe_enabled": True,  # Always True - MoE is the only architecture
+            # MoE state
+            "moe_enabled": True,
             "my_experts": self.model.my_experts if hasattr(self.model, 'my_experts') else {},
-            # Router weights are saved as part of layer state_dict above
         }
         
         torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Checkpoint saved: {checkpoint_path.name} (MoE architecture)")
+        logger.info(f"Checkpoint saved: {checkpoint_path.name}")
     
     def forward_pipeline(self, hidden_states: torch.Tensor, session_id: str,
                         source_layer: int, is_training: bool = False,

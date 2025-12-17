@@ -32,7 +32,9 @@ Each transformer block contains:
 - **RMSNorm** (pre-norm)
 - **GQA Attention** + RoPE + FlashAttention
 - **RMSNorm** (pre-norm)
-- **SwiGLU FFN** (up_proj, gate, down)
+- **MoE FFN** — 8 SwiGLU experts, top-2 routing per token
+
+See [Mixture of Experts](/architecture/mixture-of-experts) for MoE details.
 
 ## Architecture Specification
 
