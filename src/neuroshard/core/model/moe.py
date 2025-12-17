@@ -315,75 +315,82 @@ class DistributedMoELayer(nn.Module):
         # 3. Initialize output tensor
         output = torch.zeros_like(hidden_states)
         
-        # 4. Process each expert
-        # Group tokens by expert for efficient batched computation
+        # 4. Process experts with local-first optimization
+        # Strategy: Process all local experts first, then batch remote calls
+        # This minimizes blocking on network I/O
+        
+        # Collect work items: (expert_id, mask, input, weights)
+        work_items: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        
         for k in range(self.config.num_experts_per_token):
             expert_indices = selected_experts[:, :, k]  # [B, S]
             expert_weights = routing_weights[:, :, k]   # [B, S]
             
             for expert_id in range(self.config.num_experts):
-                # Find tokens routed to this expert
                 mask = (expert_indices == expert_id)  # [B, S]
-                
                 if not mask.any():
                     continue
                 
-                # Get tokens for this expert
                 expert_input = hidden_states[mask]  # [num_tokens_for_expert, H]
                 
                 # Apply capacity limit if needed
                 if self.config.drop_tokens and len(expert_input) > expert_capacity:
-                    # Keep only up to capacity (in order)
                     expert_input = expert_input[:expert_capacity]
-                    # Adjust mask to only include kept tokens
                     indices = mask.nonzero(as_tuple=True)
                     kept_mask = torch.zeros_like(mask)
-                    for i in range(expert_capacity):
+                    for i in range(min(expert_capacity, len(indices[0]))):
                         kept_mask[indices[0][i], indices[1][i]] = True
                     mask = kept_mask
                 
-                # Compute expert output
-                if self.is_expert_local(expert_id):
-                    # Local expert computation
-                    expert_output = self.local_experts[str(expert_id)](expert_input)
-                else:
-                    # Remote expert computation
-                    if remote_expert_forward is not None:
-                        try:
-                            expert_output = remote_expert_forward(
-                                self.layer_idx, expert_id, expert_input
-                            )
-                        except Exception as e:
-                            # Remote call failed - use pass-through (residual)
-                            logger.debug(f"[MoE] Remote expert {expert_id} call failed: {e}")
-                            expert_output = expert_input  # Pass-through preserves info
-                            self._missing_expert_count += 1
-                    else:
-                        # No remote forward function - use pass-through
-                        # This happens during single-node testing or when network is unavailable
-                        # Pass-through is safer than zeros (preserves gradient flow)
-                        if not hasattr(self, '_missing_logged'):
-                            logger.debug(f"[MoE] Expert {expert_id} not available locally, using pass-through")
-                            self._missing_logged = True
-                        expert_output = expert_input  # Pass-through
-                        self._missing_expert_count += 1
-                
-                # Apply dropout
-                expert_output = self.expert_dropout(expert_output)
-                
-                # Weight by routing probability and add to output
                 weights = expert_weights[mask].unsqueeze(-1)  # [num_tokens, 1]
-                
-                # Handle potential size mismatch from capacity limiting
-                if expert_output.shape[0] < weights.shape[0]:
-                    weights = weights[:expert_output.shape[0]]
-                
-                output[mask][:expert_output.shape[0]] += weights * expert_output
-                
-                # Update statistics
-                if self.training:
-                    self.expert_counts[expert_id] += expert_output.shape[0]
-                    self.total_tokens += expert_output.shape[0]
+                work_items.append((expert_id, mask, expert_input, weights))
+        
+        # Separate local and remote work
+        local_work = [(eid, m, inp, w) for eid, m, inp, w in work_items if self.is_expert_local(eid)]
+        remote_work = [(eid, m, inp, w) for eid, m, inp, w in work_items if not self.is_expert_local(eid)]
+        
+        # Process LOCAL experts first (zero network latency)
+        for expert_id, mask, expert_input, weights in local_work:
+            expert_output = self.local_experts[str(expert_id)](expert_input)
+            expert_output = self.expert_dropout(expert_output)
+            
+            if expert_output.shape[0] < weights.shape[0]:
+                weights = weights[:expert_output.shape[0]]
+            output[mask][:expert_output.shape[0]] += weights * expert_output
+            
+            if self.training:
+                self.expert_counts[expert_id] += expert_output.shape[0]
+                self.total_tokens += expert_output.shape[0]
+        
+        # Process REMOTE experts
+        # TODO: Future optimization - use ThreadPoolExecutor for parallel gRPC calls
+        # For now, process sequentially but after all local work is done
+        for expert_id, mask, expert_input, weights in remote_work:
+            if remote_expert_forward is not None:
+                try:
+                    expert_output = remote_expert_forward(
+                        self.layer_idx, expert_id, expert_input
+                    )
+                except Exception as e:
+                    logger.debug(f"[MoE] Remote expert {expert_id} call failed: {e}")
+                    expert_output = expert_input  # Pass-through
+                    self._missing_expert_count += 1
+            else:
+                if not hasattr(self, '_missing_logged'):
+                    logger.debug(f"[MoE] Expert {expert_id} not available, using pass-through")
+                    self._missing_logged = True
+                expert_output = expert_input
+                self._missing_expert_count += 1
+            
+            expert_output = self.expert_dropout(expert_output)
+            
+            if expert_output.shape[0] < weights.shape[0]:
+                weights = weights[:expert_output.shape[0]]
+            output[mask][:expert_output.shape[0]] += weights * expert_output
+            
+            if self.training:
+                self.expert_counts[expert_id] += expert_output.shape[0]
+                self.total_tokens += expert_output.shape[0]
         
         # 5. Compile auxiliary data
         aux_data = {

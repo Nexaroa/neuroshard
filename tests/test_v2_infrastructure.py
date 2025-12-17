@@ -21,7 +21,7 @@ from concurrent import futures
 
 import grpc
 
-from protos import neuroshard_pb2, neuroshard_pb2_grpc
+from neuroshard.protos import neuroshard_pb2, neuroshard_pb2_grpc
 
 
 # =============================================================================
@@ -513,7 +513,7 @@ class TestInfrastructureIntegration:
     def test_network_state_with_gossip(self, multi_node_cluster, dht_network):
         """Test network state updates propagate via gossip."""
         from neuroshard.core.network.dht_protocol import NetworkState
-        from protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2
         
         nodes = multi_node_cluster(num_nodes=3)
         time.sleep(0.5)

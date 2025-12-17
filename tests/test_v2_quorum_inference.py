@@ -19,7 +19,7 @@ import grpc
 from unittest.mock import MagicMock, patch
 from typing import Dict, List, Optional
 
-from protos import neuroshard_pb2, neuroshard_pb2_grpc
+from neuroshard.protos import neuroshard_pb2, neuroshard_pb2_grpc
 
 
 # =============================================================================

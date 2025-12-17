@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import grpc
 
-from protos import neuroshard_pb2, neuroshard_pb2_grpc
+from neuroshard.protos import neuroshard_pb2, neuroshard_pb2_grpc
 
 
 # =============================================================================

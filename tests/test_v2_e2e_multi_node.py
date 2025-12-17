@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import grpc
 
-from protos import neuroshard_pb2, neuroshard_pb2_grpc
+from neuroshard.protos import neuroshard_pb2, neuroshard_pb2_grpc
 
 
 # =============================================================================
@@ -170,7 +170,7 @@ class TestTrainingPipeline:
         batch = mock_genesis_loader.get_batch()
         
         # Simulate training forward pass through pipeline
-        from protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2
         
         # Initiator processes and forwards to processor
         channel = grpc.insecure_channel(nodes[1].endpoint)
@@ -197,7 +197,7 @@ class TestTrainingPipeline:
     
     def test_activation_forwarding_chain(self, multi_node_cluster):
         """Test activation forwarding through the pipeline."""
-        from protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2
         
         nodes = multi_node_cluster(num_nodes=3, total_layers=12)
         time.sleep(0.5)
@@ -315,7 +315,7 @@ class TestInferencePipeline:
         simple_model,
     ):
         """Test inference request through pipeline."""
-        from protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2
         
         nodes = multi_node_cluster(num_nodes=3, total_layers=12)
         time.sleep(0.5)
@@ -624,7 +624,7 @@ class TestFullSystemIntegration:
         )
         from neuroshard.core.consensus.verifier import ProofVerifier, PipelineProof
         from neuroshard.core.network.dht_protocol import NetworkState
-        from protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2
         
         # 1. Bootstrap network
         dht = dht_network.create_dht("system")
@@ -722,7 +722,7 @@ class TestFullSystemIntegration:
             QuorumMember, QuorumRole, QuorumLifecycle
         )
         from neuroshard.core.economics.market import InferenceMarket, RequestStatus
-        from protos import neuroshard_pb2
+        from neuroshard.protos import neuroshard_pb2
         
         # 1. Start nodes
         nodes = multi_node_cluster(num_nodes=3, total_layers=12)
