@@ -852,16 +852,26 @@ class P2PManager:
             return
         
         logger.info("[PoNW] Gossip loop started (will generate first proof in 60s)")
+        
+        loop_iteration = 0
+        consecutive_errors = 0
+        consecutive_skips = 0  # Track how many times we skip due to equal hashes
 
         while self.running:
-            # Interruptible sleep - wakes up immediately on stop()
-            if self._stop_event.wait(timeout=60):
-                break
-            if not self.ledger:
-                logger.info("[NODE] PoNW: No ledger available, skipping proof generation")
-                continue
-                
+            loop_iteration += 1
+            
             try:
+                # Interruptible sleep - wakes up immediately on stop()
+                if self._stop_event.wait(timeout=60):
+                    logger.info("[PoNW] Stop event received, exiting gossip loop")
+                    break
+                    
+                if not self.ledger:
+                    logger.info("[NODE] PoNW: No ledger available, skipping proof generation")
+                    continue
+                
+                # Reset error counter on successful loop start
+                consecutive_errors = 0
                 # Get metrics from state
                 tokens_processed = self.state_ref.get("token_count", 0)
                 training_batches = self.state_ref.get("training_batches", 0)
@@ -940,8 +950,21 @@ class P2PManager:
                 # This happens if gossip loop fires before AsyncTrainer completes a round
                 if proof_type == ProofType.TRAINING and model_hash_start and model_hash_end:
                     if model_hash_start == model_hash_end:
-                        logger.info("[PoNW] Skipping proof - training round not complete yet (waiting for model weight changes)")
-                        continue
+                        consecutive_skips += 1
+                        if consecutive_skips <= 3:
+                            logger.info(f"[PoNW] Skipping proof - training round not complete yet (skip {consecutive_skips}/3)")
+                            continue
+                        else:
+                            # After 3 skips (~3 minutes), force reset the model hash
+                            # This handles cases where the hash tracking gets out of sync
+                            logger.warning(f"[PoNW] Resetting model hash after {consecutive_skips} skips - forcing re-sync")
+                            self.state_ref["model_hash_start"] = ""
+                            consecutive_skips = 0
+                            # Still skip this iteration, but next one will start fresh
+                            continue
+                    else:
+                        # Hashes differ - training happened, reset skip counter
+                        consecutive_skips = 0
                 gradient_commitment = self.state_ref.get("gradient_commitment", "")
                 data_hash = self.state_ref.get("data_hash", "")
                 gradient_norm = self.state_ref.get("gradient_norm", 0.0)
@@ -1041,7 +1064,20 @@ class P2PManager:
                         threading.Thread(target=self._send_proof_to_peer, args=(target, proof)).start()
                          
             except Exception as e:
-                logger.error(f"PoNW gossip error: {e}")
+                consecutive_errors += 1
+                logger.error(f"[PoNW] Gossip loop error (attempt {consecutive_errors}): {e}")
+                import traceback
+                logger.debug(f"[PoNW] Traceback: {traceback.format_exc()}")
+                
+                # If too many consecutive errors, log warning but keep trying
+                if consecutive_errors >= 5:
+                    logger.warning(f"[PoNW] {consecutive_errors} consecutive errors - loop is struggling")
+                
+                # Small backoff on errors to avoid tight error loops
+                time.sleep(min(consecutive_errors * 2, 30))
+        
+        # Log when loop exits (important for debugging)
+        logger.info(f"[PoNW] Gossip loop exited after {loop_iteration} iterations (running={self.running})")
 
     def _send_proof_to_peer(self, target_url: str, proof: PoNWProof):
         """Send PoNW proof to a peer via gRPC."""
